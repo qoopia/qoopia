@@ -1,0 +1,33 @@
+{
+  "name": "qoopia",
+  "version": "2.0.0",
+  "description": "Shared Truth Layer for AI Agents",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest",
+    "migrate": "tsx src/db/migrate.ts",
+    "seed": "tsx src/db/seed.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "drizzle-orm": "^0.39.3",
+    "hono": "^4.7.5",
+    "@hono/node-server": "^1.14.1",
+    "pino": "^9.6.0",
+    "ulid": "^2.3.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.13.10",
+    "drizzle-kit": "^0.30.5",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.9",
+    "supertest": "^7.1.0",
+    "@types/supertest": "^6.0.3"
+  }
+}
