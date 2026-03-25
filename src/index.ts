@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server';
 import { logger } from './core/logger.js';
 import { runMigrations } from './db/migrate.js';
 import { rawDb } from './db/connection.js';
+import { eventBus } from './core/event-bus.js';
 import api from './api/router.js';
 
 // Run migrations on startup
@@ -19,6 +20,7 @@ const server = serve({
 // Graceful shutdown
 function shutdown() {
   logger.info('Shutting down...');
+  eventBus.closeAll(); // Close all SSE streams
   server.close(() => {
     rawDb.pragma('wal_checkpoint(TRUNCATE)');
     rawDb.close();

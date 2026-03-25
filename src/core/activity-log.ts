@@ -1,5 +1,6 @@
 import { ulid } from 'ulid';
 import { rawDb } from '../db/connection.js';
+import { eventBus } from './event-bus.js';
 
 export interface LogEntry {
   workspace_id: string;
@@ -23,6 +24,8 @@ let _stmt: ReturnType<typeof insertStmt> | null = null;
 
 export function logActivity(entry: LogEntry): string {
   const id = ulid();
+  const now = new Date().toISOString().replace(/\.\d{3}Z/, 'Z');
+
   if (!_stmt) _stmt = insertStmt();
   _stmt.run(
     id,
@@ -37,5 +40,20 @@ export function logActivity(entry: LogEntry): string {
     entry.revision_before ?? null,
     entry.revision_after ?? null,
   );
+
+  // Emit to event bus for SSE subscribers
+  eventBus.emit({
+    id,
+    workspace_id: entry.workspace_id,
+    entity_type: entry.entity_type,
+    entity_id: entry.entity_id,
+    project_id: entry.project_id,
+    actor: entry.actor,
+    action: entry.action,
+    summary: entry.summary,
+    revision: entry.revision_after,
+    timestamp: now,
+  });
+
   return id;
 }
