@@ -39,8 +39,8 @@ class EventBus {
 
   emit(event: QoopiaEvent): void {
     for (const sub of this.subscribers.values()) {
-      // Workspace isolation
-      if (sub.workspace_id !== event.workspace_id) continue;
+      // Workspace isolation (wildcard '*' matches all)
+      if (sub.workspace_id !== '*' && sub.workspace_id !== event.workspace_id) continue;
 
       // Project filter
       if (sub.filters.project_id && event.project_id !== sub.filters.project_id) continue;

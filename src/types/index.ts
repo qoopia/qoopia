@@ -3,6 +3,7 @@ export interface AuthContext {
   id: string;
   workspace_id: string;
   name: string;
+  permissions?: unknown;
 }
 
 export interface ErrorResponse {
