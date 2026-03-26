@@ -20,6 +20,7 @@ import authHandler from './handlers/auth.js';
 import openapiHandler from './handlers/openapi.js';
 import mcpHandler from './handlers/mcp.js';
 import exportHandler from './handlers/export.js';
+import oauthHandler from './handlers/oauth.js';
 
 const api = new Hono();
 
@@ -31,6 +32,9 @@ api.use('*', requestIdMiddleware);
 api.route('/api/v1/health', healthHandler);
 api.route('/api/v1/auth', authHandler);
 api.route('/api/v1/openapi.json', openapiHandler);
+
+// OAuth 2.0 routes (no auth middleware — public endpoints)
+api.route('/', oauthHandler);
 
 // Auth middleware for all protected routes
 const protectedRoutes = ['projects', 'tasks', 'deals', 'contacts', 'finances', 'activity', 'search', 'events', 'batch', 'agents', 'export'];

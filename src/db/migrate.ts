@@ -1,7 +1,9 @@
+import crypto from 'node:crypto';
+import { ulid } from 'ulid';
 import { rawDb } from './connection.js';
 import { logger } from '../core/logger.js';
 
-const CURRENT_VERSION = 1;
+const CURRENT_VERSION = 2;
 
 export function runMigrations() {
   const currentVersion = rawDb.prepare(
@@ -18,10 +20,67 @@ export function runMigrations() {
     logger.info('Migration 001 applied');
   } else {
     const latest = rawDb.prepare('SELECT MAX(version) as v FROM schema_versions').get() as { v: number };
+
+    if (latest.v < 2) {
+      logger.info('Running migration 002: OAuth tables...');
+      rawDb.exec(MIGRATION_002);
+      seedOAuthClients();
+      rawDb.prepare('INSERT INTO schema_versions (version, description) VALUES (?, ?)').run(
+        2,
+        'OAuth tables: oauth_clients, oauth_codes, oauth_tokens'
+      );
+      logger.info('Migration 002 applied');
+    }
+
     if (latest.v >= CURRENT_VERSION) {
-      logger.info({ version: latest.v }, 'Database schema up to date');
+      logger.info({ version: CURRENT_VERSION }, 'Database schema up to date');
       return;
     }
+  }
+}
+
+function seedOAuthClients() {
+  const agents = rawDb.prepare(
+    "SELECT id, workspace_id, name FROM agents WHERE active = 1"
+  ).all() as { id: string; workspace_id: string; name: string }[];
+
+  // Also add system client
+  const systemAgent = agents.find(a => a.name.toLowerCase() === 'system');
+
+  // If no system agent, check for it separately
+  const agentsToSeed = [...agents];
+
+  // Ensure we have system — add a virtual entry if none exists
+  if (!systemAgent) {
+    const ws = rawDb.prepare("SELECT id FROM workspaces LIMIT 1").get() as { id: string } | undefined;
+    if (ws) {
+      // Create system agent for OAuth
+      const sysId = ulid();
+      const sysKey = `qp_a_${crypto.randomBytes(32).toString('hex')}`;
+      const sysHash = crypto.createHash('sha256').update(sysKey).digest('hex');
+      rawDb.prepare(
+        "INSERT INTO agents (id, workspace_id, name, type, api_key_hash, permissions) VALUES (?, ?, 'system', 'system', ?, ?)"
+      ).run(sysId, ws.id, sysHash, JSON.stringify({ projects: '*', rules: [{ entity: '*', actions: ['read', 'create', 'update', 'delete'] }] }));
+      agentsToSeed.push({ id: sysId, workspace_id: ws.id, name: 'system' });
+      logger.info({ agent_id: sysId, api_key: sysKey }, 'Created system agent for OAuth');
+    }
+  }
+
+  for (const agent of agentsToSeed) {
+    const clientId = ulid();
+    const clientSecret = `qp_cs_${crypto.randomBytes(32).toString('hex')}`;
+    const secretHash = crypto.createHash('sha256').update(clientSecret).digest('hex');
+    const redirectUris = JSON.stringify(['https://claude.ai/api/mcp/auth_callback']);
+
+    rawDb.prepare(
+      "INSERT INTO oauth_clients (id, name, agent_id, client_secret_hash, redirect_uris) VALUES (?, ?, ?, ?, ?)"
+    ).run(clientId, agent.name, agent.id, secretHash, redirectUris);
+
+    logger.info({
+      client_name: agent.name,
+      client_id: clientId,
+      client_secret: clientSecret,
+    }, `OAuth client created: ${agent.name}`);
   }
 }
 
@@ -372,4 +431,49 @@ CREATE TRIGGER IF NOT EXISTS activity_fts_au AFTER UPDATE ON activity BEGIN
   INSERT INTO activity_fts(rowid, summary)
   VALUES (new.rowid, new.summary);
 END;
+`;
+
+const MIGRATION_002 = `
+-- ============================================================
+-- OAuth 2.0 Tables
+-- ============================================================
+CREATE TABLE IF NOT EXISTS oauth_clients (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  agent_id TEXT REFERENCES agents(id),
+  client_secret_hash TEXT NOT NULL,
+  redirect_uris TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS oauth_codes (
+  code_hash TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL REFERENCES oauth_clients(id),
+  redirect_uri TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  code_challenge TEXT NOT NULL,
+  code_challenge_method TEXT NOT NULL DEFAULT 'S256',
+  expires_at TEXT NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+  token_hash TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL REFERENCES oauth_clients(id),
+  agent_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  token_type TEXT NOT NULL DEFAULT 'refresh_token',
+  expires_at TEXT NOT NULL,
+  revoked INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_oauth_codes_client ON oauth_codes(client_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_codes_expires ON oauth_codes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_client ON oauth_tokens(client_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_agent ON oauth_tokens(agent_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expires ON oauth_tokens(expires_at) WHERE revoked = 0;
+CREATE INDEX IF NOT EXISTS idx_oauth_clients_agent ON oauth_clients(agent_id);
 `;
