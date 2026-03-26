@@ -4,8 +4,23 @@ import { rawDb } from '../../db/connection.js';
 import type { AuthContext } from '../../types/index.js';
 
 export const authMiddleware = createMiddleware<{ Variables: { auth: AuthContext } }>(async (c, next) => {
+  // Try Authorization header first
+  let rawKey = '';
   const authHeader = c.req.header('Authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    rawKey = authHeader.slice(7);
+  }
+
+  // Fallback to session cookie
+  if (!rawKey) {
+    const cookie = c.req.header('Cookie') || '';
+    const match = cookie.match(/qp_session=([^;]+)/);
+    if (match) {
+      rawKey = match[1];
+    }
+  }
+
+  if (!rawKey) {
     return c.json({
       error: {
         code: 'UNAUTHORIZED',
@@ -14,7 +29,6 @@ export const authMiddleware = createMiddleware<{ Variables: { auth: AuthContext 
     }, 401);
   }
 
-  const rawKey = authHeader.slice(7);
   const hash = crypto.createHash('sha256').update(rawKey).digest('hex');
 
   // Check agents (current key)

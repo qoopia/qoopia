@@ -61,9 +61,9 @@ app.get('/', (c) => {
         });
       }
 
-      // Heartbeat — write comment to keep connection alive
+      // Heartbeat — write SSE comment to keep connection alive
       if (!closed) {
-        await stream.writeSSE({ event: '', data: '', comment: 'heartbeat' });
+        await stream.write(': heartbeat\n\n');
       }
 
       // Wait for next heartbeat interval (or break early if events arrive)

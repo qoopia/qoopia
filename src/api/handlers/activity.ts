@@ -31,11 +31,13 @@ app.get('/', (c) => {
     details: safeJsonParse(row.details as string, {}),
   }));
 
+  const lastId = hasMore && data.length > 0 ? (data[data.length - 1] as Record<string, unknown>).id : null;
+
   return c.json({
     data,
     pagination: {
       limit,
-      next_cursor: hasMore && data.length > 0 ? data[data.length - 1].id : null,
+      next_cursor: lastId,
       has_more: hasMore,
     },
   });

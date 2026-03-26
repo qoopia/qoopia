@@ -10,9 +10,9 @@ interface BatchOperation {
 }
 
 // The main Hono app is passed in so we can route internally
-let _rootApp: { fetch: (request: Request) => Promise<Response> } | null = null;
+let _rootApp: { fetch: (request: Request) => Response | Promise<Response> } | null = null;
 
-export function setBatchRouter(rootApp: { fetch: (request: Request) => Promise<Response> }) {
+export function setBatchRouter(rootApp: { fetch: (request: Request) => Response | Promise<Response> }) {
   _rootApp = rootApp;
 }
 
@@ -66,7 +66,7 @@ app.post('/', async (c) => {
 
     try {
       const request = new Request(url.toString(), init);
-      const response = await _rootApp.fetch(request);
+      const response = await Promise.resolve(_rootApp.fetch(request));
       let responseBody: unknown = null;
 
       if (response.status !== 204) {

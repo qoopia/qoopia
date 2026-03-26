@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { corsMiddleware } from './middleware/cors.js';
 import { authMiddleware } from './middleware/auth.js';
 import { requestIdMiddleware } from './middleware/request-id.js';
 import { idempotencyMiddleware } from './middleware/idempotency.js';
@@ -15,29 +16,42 @@ import searchHandler from './handlers/search.js';
 import eventsHandler from './handlers/events.js';
 import batchHandler, { setBatchRouter } from './handlers/batch.js';
 import agentsHandler from './handlers/agents.js';
+import authHandler from './handlers/auth.js';
+import openapiHandler from './handlers/openapi.js';
+import mcpHandler from './handlers/mcp.js';
+import exportHandler from './handlers/export.js';
 
 const api = new Hono();
 
 // Global middleware
+api.use('*', corsMiddleware);
 api.use('*', requestIdMiddleware);
 
-// Health (no auth required)
+// No-auth routes
 api.route('/api/v1/health', healthHandler);
+api.route('/api/v1/auth', authHandler);
+api.route('/api/v1/openapi.json', openapiHandler);
 
 // Auth middleware for all protected routes
-const protectedRoutes = ['projects', 'tasks', 'deals', 'contacts', 'finances', 'activity', 'search', 'events', 'batch', 'agents'];
+const protectedRoutes = ['projects', 'tasks', 'deals', 'contacts', 'finances', 'activity', 'search', 'events', 'batch', 'agents', 'export'];
 for (const route of protectedRoutes) {
   api.use(`/api/v1/${route}/*`, authMiddleware);
   api.use(`/api/v1/${route}`, authMiddleware);
 }
+
+// MCP endpoint (auth required)
+api.use('/mcp', authMiddleware);
+api.use('/mcp/*', authMiddleware);
 
 // Rate limiting (after auth, before permissions)
 for (const route of protectedRoutes) {
   api.use(`/api/v1/${route}/*`, rateLimitMiddleware);
   api.use(`/api/v1/${route}`, rateLimitMiddleware);
 }
+api.use('/mcp', rateLimitMiddleware);
+api.use('/mcp/*', rateLimitMiddleware);
 
-// Permissions middleware for entity routes (not agents — those have own checks)
+// Permissions middleware for entity routes (not agents/export — those have own checks)
 const entityRoutes = ['projects', 'tasks', 'deals', 'contacts', 'finances', 'activity', 'search', 'events', 'batch'];
 for (const route of entityRoutes) {
   api.use(`/api/v1/${route}/*`, permissionsMiddleware);
@@ -62,6 +76,8 @@ api.route('/api/v1/search', searchHandler);
 api.route('/api/v1/events', eventsHandler);
 api.route('/api/v1/batch', batchHandler);
 api.route('/api/v1/agents', agentsHandler);
+api.route('/api/v1/export', exportHandler);
+api.route('/mcp', mcpHandler);
 
 // Wire batch handler to route internally through the app
 setBatchRouter(api);

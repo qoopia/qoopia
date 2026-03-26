@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import Database, { type Database as DatabaseType } from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import * as schema from './schema.js';
 import { logger } from '../core/logger.js';
@@ -25,4 +25,4 @@ sqlite.pragma('wal_autocheckpoint = 1000');
 logger.info({ db: DB_PATH }, 'SQLite connected with WAL mode');
 
 export const db = drizzle(sqlite, { schema });
-export const rawDb = sqlite;
+export const rawDb: DatabaseType = sqlite;
