@@ -4,9 +4,13 @@ import { rawDb } from '../../db/connection.js';
 import { verifyAccessToken } from '../handlers/oauth.js';
 import type { AuthContext } from '../../types/index.js';
 
+const publicUrl = process.env.QOOPIA_PUBLIC_URL || 'http://localhost:3737';
+const wwwAuth = `Bearer resource_metadata_uri="${publicUrl}/.well-known/oauth-protected-resource"`;
+
 export const authMiddleware = createMiddleware<{ Variables: { auth: AuthContext } }>(async (c, next) => {
   const authHeader = c.req.header('Authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    c.header('WWW-Authenticate', wwwAuth);
     return c.json({
       error: {
         code: 'UNAUTHORIZED',
@@ -54,6 +58,7 @@ export const authMiddleware = createMiddleware<{ Variables: { auth: AuthContext 
       return next();
     }
 
+    c.header('WWW-Authenticate', wwwAuth);
     return c.json({
       error: {
         code: 'UNAUTHORIZED',
@@ -77,6 +82,7 @@ export const authMiddleware = createMiddleware<{ Variables: { auth: AuthContext 
     });
     return next();
   } catch {
+    c.header('WWW-Authenticate', wwwAuth);
     return c.json({
       error: {
         code: 'UNAUTHORIZED',

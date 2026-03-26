@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { SignJWT, jwtVerify, type JWTPayload } from 'jose';
+import { ulid } from 'ulid';
 import { rawDb } from '../../db/connection.js';
 import { logger } from '../../core/logger.js';
 
@@ -153,10 +154,9 @@ oauth.get('/.well-known/oauth-authorization-server', (c) => {
     revocation_endpoint: `${baseUrl}/oauth/revoke`,
     grant_types_supported: ['client_credentials', 'authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
-    token_endpoint_auth_methods_supported: ['client_secret_post'],
+    token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
     response_types_supported: ['code'],
-    // TODO: Dynamic Client Registration
-    // registration_endpoint: `${baseUrl}/oauth/register`,
+    registration_endpoint: `${baseUrl}/oauth/register`,
   });
 });
 
@@ -561,6 +561,88 @@ oauth.post('/oauth/revoke', async (c) => {
 
   // RFC 7009: always return 200, even if token was not found
   return c.json({}, 200);
+});
+
+// ── 6. POST /oauth/register (RFC 7591 Dynamic Client Registration) ──
+
+oauth.post('/oauth/register', async (c) => {
+  let body: Record<string, unknown>;
+  try {
+    body = await c.req.json();
+  } catch {
+    const { body: errBody, status } = oauthError('invalid_request', 'Request body must be JSON');
+    return c.json(errBody, status);
+  }
+
+  const clientName = (typeof body.client_name === 'string' && body.client_name) ? body.client_name : 'Unnamed Client';
+  const redirectUris = body.redirect_uris;
+
+  if (!Array.isArray(redirectUris) || redirectUris.length === 0 || !redirectUris.every(u => typeof u === 'string')) {
+    const { body: errBody, status } = oauthError('invalid_request', 'redirect_uris must be a non-empty array of strings');
+    return c.json(errBody, status);
+  }
+
+  // Find the first active agent (and its workspace) to associate with this client
+  const agent = rawDb.prepare(
+    'SELECT id, workspace_id FROM agents WHERE active = 1 ORDER BY created_at ASC LIMIT 1'
+  ).get() as { id: string; workspace_id: string } | undefined;
+
+  if (!agent) {
+    const { body: errBody, status } = oauthError('server_error', 'No active agent available', 500);
+    return c.json(errBody, status);
+  }
+
+  const authMethod = (body.token_endpoint_auth_method as string) || 'client_secret_post';
+  if (authMethod !== 'client_secret_post' && authMethod !== 'none') {
+    const { body: errBody, status } = oauthError('invalid_request', 'token_endpoint_auth_method must be "client_secret_post" or "none"');
+    return c.json(errBody, status);
+  }
+
+  const isPublic = authMethod === 'none';
+  const clientId = ulid();
+
+  let clientSecret: string | undefined;
+  let secretHash: string;
+
+  if (isPublic) {
+    secretHash = '';
+  } else {
+    clientSecret = crypto.randomBytes(32).toString('hex');
+    secretHash = sha256(clientSecret);
+  }
+
+  rawDb.prepare(
+    'INSERT INTO oauth_clients (id, name, agent_id, client_secret_hash, redirect_uris) VALUES (?, ?, ?, ?, ?)'
+  ).run(clientId, clientName, agent.id, secretHash, JSON.stringify(redirectUris));
+
+  logger.info({ client_id: clientId, client_name: clientName, public: isPublic }, 'Dynamic client registered (RFC 7591)');
+
+  // Determine grant_types: use client-requested values, or default based on auth method
+  const defaultGrants = isPublic
+    ? ['authorization_code', 'refresh_token']
+    : ['authorization_code', 'refresh_token', 'client_credentials'];
+  const grantTypes = (Array.isArray(body.grant_types) && body.grant_types.every((g: unknown) => typeof g === 'string'))
+    ? body.grant_types as string[]
+    : defaultGrants;
+
+  const responseTypes = (Array.isArray(body.response_types) && body.response_types.every((r: unknown) => typeof r === 'string'))
+    ? body.response_types as string[]
+    : ['code'];
+
+  const response: Record<string, unknown> = {
+    client_id: clientId,
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    client_name: clientName,
+    redirect_uris: redirectUris,
+    grant_types: grantTypes,
+    response_types: responseTypes,
+    token_endpoint_auth_method: authMethod,
+  };
+  if (clientSecret) {
+    response.client_secret = clientSecret;
+  }
+
+  return c.json(response, 201);
 });
 
 // ── HTML Escape Helper ──────────────────────────────────────
