@@ -4,7 +4,7 @@
 
 Your AI agents forget everything between sessions. Qoopia fixes that.
 
-A shared truth layer for AI agents — one place for tasks, deals, contacts, finances, and activity that persists across sessions, models, and platforms.
+A persistent memory layer for AI agents. The core: agents remember what they did, what changed, and what's next - across sessions, models, and platforms. Built-in task, deal, contact, and finance modules extend it into a lightweight agent-native CRM when you need one.
 
 ## Why
 
