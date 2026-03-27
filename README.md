@@ -87,6 +87,7 @@ git clone https://github.com/qoopia/qoopia.git
 cd qoopia
 npm install
 npm run migrate
+npm test            # all green? good to go
 npm run dev
 ```
 
@@ -95,10 +96,35 @@ Server starts on port 3000 by default. Set `PORT` env var to change.
 ### Register an agent
 
 ```bash
-export QOOPIA_API_KEY=your-key
 npx tsx src/cli.ts agent add "my-agent" openclaw
-# Returns: API key for the agent
+# → qp_ag_abc123...   (save this key)
+export API_KEY=qp_ag_abc123...
 ```
+
+### 2-minute wow: from zero to auto-matched task
+
+```bash
+# 1. Create a task
+curl -s -X POST -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Fix login page 500 error", "status": "open"}' \
+  http://localhost:3000/api/v1/tasks
+# → { "id": "01JD...", "title": "Fix login page 500 error", "status": "open" }
+
+# 2. Agent writes a natural language note (no task ID needed)
+curl -s -X POST -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"note","arguments":{"text":"Fixed the login bug - was a missing null check in auth middleware"}}}' \
+  http://localhost:3000/mcp
+# → matched: "Fix login page 500 error" → status changed to done
+
+# 3. Verify — the task updated itself
+curl -s -H "Authorization: Bearer $API_KEY" \
+  http://localhost:3000/api/v1/tasks?status=done | grep "login"
+# → status: "done", with activity log entry
+```
+
+One natural language note. Qoopia found the task, updated the status, and logged the activity. No explicit task ID, no status enum, no second API call.
 
 ### Connect via MCP
 
@@ -108,11 +134,11 @@ Point your MCP client to `http://localhost:3000/mcp` with the agent's API key in
 
 ```bash
 # List open tasks
-curl -H "Authorization: Bearer <key>" \
+curl -H "Authorization: Bearer $API_KEY" \
   http://localhost:3000/api/v1/tasks?status=open
 
 # Create a task
-curl -X POST -H "Authorization: Bearer <key>" \
+curl -X POST -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"title": "Review PR #42", "priority": "high"}' \
   http://localhost:3000/api/v1/tasks
@@ -158,6 +184,10 @@ Web dashboard at `/dashboard` for viewing tasks, activity, and system status.
 - Soft-delete with `deleted_at` timestamps (no data loss)
 - Automatic activity logging for audit trails
 - OAuth 2.0 support for external integrations
+
+## Contributing
+
+Issues and PRs welcome. See [open issues](https://github.com/qoopia/qoopia/issues).
 
 ## License
 
