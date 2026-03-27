@@ -45,6 +45,30 @@ function matchesEvent(webhookEvents: string[], eventName: string): boolean {
   return webhookEvents.includes('*') || webhookEvents.includes(eventName);
 }
 
+function isPrivateHost(hostname: string): boolean {
+  // Block IPv6 loopback and private ranges
+  if (hostname === '::1' || hostname === '[::1]') return true;
+  if (hostname.startsWith('fc') || hostname.startsWith('fd')) return true; // fc00::/7
+  if (hostname.startsWith('fe80')) return true; // link-local
+
+  // Resolve common names
+  if (hostname === 'localhost' || hostname.endsWith('.local')) return true;
+
+  // IPv4 private ranges
+  const ipv4Match = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4Match) {
+    const [, a, b] = ipv4Match.map(Number);
+    if (a === 127) return true;                              // 127.0.0.0/8
+    if (a === 10) return true;                               // 10.0.0.0/8
+    if (a === 172 && b >= 16 && b <= 31) return true;        // 172.16.0.0/12
+    if (a === 192 && b === 168) return true;                 // 192.168.0.0/16
+    if (a === 169 && b === 254) return true;                 // 169.254.0.0/16 link-local
+    if (a === 0) return true;                                // 0.0.0.0/8
+  }
+
+  return false;
+}
+
 async function deliverWebhook(webhook: WebhookConfig, payload: WebhookPayload): Promise<void> {
   let url: string;
   let body: string;
@@ -64,6 +88,18 @@ async function deliverWebhook(webhook: WebhookConfig, payload: WebhookPayload): 
     if (webhook.config.headers) {
       headers = { ...headers, ...webhook.config.headers };
     }
+  }
+
+  // SSRF protection: block private/internal network targets
+  try {
+    const parsed = new URL(url);
+    if (isPrivateHost(parsed.hostname)) {
+      logger.warn({ webhook_id: webhook.id, url }, 'Webhook blocked: private network target');
+      return;
+    }
+  } catch {
+    logger.warn({ webhook_id: webhook.id, url }, 'Webhook blocked: invalid URL');
+    return;
   }
 
   let lastError = '';

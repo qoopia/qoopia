@@ -45,7 +45,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         project_id: { type: 'string', description: 'Filter by project ID' },
-        status: { type: 'string', enum: ['todo', 'open', 'in_progress', 'waiting', 'done', 'cancelled'] },
+        status: { type: 'string', enum: ['todo', 'in_progress', 'waiting', 'done', 'cancelled'] },
         assignee: { type: 'string', description: 'Filter by assignee ID' },
         limit: { type: 'number', description: 'Max results (default 50)' },
       },
@@ -163,7 +163,7 @@ const TOOLS = [
       properties: {
         title: { type: 'string', description: 'Task title' },
         project_id: { type: 'string', description: 'Project ID' },
-        status: { type: 'string', enum: ['todo', 'open', 'in_progress', 'waiting', 'done', 'cancelled'], description: 'Default: todo' },
+        status: { type: 'string', enum: ['todo', 'in_progress', 'waiting', 'done', 'cancelled'], description: 'Default: todo' },
         priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'], description: 'Default: medium' },
         assignee: { type: 'string', description: 'Assignee agent ID' },
         due_date: { type: 'string', description: 'Due date (YYYY-MM-DD)' },
@@ -182,7 +182,7 @@ const TOOLS = [
       properties: {
         id: { type: 'string', description: 'Task ID' },
         title: { type: 'string' },
-        status: { type: 'string', enum: ['todo', 'open', 'in_progress', 'waiting', 'done', 'cancelled'] },
+        status: { type: 'string', enum: ['todo', 'in_progress', 'waiting', 'done', 'cancelled'] },
         priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] },
         assignee: { type: 'string' },
         due_date: { type: 'string' },
@@ -211,7 +211,7 @@ const TOOLS = [
         name: { type: 'string', description: 'Deal name' },
         project_id: { type: 'string', description: 'Project ID' },
         address: { type: 'string' },
-        status: { type: 'string', description: 'Default: active' },
+        status: { type: 'string', enum: ['active', 'paused', 'archived'], description: 'Default: active' },
         asking_price: { type: 'number' },
         target_price: { type: 'number' },
         monthly_rent: { type: 'number' },
@@ -232,7 +232,7 @@ const TOOLS = [
         id: { type: 'string', description: 'Deal ID' },
         name: { type: 'string' },
         address: { type: 'string' },
-        status: { type: 'string' },
+        status: { type: 'string', enum: ['active', 'paused', 'archived'] },
         asking_price: { type: 'number' },
         target_price: { type: 'number' },
         monthly_rent: { type: 'number' },
@@ -331,7 +331,7 @@ const TOOLS = [
         amount: { type: 'number' },
         currency: { type: 'string', description: 'Default: USD' },
         recurring: { type: 'string', enum: ['none', 'monthly', 'annual', 'biennial'] },
-        status: { type: 'string', description: 'Default: active' },
+        status: { type: 'string', enum: ['active', 'trial', 'paused', 'cancelled'], description: 'Default: active' },
         project_id: { type: 'string' },
         notes: { type: 'string' },
         tags: { type: 'array', items: { type: 'string' } },
@@ -346,12 +346,12 @@ const TOOLS = [
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Finance ID' },
-        type: { type: 'string' },
+        type: { type: 'string', enum: ['subscription', 'credit', 'investment', 'budget', 'purchase', 'acquisition'] },
         name: { type: 'string' },
         amount: { type: 'number' },
         currency: { type: 'string' },
-        recurring: { type: 'string' },
-        status: { type: 'string' },
+        recurring: { type: 'string', enum: ['none', 'monthly', 'annual', 'biennial'] },
+        status: { type: 'string', enum: ['active', 'trial', 'paused', 'cancelled'] },
         notes: { type: 'string' },
         tags: { type: 'array', items: { type: 'string' } },
       },
@@ -1234,10 +1234,21 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
 // MCP Streamable HTTP: POST /mcp
 app.post('/', async (c) => {
   const auth = c.get('auth');
-  const body = await c.req.json() as McpRequest;
+
+  let body: McpRequest;
+  try {
+    body = await c.req.json() as McpRequest;
+  } catch {
+    return c.json({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+  }
 
   if (body.jsonrpc !== '2.0' || !body.method) {
     return c.json({ jsonrpc: '2.0', id: body.id ?? null, error: { code: -32600, message: 'Invalid Request' } });
+  }
+
+  // Notifications have no id — do not send a response (MCP spec)
+  if (body.method.startsWith('notifications/')) {
+    return c.body(null, 204);
   }
 
   let result: unknown;
@@ -1250,9 +1261,6 @@ app.post('/', async (c) => {
         serverInfo: { name: 'qoopia', version: '2.0.0' },
       };
       break;
-
-    case 'notifications/initialized':
-      return c.json({ jsonrpc: '2.0', id: body.id, result: {} });
 
     case 'tools/list':
       result = handleToolsList();

@@ -22,13 +22,13 @@ interface BufferedEvent extends ObserveEvent {
   received_at: string;
 }
 
-// ── Buffer/Flush mechanism ──
+// ── Buffer/Flush mechanism (per-workspace) ──
 
-let eventBuffer: BufferedEvent[] = [];
-let flushTimer: ReturnType<typeof setTimeout> | null = null;
+const workspaceBuffers = new Map<string, BufferedEvent[]>();
+const workspaceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const FLUSH_INTERVAL = 60_000; // 60 seconds
 const FLUSH_THRESHOLD = 20;    // flush after 20 events
-const MAX_BUFFER = 100;        // hard cap
+const MAX_BUFFER = 100;        // hard cap per workspace
 
 function extractKeywords(text: string): string[] {
   const stopWords = new Set(['the', 'a', 'an', 'is', 'was', 'are', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'shall', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after', 'then', 'when', 'where', 'why', 'how', 'all', 'each', 'some', 'no', 'not', 'only', 'so', 'than', 'too', 'very', 'just', 'and', 'but', 'or', 'if', 'while', 'that', 'this', 'it', 'its', 'i', 'my', 'we', 'our', 'you', 'your', 'he', 'she', 'they', 'them']);
@@ -63,66 +63,64 @@ function matchEntitiesFromText(text: string, workspaceId: string): Array<{ type:
   return matched.slice(0, 20);
 }
 
-export function flushBuffer(): { processed: number; matched: number } {
-  if (eventBuffer.length === 0) return { processed: 0, matched: 0 };
+function flushWorkspaceBuffer(workspaceId: string): { processed: number; matched: number } {
+  const buffer = workspaceBuffers.get(workspaceId);
+  if (!buffer || buffer.length === 0) return { processed: 0, matched: 0 };
 
-  const events = eventBuffer.splice(0);
-  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+  const events = buffer.splice(0);
+  const timer = workspaceTimers.get(workspaceId);
+  if (timer) { clearTimeout(timer); workspaceTimers.delete(workspaceId); }
+  if (events.length === 0) { workspaceBuffers.delete(workspaceId); return { processed: 0, matched: 0 }; }
 
-  // Group events by workspace
-  const byWorkspace = new Map<string, BufferedEvent[]>();
-  for (const ev of events) {
-    const arr = byWorkspace.get(ev.workspace_id) || [];
-    arr.push(ev);
-    byWorkspace.set(ev.workspace_id, arr);
-  }
+  const combinedText = events.map(e => `[${e.agent}] ${e.content}`).join('\n');
+  const agents = [...new Set(events.map(e => e.agent))];
 
-  let totalMatched = 0;
+  const matched = matchEntitiesFromText(combinedText, workspaceId);
 
-  for (const [workspaceId, wsEvents] of byWorkspace) {
-    // Combine all event content into one blob
-    const combinedText = wsEvents.map(e => `[${e.agent}] ${e.content}`).join('\n');
-    const agents = [...new Set(wsEvents.map(e => e.agent))];
-
-    // Find affected entities
-    const matched = matchEntitiesFromText(combinedText, workspaceId);
-    totalMatched += matched.length;
-
-    // Log activity for each matched entity
-    if (matched.length > 0) {
-      for (const entity of matched) {
-        logActivity({
-          workspace_id: workspaceId,
-          actor: agents.join(', '),
-          action: 'observed',
-          entity_type: entity.type,
-          entity_id: entity.id,
-          summary: `Observed activity from ${agents.join(', ')} mentioning ${entity.name}`,
-          details: { source: 'observe', event_count: wsEvents.length, agents },
-        });
-      }
-    } else {
-      // Log a general observation even with no matches
+  if (matched.length > 0) {
+    for (const entity of matched) {
       logActivity({
         workspace_id: workspaceId,
         actor: agents.join(', '),
         action: 'observed',
-        entity_type: 'activity',
-        summary: `Observed ${wsEvents.length} event(s) from ${agents.join(', ')}`,
-        details: { source: 'observe', event_count: wsEvents.length, agents },
+        entity_type: entity.type,
+        entity_id: entity.id,
+        summary: `Observed activity from ${agents.join(', ')} mentioning ${entity.name}`,
+        details: { source: 'observe', event_count: events.length, agents },
       });
     }
+  } else {
+    logActivity({
+      workspace_id: workspaceId,
+      actor: agents.join(', '),
+      action: 'observed',
+      entity_type: 'activity',
+      summary: `Observed ${events.length} event(s) from ${agents.join(', ')}`,
+      details: { source: 'observe', event_count: events.length, agents },
+    });
   }
 
-  return { processed: events.length, matched: totalMatched };
+  if (buffer.length === 0) workspaceBuffers.delete(workspaceId);
+  return { processed: events.length, matched: matched.length };
 }
 
-function scheduleFlush(): void {
-  if (!flushTimer) {
-    flushTimer = setTimeout(() => {
-      flushTimer = null;
-      flushBuffer();
-    }, FLUSH_INTERVAL);
+export function flushBuffer(): { processed: number; matched: number } {
+  let totalProcessed = 0;
+  let totalMatched = 0;
+  for (const wsId of [...workspaceBuffers.keys()]) {
+    const r = flushWorkspaceBuffer(wsId);
+    totalProcessed += r.processed;
+    totalMatched += r.matched;
+  }
+  return { processed: totalProcessed, matched: totalMatched };
+}
+
+function scheduleFlush(workspaceId: string): void {
+  if (!workspaceTimers.has(workspaceId)) {
+    workspaceTimers.set(workspaceId, setTimeout(() => {
+      workspaceTimers.delete(workspaceId);
+      flushWorkspaceBuffer(workspaceId);
+    }, FLUSH_INTERVAL));
   }
 }
 
@@ -139,8 +137,8 @@ app.post('/', async (c) => {
   }
 
   // Validate required fields
-  if (!body.type || !body.agent || !body.content) {
-    return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Missing required fields: type, agent, content' } }, 400);
+  if (!body.type || !body.content) {
+    return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Missing required fields: type, content' } }, 400);
   }
 
   const validTypes = ['message_sent', 'session_compact', 'session_end'];
@@ -148,29 +146,36 @@ app.post('/', async (c) => {
     return c.json({ error: { code: 'VALIDATION_ERROR', message: `Invalid type. Must be one of: ${validTypes.join(', ')}` } }, 400);
   }
 
-  // Buffer the event
+  // Derive agent name from auth context, not request body
   const buffered: BufferedEvent = {
     ...body,
+    agent: auth.name,
     workspace_id: auth.workspace_id,
     actor_id: auth.id,
     received_at: new Date().toISOString(),
   };
 
-  // Enforce max buffer size
-  if (eventBuffer.length >= MAX_BUFFER) {
-    flushBuffer();
+  const wsId = auth.workspace_id;
+  let buffer = workspaceBuffers.get(wsId);
+  if (!buffer) { buffer = []; workspaceBuffers.set(wsId, buffer); }
+
+  // Enforce max buffer size per workspace
+  if (buffer.length >= MAX_BUFFER) {
+    flushWorkspaceBuffer(wsId);
+    buffer = workspaceBuffers.get(wsId) || [];
+    if (!workspaceBuffers.has(wsId)) { workspaceBuffers.set(wsId, buffer); }
   }
 
-  eventBuffer.push(buffered);
+  buffer.push(buffered);
 
   // Flush if threshold reached, otherwise schedule timer
-  if (eventBuffer.length >= FLUSH_THRESHOLD) {
-    flushBuffer();
+  if (buffer.length >= FLUSH_THRESHOLD) {
+    flushWorkspaceBuffer(wsId);
   } else {
-    scheduleFlush();
+    scheduleFlush(wsId);
   }
 
-  return c.json({ accepted: true, buffered: eventBuffer.length }, 202);
+  return c.json({ accepted: true, buffered: (workspaceBuffers.get(wsId) || []).length }, 202);
 });
 
 export default app;
