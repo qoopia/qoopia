@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { rawDb } from '../../db/connection.js';
 import { logActivity } from '../../core/activity-log.js';
+import { detectAndApplyStatusChanges } from '../../core/intelligence.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
@@ -74,8 +75,23 @@ function flushWorkspaceBuffer(workspaceId: string): { processed: number; matched
 
   const combinedText = events.map(e => `[${e.agent}] ${e.content}`).join('\n');
   const agents = [...new Set(events.map(e => e.agent))];
+  const actorId = events[0]?.actor_id || agents[0] || 'observe';
 
   const matched = matchEntitiesFromText(combinedText, workspaceId);
+
+  // Auto-status sync: detect and apply status changes from observed text
+  const statusChanges = detectAndApplyStatusChanges(combinedText, workspaceId, actorId, 'observe');
+  for (const upd of statusChanges.applied) {
+    logActivity({
+      workspace_id: workspaceId,
+      actor: actorId,
+      action: 'auto-update',
+      entity_type: upd.type,
+      entity_id: upd.id,
+      summary: `Auto-updated ${upd.type} "${upd.name}": ${upd.previous_status} → ${upd.new_status} (from observe)`,
+      details: { source: 'observe', event_count: events.length, agents },
+    });
+  }
 
   if (matched.length > 0) {
     for (const entity of matched) {
@@ -86,7 +102,7 @@ function flushWorkspaceBuffer(workspaceId: string): { processed: number; matched
         entity_type: entity.type,
         entity_id: entity.id,
         summary: `Observed activity from ${agents.join(', ')} mentioning ${entity.name}`,
-        details: { source: 'observe', event_count: events.length, agents },
+        details: { source: 'observe', event_count: events.length, agents, auto_updated: statusChanges.applied.length },
       });
     }
   } else {
@@ -96,7 +112,7 @@ function flushWorkspaceBuffer(workspaceId: string): { processed: number; matched
       action: 'observed',
       entity_type: 'activity',
       summary: `Observed ${events.length} event(s) from ${agents.join(', ')}`,
-      details: { source: 'observe', event_count: events.length, agents },
+      details: { source: 'observe', event_count: events.length, agents, auto_updated: statusChanges.applied.length },
     });
   }
 

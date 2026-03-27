@@ -22,6 +22,9 @@ import mcpHandler from './handlers/mcp.js';
 import exportHandler from './handlers/export.js';
 import oauthHandler from './handlers/oauth.js';
 import observeHandler from './handlers/observe.js';
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 
 const api = new Hono();
 
@@ -34,8 +37,7 @@ api.route('/api/v1/health', healthHandler);
 api.route('/api/v1/auth', authHandler);
 api.route('/api/v1/openapi.json', openapiHandler);
 
-// OAuth 2.0 routes — public endpoints except /oauth/authorize which requires auth
-api.use('/oauth/authorize', authMiddleware);
+// OAuth 2.0 routes — all public (authorize must be unauthenticated for OAuth flow)
 api.route('/', oauthHandler);
 
 // Auth middleware for all protected routes
@@ -94,5 +96,32 @@ api.route('/api/v1/observe', observeHandler);
 
 // Wire batch handler to route internally through the app
 setBatchRouter(api);
+
+// Dashboard (static HTML)
+const publicDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'public');
+api.get('/dashboard', (c) => {
+  try {
+    const html = readFileSync(join(publicDir, 'index.html'), 'utf-8');
+    return c.html(html);
+  } catch {
+    return c.text('Dashboard not found', 404);
+  }
+});
+api.get('/logo.svg', (c) => {
+  try {
+    const svg = readFileSync(join(publicDir, 'logo.svg'), 'utf-8');
+    return c.body(svg, 200, { 'Content-Type': 'image/svg+xml' });
+  } catch {
+    return c.text('Not found', 404);
+  }
+});
+api.get('/logo-dark.svg', (c) => {
+  try {
+    const svg = readFileSync(join(publicDir, 'logo-dark.svg'), 'utf-8');
+    return c.body(svg, 200, { 'Content-Type': 'image/svg+xml' });
+  } catch {
+    return c.text('Not found', 404);
+  }
+});
 
 export default api;

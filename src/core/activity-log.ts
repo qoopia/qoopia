@@ -1,3 +1,4 @@
+// DO NOT add matching logic here — causes recursion via detectAndApplyStatusChanges
 import { ulid } from 'ulid';
 import { rawDb } from '../db/connection.js';
 import { eventBus } from './event-bus.js';

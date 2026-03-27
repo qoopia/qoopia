@@ -5,7 +5,7 @@ import { logActivity } from '../../core/activity-log.js';
 import type { AuthContext } from '../../types/index.js';
 import { readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, existsSync, realpathSync } from 'fs';
 import { resolve, join, relative, basename } from 'path';
-import { matchFromNote, semanticSearch, getCapabilities, storeEmbedding } from '../../core/intelligence.js';
+import { matchFromNote, semanticSearch, getCapabilities, storeEmbedding, detectAndApplyStatusChanges, detectStaleTasks } from '../../core/intelligence.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
 
@@ -957,6 +957,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
     }
 
     case 'create_activity': {
+      const summaryText = args.summary as string || `${args.action} on ${args.entity_type}`;
       const actId = logActivity({
         workspace_id: workspaceId,
         actor: actorId,
@@ -964,10 +965,20 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
         entity_type: args.entity_type as string,
         entity_id: args.entity_id as string ?? undefined,
         project_id: args.project_id as string ?? undefined,
-        summary: args.summary as string || `${args.action} on ${args.entity_type}`,
+        summary: summaryText,
         details: args.details as Record<string, unknown> ?? undefined,
       });
-      return { content: [{ type: 'text', text: `Activity logged: ${actId}` }] };
+
+      // Auto-status sync on activity creation
+      const actStatusChanges = detectAndApplyStatusChanges(summaryText, workspaceId, actorId, args.action as string);
+      for (const upd of actStatusChanges.applied) {
+        logActivity({ workspace_id: workspaceId, actor: actorId, action: 'auto-update', entity_type: upd.type, entity_id: upd.id, summary: `Auto-updated ${upd.type} "${upd.name}": ${upd.previous_status} → ${upd.new_status} (from activity)` });
+      }
+
+      let actMsg = `Activity logged: ${actId}`;
+      if (actStatusChanges.applied.length > 0) actMsg += `. Auto-updated: ${actStatusChanges.applied.map(u => `${u.name} → ${u.new_status}`).join(', ')}`;
+
+      return { content: [{ type: 'text', text: actMsg }] };
     }
 
     // ══════════════ ACTIVITY-FIRST MEMORY TOOLS ══════════════
@@ -993,34 +1004,16 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
 
       // Match entities from note text
       const matchResult = await matchFromNote(text, workspaceId);
-      const autoUpdates: Array<{ type: string; id: string; name: string; previous_status?: string; new_status?: string }> = [];
 
-      // Auto-update entities with detected status changes
-      for (const entity of matchResult.matched_entities) {
-        if (entity.new_status && entity.previous_status) {
-          if (entity.type === 'task') {
-            const existing = rawDb.prepare('SELECT revision FROM tasks WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL').get(entity.id, workspaceId) as { revision: number } | undefined;
-            if (existing) {
-              const newRev = existing.revision + 1;
-              rawDb.prepare('UPDATE tasks SET status = ?, revision = ?, updated_at = ?, updated_by = ? WHERE id = ? AND workspace_id = ?')
-                .run(entity.new_status, newRev, now(), actorId, entity.id, workspaceId);
-              entity.auto_updated = true;
-              autoUpdates.push({ type: 'task', id: entity.id, name: entity.name, previous_status: entity.previous_status, new_status: entity.new_status });
-              logActivity({ workspace_id: workspaceId, actor: agentName || actorId, action: 'auto_updated', entity_type: 'task', entity_id: entity.id, summary: `Auto-updated task "${entity.name}": ${entity.previous_status} → ${entity.new_status} (from note)` });
-            }
-          } else if (entity.type === 'deal') {
-            const existing = rawDb.prepare('SELECT revision FROM deals WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL').get(entity.id, workspaceId) as { revision: number } | undefined;
-            if (existing) {
-              const newRev = existing.revision + 1;
-              rawDb.prepare('UPDATE deals SET status = ?, revision = ?, updated_at = ?, updated_by = ? WHERE id = ? AND workspace_id = ?')
-                .run(entity.new_status, newRev, now(), actorId, entity.id, workspaceId);
-              entity.auto_updated = true;
-              autoUpdates.push({ type: 'deal', id: entity.id, name: entity.name, previous_status: entity.previous_status, new_status: entity.new_status });
-              logActivity({ workspace_id: workspaceId, actor: agentName || actorId, action: 'auto_updated', entity_type: 'deal', entity_id: entity.id, summary: `Auto-updated deal "${entity.name}": ${entity.previous_status} → ${entity.new_status} (from note)` });
-            }
-          }
-        }
+      // Auto-status sync: detect and apply status changes with confidence gating
+      const statusChanges = detectAndApplyStatusChanges(text, workspaceId, actorId, 'note', matchResult);
+
+      // Log auto-updates as activity (source=auto-update to prevent recursion)
+      for (const upd of statusChanges.applied) {
+        logActivity({ workspace_id: workspaceId, actor: agentName || actorId, action: 'auto-update', entity_type: upd.type, entity_id: upd.id, summary: `Auto-updated ${upd.type} "${upd.name}": ${upd.previous_status} → ${upd.new_status} (from note)` });
       }
+
+      const autoUpdates = statusChanges.applied.map(u => ({ type: u.type, id: u.id, name: u.name, previous_status: u.previous_status, new_status: u.new_status }));
 
       // Insert note
       const noteId = ulid();
@@ -1048,13 +1041,12 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       }
 
       // Build matched summary
-      const matchedSummary = matchResult.matched_entities
-        .filter(e => e.auto_updated)
-        .map(e => `${e.name} → ${e.new_status}`);
+      const matchedSummary = statusChanges.applied.map(u => `${u.name} → ${u.new_status}`);
 
       let message = 'Recorded.';
       if (matchedSummary.length > 0) message += ` ${matchedSummary.join(', ')}.`;
-      if (remaining.length > 0) message += ` ${remaining.length} task${remaining.length > 1 ? 's' : ''} remaining${projectId ? '' : ''}.`;
+      if (statusChanges.suggested.length > 0) message += ` ${statusChanges.suggested.length} suggested status change(s) (medium confidence).`;
+      if (remaining.length > 0) message += ` ${remaining.length} task${remaining.length > 1 ? 's' : ''} remaining.`;
 
       return {
         content: [{
@@ -1062,9 +1054,10 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
           text: JSON.stringify({
             recorded: true,
             note_id: noteId,
-            matched: matchResult.matched_entities.filter(e => e.auto_updated).map(e => ({
-              type: e.type, name: e.name, action: `→ ${e.new_status}`,
+            matched: statusChanges.applied.map(u => ({
+              type: u.type, name: u.name, action: `→ ${u.new_status}`,
             })),
+            suggested: statusChanges.suggested.length > 0 ? statusChanges.suggested : undefined,
             remaining,
             capabilities: getCapabilities(),
             message,
@@ -1110,11 +1103,11 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       const agentName = args.agent_name ? String(args.agent_name) : undefined;
 
       // Open/in_progress tasks
-      let taskQuery = "SELECT id, title, status, priority, due_date, assignee FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL AND status NOT IN ('done', 'cancelled')";
+      let taskQuery = "SELECT id, title, status, priority, due_date, assignee, updated_at FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL AND status NOT IN ('done', 'cancelled')";
       const taskParams: unknown[] = [workspaceId];
       if (projectId) { taskQuery += ' AND project_id = ?'; taskParams.push(projectId); }
       taskQuery += ' ORDER BY due_date ASC NULLS LAST LIMIT 20';
-      const taskItems = rawDb.prepare(taskQuery).all(...taskParams) as Array<{ id: string; title: string; status: string; priority: string; due_date: string | null; assignee: string | null }>;
+      const taskItems = rawDb.prepare(taskQuery).all(...taskParams) as Array<{ id: string; title: string; status: string; priority: string; due_date: string | null; assignee: string | null; updated_at: string }>;
 
       // Overdue count
       let overdueQuery = "SELECT COUNT(*) as c FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL AND due_date < date('now') AND status NOT IN ('done', 'cancelled')";
@@ -1157,14 +1150,27 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
         health[ah.agent_name] = { last_note: ah.last_note, hours_ago: hoursAgo };
       }
 
-      const message = `${projectName || 'Workload'}: ${taskItems.length} open task${taskItems.length !== 1 ? 's' : ''} (${overdueCount} overdue), ${dealItems.length} active deal${dealItems.length !== 1 ? 's' : ''}, ${noteItems.length} recent note${noteItems.length !== 1 ? 's' : ''}.`;
+      // Detect stale tasks: open tasks where recent notes/activity suggest completion
+      const staleWarnings = detectStaleTasks(taskItems, workspaceId);
+      const staleTaskIds = new Set(staleWarnings.map(w => w.task_id));
+
+      // Annotate task items with stale_warning if detected
+      const annotatedTasks = taskItems.map(t => {
+        const warning = staleWarnings.find(w => w.task_id === t.id);
+        return warning ? { ...t, stale_warning: warning.stale_warning } : t;
+      });
+
+      let message = `${projectName || 'Workload'}: ${taskItems.length} open task${taskItems.length !== 1 ? 's' : ''} (${overdueCount} overdue), ${dealItems.length} active deal${dealItems.length !== 1 ? 's' : ''}, ${noteItems.length} recent note${noteItems.length !== 1 ? 's' : ''}.`;
+      if (staleWarnings.length > 0) {
+        message += ` WARNING: ${staleWarnings.length} task(s) may have stale status — recent activity suggests completion.`;
+      }
 
       return {
         content: [{
           type: 'text',
           text: JSON.stringify({
             project: projectName,
-            tasks: { total: taskItems.length, overdue: overdueCount, items: taskItems },
+            tasks: { total: taskItems.length, overdue: overdueCount, stale: staleWarnings.length, items: annotatedTasks },
             deals: { total: dealItems.length, items: dealItems },
             notes: {
               total: noteItems.length,
@@ -1189,8 +1195,14 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       // Match entities from summary text
       const matched = matchEntities(summary, workspaceId, hintsIds);
 
-      // Auto-update statuses for explicit status indicators
-      autoUpdateStatuses(summary, matched, workspaceId, actorId);
+      // Auto-status sync with confidence gating (replaces old autoUpdateStatuses)
+      const reportStatusChanges = detectAndApplyStatusChanges(summary, workspaceId, actorId, 'report');
+      for (const upd of reportStatusChanges.applied) {
+        logActivity({ workspace_id: workspaceId, actor: agentName, action: 'auto-update', entity_type: upd.type, entity_id: upd.id, summary: `Auto-updated ${upd.type} "${upd.name}": ${upd.previous_status} → ${upd.new_status} (from report)` });
+        // Mark matching entity as auto_updated for backwards compat
+        const matchedEntity = matched.find(m => m.id === upd.id);
+        if (matchedEntity) matchedEntity.auto_updated = true;
+      }
 
       // Log the activity
       const activityId = logActivity({
@@ -1207,10 +1219,13 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
         },
       });
 
-      const autoUpdated = matched.filter(m => m.auto_updated);
+      const autoUpdated = reportStatusChanges.applied;
       let message = `Activity recorded. ${matched.length} entit${matched.length === 1 ? 'y' : 'ies'} identified for review.`;
       if (autoUpdated.length > 0) {
         message += ` ${autoUpdated.length} entit${autoUpdated.length === 1 ? 'y' : 'ies'} auto-updated.`;
+      }
+      if (reportStatusChanges.suggested.length > 0) {
+        message += ` ${reportStatusChanges.suggested.length} suggested status change(s).`;
       }
 
       return {
@@ -1220,6 +1235,8 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
             recorded: true,
             activity_id: activityId,
             matched_entities: matched,
+            auto_updated: autoUpdated.length > 0 ? autoUpdated : undefined,
+            suggested: reportStatusChanges.suggested.length > 0 ? reportStatusChanges.suggested : undefined,
             message,
           }, null, 2),
         }],

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <defs>
+    <style>
+      .q-body { fill: #0A1628; }
+      .q-node { fill: #F0EDE8; }
+    </style>
+  </defs>
+  <!-- Q letter - outer circle -->
+  <circle class="q-body" cx="100" cy="90" r="70"/>
+  <!-- Q counter (hole) -->
+  <circle fill="#00000000" cx="100" cy="90" r="36" style="mix-blend-mode:normal"/>
+  <circle cx="100" cy="90" r="36" fill="transparent"/>
+  <!-- Cut out the counter -->
+  <mask id="qmask">
+    <rect width="200" height="200" fill="white"/>
+    <circle cx="100" cy="90" r="36" fill="black"/>
+  </mask>
+  <circle class="q-body" cx="100" cy="90" r="70" mask="url(#qmask)"/>
+  <!-- Q tail - neural connection line -->
+  <line x1="120" y1="130" x2="155" y2="170" stroke="#0A1628" stroke-width="16" stroke-linecap="round"/>
+  <!-- Tail branch -->
+  <line x1="145" y1="158" x2="168" y2="155" stroke="#0A1628" stroke-width="6" stroke-linecap="round"/>
+  <line x1="145" y1="158" x2="162" y2="175" stroke="#0A1628" stroke-width="6" stroke-linecap="round"/>
+  <!-- Neural node inside counter -->
+  <circle class="q-node" cx="100" cy="90" r="8"/>
+  <!-- Small connection dots radiating from node -->
+  <circle class="q-node" cx="100" cy="68" r="3" opacity="0.5"/>
+  <circle class="q-node" cx="118" cy="82" r="3" opacity="0.5"/>
+  <circle class="q-node" cx="85" cy="98" r="3" opacity="0.5"/>
+  <!-- Subtle connection lines from node to dots -->
+  <line x1="100" y1="82" x2="100" y2="71" stroke="#F0EDE8" stroke-width="1" opacity="0.3"/>
+  <line x1="107" y1="86" x2="115" y2="83" stroke="#F0EDE8" stroke-width="1" opacity="0.3"/>
+  <line x1="93" y1="94" x2="88" y2="97" stroke="#F0EDE8" stroke-width="1" opacity="0.3"/>
+  <!-- Tail end nodes -->
+  <circle class="q-node" cx="168" cy="155" r="4" opacity="0.6"/>
+  <circle class="q-node" cx="162" cy="175" r="4" opacity="0.6"/>
+</svg>

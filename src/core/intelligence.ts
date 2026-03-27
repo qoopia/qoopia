@@ -46,7 +46,7 @@ export function getCapabilities(): { llm: boolean; embeddings: boolean } {
 // ── Status patterns ──
 
 const STATUS_PATTERNS: Array<{ pattern: RegExp; status: string }> = [
-  { pattern: /\b(?:completed|finished|done with|done|closed)\b/i, status: 'done' },
+  { pattern: /\b(?:complete[d]?|finished|done with|done|closed|shipped|launched|COMPLETE)\b/i, status: 'done' },
   { pattern: /\b(?:cancelled|canceled|abandoned)\b/i, status: 'cancelled' },
   { pattern: /\b(?:started|began|working on)\b/i, status: 'in_progress' },
 ];
@@ -396,4 +396,182 @@ export async function semanticSearch(query: string, workspaceId: string, limit: 
 
   // Layer 2: FTS5 fallback
   return fts5Search(query, workspaceId, limit);
+}
+
+// ── Auto-status sync ──
+
+export interface StatusChangeResult {
+  applied: Array<{ type: 'task' | 'deal'; id: string; name: string; previous_status: string; new_status: string }>;
+  suggested: Array<{ type: 'task' | 'deal'; id: string; name: string; current_status: string; suggested_status: string; confidence: 'medium' }>;
+}
+
+/**
+ * Compute title-word overlap ratio: what fraction of the entity's title words appear in the text.
+ */
+function titleOverlapRatio(text: string, title: string): number {
+  const textLower = text.toLowerCase();
+  const titleWords = title.toLowerCase().replace(/[^\w\s-]/g, ' ').split(/\s+/).filter(w => w.length > 2);
+  if (titleWords.length === 0) return 0;
+  const matched = titleWords.filter(w => textLower.includes(w));
+  return matched.length / titleWords.length;
+}
+
+/**
+ * Determine confidence for a matched entity:
+ * - high: exact title substring match in text, OR >=70% of title words appear in text
+ * - medium: keyword LIKE match (from matchFromNote) but below 70% title overlap
+ * - low: single short keyword match on a short title (likely false positive)
+ */
+function classifyConfidence(text: string, entityName: string, matchMethod: 'llm' | 'keyword'): 'high' | 'medium' | 'low' {
+  const textLower = text.toLowerCase();
+  const nameLower = entityName.toLowerCase();
+
+  // Exact title substring → high
+  if (textLower.includes(nameLower)) return 'high';
+
+  // >=70% title word overlap → high
+  if (titleOverlapRatio(text, entityName) >= 0.7) return 'high';
+
+  // LLM already filtered to high confidence internally
+  if (matchMethod === 'llm') return 'medium';
+
+  // Short entity names matched by a single keyword are likely false positives
+  const nameWords = nameLower.replace(/[^\w\s-]/g, ' ').split(/\s+/).filter(w => w.length > 2);
+  if (nameWords.length <= 1) return 'low';
+
+  return 'medium';
+}
+
+/**
+ * Detect status changes from text and apply them with confidence gating.
+ * - source "auto-update" → skip (recursion guard: activity logged by this function)
+ * - high confidence → auto-apply status change
+ * - medium confidence → return as suggestion only
+ * - low confidence → ignore
+ */
+export function detectAndApplyStatusChanges(
+  text: string,
+  workspaceId: string,
+  actorId: string,
+  source: string,
+  matchResult?: MatchResult,
+): StatusChangeResult {
+  const result: StatusChangeResult = { applied: [], suggested: [] };
+
+  // Recursion guard: don't process our own auto-update activity entries
+  if (source === 'auto-update') return result;
+
+  // Detect status intent from text
+  let detectedStatus: string | undefined;
+  for (const sp of STATUS_PATTERNS) {
+    if (sp.pattern.test(text)) {
+      detectedStatus = sp.status;
+      break;
+    }
+  }
+  if (!detectedStatus) return result;
+
+  // Use provided matchResult or fall back to sync keyword match
+  const entities = matchResult
+    ? matchResult.matched_entities
+    : keywordMatch(text, workspaceId).matched_entities;
+  const method = matchResult?.method ?? 'keyword';
+
+  for (const entity of entities) {
+    if (entity.type !== 'task' && entity.type !== 'deal') continue;
+
+    const confidence = classifyConfidence(text, entity.name, method);
+    if (confidence === 'low') continue;
+
+    // Fetch current status
+    const table = entity.type === 'task' ? 'tasks' : 'deals';
+    const nameCol = entity.type === 'task' ? 'title' : 'name';
+    const row = rawDb.prepare(
+      `SELECT status, revision FROM ${table} WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
+    ).get(entity.id, workspaceId) as { status: string; revision: number } | undefined;
+    if (!row || row.status === detectedStatus) continue;
+
+    if (confidence === 'high') {
+      // Auto-apply
+      const newRev = row.revision + 1;
+      const nowTs = new Date().toISOString().replace(/\.\d{3}Z/, 'Z');
+      rawDb.prepare(
+        `UPDATE ${table} SET status = ?, revision = ?, updated_at = ?, updated_by = ? WHERE id = ? AND workspace_id = ?`
+      ).run(detectedStatus, newRev, nowTs, actorId, entity.id, workspaceId);
+
+      result.applied.push({
+        type: entity.type,
+        id: entity.id,
+        name: entity.name,
+        previous_status: row.status,
+        new_status: detectedStatus,
+      });
+    } else {
+      // Medium → suggest only
+      result.suggested.push({
+        type: entity.type,
+        id: entity.id,
+        name: entity.name,
+        current_status: row.status,
+        suggested_status: detectedStatus,
+        confidence: 'medium',
+      });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Check open tasks for stale status: if recent notes/activity after the task's updated_at
+ * mention completion patterns, flag the task.
+ */
+export function detectStaleTasks(
+  tasks: Array<{ id: string; title: string; status: string; updated_at?: string }>,
+  workspaceId: string,
+): Array<{ task_id: string; title: string; stale_warning: string }> {
+  const warnings: Array<{ task_id: string; title: string; stale_warning: string }> = [];
+  const donePattern = /\b(?:completed?|finished|done|closed|shipped|launched|COMPLETE)\b/i;
+
+  for (const task of tasks) {
+    if (task.status === 'done' || task.status === 'cancelled') continue;
+
+    const updatedAt = task.updated_at || '1970-01-01T00:00:00Z';
+
+    // Check notes created after task was last updated
+    const recentNotes = rawDb.prepare(
+      `SELECT text FROM notes WHERE workspace_id = ? AND created_at > ? AND LOWER(text) LIKE ? LIMIT 3`
+    ).all(workspaceId, updatedAt, `%${task.title.toLowerCase().split(/\s+/)[0]}%`) as Array<{ text: string }>;
+
+    for (const note of recentNotes) {
+      if (donePattern.test(note.text) && titleOverlapRatio(note.text, task.title) >= 0.4) {
+        warnings.push({
+          task_id: task.id,
+          title: task.title,
+          stale_warning: `Recent note suggests this task may be complete: "${note.text.slice(0, 100)}..."`,
+        });
+        break;
+      }
+    }
+
+    if (warnings.some(w => w.task_id === task.id)) continue;
+
+    // Check activity entries
+    const recentActivity = rawDb.prepare(
+      `SELECT summary FROM activity WHERE workspace_id = ? AND timestamp > ? AND LOWER(summary) LIKE ? LIMIT 3`
+    ).all(workspaceId, updatedAt, `%${task.title.toLowerCase().split(/\s+/)[0]}%`) as Array<{ summary: string }>;
+
+    for (const act of recentActivity) {
+      if (donePattern.test(act.summary) && titleOverlapRatio(act.summary, task.title) >= 0.4) {
+        warnings.push({
+          task_id: task.id,
+          title: task.title,
+          stale_warning: `Recent activity suggests this task may be complete: "${act.summary.slice(0, 100)}..."`,
+        });
+        break;
+      }
+    }
+  }
+
+  return warnings;
 }
