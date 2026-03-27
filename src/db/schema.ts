@@ -25,6 +25,7 @@ export const users = sqliteTable('users', {
   email: text('email').unique(),
   role: text('role').notNull().default('member'),
   api_key_hash: text('api_key_hash'),
+  session_expires_at: text('session_expires_at'),
   last_seen: text('last_seen'),
   created_at: text('created_at').notNull().default(utcNow),
 });

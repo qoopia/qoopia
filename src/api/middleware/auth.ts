@@ -49,12 +49,19 @@ export const authMiddleware = createMiddleware<{ Variables: { auth: AuthContext 
 
     // Check users
     const user = rawDb.prepare(
-      'SELECT id, workspace_id, name FROM users WHERE api_key_hash = ?'
-    ).get(hash) as { id: string; workspace_id: string; name: string } | undefined;
+      'SELECT id, workspace_id, name, role, session_expires_at FROM users WHERE api_key_hash = ?'
+    ).get(hash) as { id: string; workspace_id: string; name: string; role: string; session_expires_at: string | null } | undefined;
 
     if (user) {
+      // HIGH #6: enforce server-side session expiry
+      if (user.session_expires_at && user.session_expires_at < new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')) {
+        c.header('WWW-Authenticate', wwwAuth);
+        return c.json({
+          error: { code: 'UNAUTHORIZED', message: 'Session expired. Please re-authenticate.' }
+        }, 401);
+      }
       rawDb.prepare("UPDATE users SET last_seen = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?").run(user.id);
-      c.set('auth', { type: 'user', id: user.id, workspace_id: user.workspace_id, name: user.name });
+      c.set('auth', { type: 'user', id: user.id, workspace_id: user.workspace_id, name: user.name, role: user.role });
       return next();
     }
 

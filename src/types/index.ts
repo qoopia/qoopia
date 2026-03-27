@@ -3,6 +3,7 @@ export interface AuthContext {
   id: string;
   workspace_id: string;
   name: string;
+  role?: string;           // user role: 'owner' | 'admin' | 'member'
   permissions?: unknown;
 }
 

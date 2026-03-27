@@ -144,9 +144,8 @@ oauth.use('/oauth/revoke', oauthRateLimitMiddleware);
 // ── 1. GET /.well-known/oauth-authorization-server ──────────
 
 oauth.get('/.well-known/oauth-authorization-server', (c) => {
-  const host = c.req.header('x-forwarded-host') || c.req.header('host') || 'localhost:3000';
-  const proto = c.req.header('x-forwarded-proto') || 'http';
-  const baseUrl = `${proto}://${host}`;
+  // HIGH #10: Use QOOPIA_PUBLIC_URL exclusively, never derive from request headers
+  const baseUrl = (process.env.QOOPIA_PUBLIC_URL || `http://localhost:${process.env.PORT || '3000'}`).replace(/\/$/, '');
 
   return c.json({
     issuer: baseUrl,
@@ -164,9 +163,8 @@ oauth.get('/.well-known/oauth-authorization-server', (c) => {
 // ── 2. GET /.well-known/oauth-protected-resource ────────────
 
 oauth.get('/.well-known/oauth-protected-resource', (c) => {
-  const host = c.req.header('x-forwarded-host') || c.req.header('host') || 'localhost:3000';
-  const proto = c.req.header('x-forwarded-proto') || 'http';
-  const baseUrl = `${proto}://${host}`;
+  // HIGH #10: Use QOOPIA_PUBLIC_URL exclusively, never derive from request headers
+  const baseUrl = (process.env.QOOPIA_PUBLIC_URL || `http://localhost:${process.env.PORT || '3000'}`).replace(/\/$/, '');
 
   return c.json({
     resource: baseUrl,
@@ -503,6 +501,20 @@ oauth.post('/oauth/token', async (c) => {
     if (tokenRecord.client_id !== clientId) {
       const { body, status } = oauthError('invalid_grant', 'client_id mismatch');
       return c.json(body, status);
+    }
+
+    // HIGH #8: Require client authentication for confidential clients on refresh
+    const refreshClient = rawDb.prepare(
+      'SELECT id, client_secret_hash FROM oauth_clients WHERE id = ?'
+    ).get(clientId) as { id: string; client_secret_hash: string | null } | undefined;
+
+    if (refreshClient?.client_secret_hash) {
+      // Confidential client — must provide valid client_secret
+      const providedSecret = params.client_secret;
+      if (!providedSecret || sha256(providedSecret) !== refreshClient.client_secret_hash) {
+        const { body, status } = oauthError('invalid_client', 'Client authentication required for confidential clients');
+        return c.json(body, status);
+      }
     }
 
     // Rotation: revoke old refresh token

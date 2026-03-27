@@ -108,8 +108,16 @@ export function getEntityFilters(perms: AgentPermissions, entityType: string): R
 export const permissionsMiddleware = createMiddleware<{ Variables: { auth: AuthContext } }>(async (c, next) => {
   const auth = c.get('auth');
 
-  // Users (humans) bypass granular permissions — they use role-based access
+  // HIGH #5: Users use role-based access — member role is read-only for agent management
   if (auth.type === 'user') {
+    const path = c.req.path;
+    const method = c.req.method;
+    // Non-admin users cannot write to agent endpoints (enforced in agents.ts handler too)
+    if (path.match(/\/api\/v1\/agents/) && method !== 'GET' && !['admin', 'owner'].includes(auth.role ?? '')) {
+      return c.json({
+        error: { code: 'FORBIDDEN', message: 'Insufficient role for this operation' }
+      }, 403);
+    }
     return next();
   }
 

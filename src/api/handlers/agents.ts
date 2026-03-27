@@ -23,10 +23,10 @@ app.get('/', (c) => {
 app.post('/', async (c) => {
   const auth = c.get('auth');
 
-  // Only users with owner/admin role can register agents
-  if (auth.type !== 'user') {
+  // HIGH #5: Only admin/owner users can manage agents
+  if (auth.type !== 'user' || !['admin', 'owner'].includes(auth.role ?? '')) {
     return c.json({
-      error: { code: 'FORBIDDEN', message: 'Only users can register agents' }
+      error: { code: 'FORBIDDEN', message: 'Only admin or owner users can register agents' }
     }, 403);
   }
 
@@ -81,9 +81,10 @@ app.patch('/:id', async (c) => {
   const auth = c.get('auth');
   const agentId = c.req.param('id');
 
-  if (auth.type !== 'user') {
+  // HIGH #5: Only admin/owner users can manage agents
+  if (auth.type !== 'user' || !['admin', 'owner'].includes(auth.role ?? '')) {
     return c.json({
-      error: { code: 'FORBIDDEN', message: 'Only users can update agents' }
+      error: { code: 'FORBIDDEN', message: 'Only admin or owner users can update agents' }
     }, 403);
   }
 
@@ -157,9 +158,10 @@ app.delete('/:id', (c) => {
   const auth = c.get('auth');
   const agentId = c.req.param('id');
 
-  if (auth.type !== 'user') {
+  // HIGH #5: Only admin/owner users can manage agents
+  if (auth.type !== 'user' || !['admin', 'owner'].includes(auth.role ?? '')) {
     return c.json({
-      error: { code: 'FORBIDDEN', message: 'Only users can deactivate agents' }
+      error: { code: 'FORBIDDEN', message: 'Only admin or owner users can deactivate agents' }
     }, 403);
   }
 
@@ -190,9 +192,10 @@ app.post('/:id/rotate-key', (c) => {
   const auth = c.get('auth');
   const agentId = c.req.param('id');
 
-  if (auth.type !== 'user') {
+  // HIGH #5: Only admin/owner users can manage agents
+  if (auth.type !== 'user' || !['admin', 'owner'].includes(auth.role ?? '')) {
     return c.json({
-      error: { code: 'FORBIDDEN', message: 'Only users can rotate agent keys' }
+      error: { code: 'FORBIDDEN', message: 'Only admin or owner users can rotate agent keys' }
     }, 403);
   }
 

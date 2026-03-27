@@ -3,7 +3,7 @@ import { ulid } from 'ulid';
 import { rawDb } from './connection.js';
 import { logger } from '../core/logger.js';
 
-const CURRENT_VERSION = 3;
+const CURRENT_VERSION = 4;
 
 export function runMigrations() {
   const currentVersion = rawDb.prepare(
@@ -40,6 +40,16 @@ export function runMigrations() {
         'Notes table with FTS5 and triggers'
       );
       logger.info('Migration 003 applied');
+    }
+
+    if (latest.v < 4) {
+      logger.info('Running migration 004: session_expires_at column...');
+      rawDb.exec(MIGRATION_004);
+      rawDb.prepare('INSERT INTO schema_versions (version, description) VALUES (?, ?)').run(
+        4,
+        'Add session_expires_at to users for server-side token expiry (HIGH #6)'
+      );
+      logger.info('Migration 004 applied');
     }
 
     if (latest.v >= CURRENT_VERSION) {
@@ -522,4 +532,9 @@ CREATE TRIGGER IF NOT EXISTS notes_fts_au AFTER UPDATE ON notes BEGIN
   INSERT INTO notes_fts(notes_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
   INSERT INTO notes_fts(rowid, text) VALUES (new.rowid, new.text);
 END;
+`;
+
+const MIGRATION_004 = `
+-- HIGH #6: Add server-side session expiry for bearer tokens
+ALTER TABLE users ADD COLUMN session_expires_at TEXT;
 `;

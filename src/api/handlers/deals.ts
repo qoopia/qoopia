@@ -97,13 +97,30 @@ app.post('/', async (c) => {
       data.notes ?? null, auth.id,
     );
 
+    // HIGH #7: validate contact_ids belong to same workspace
     if (contact_ids?.length) {
+      const placeholders = contact_ids.map(() => '?').join(',');
+      const validCount = (rawDb.prepare(
+        `SELECT COUNT(*) as cnt FROM contacts WHERE id IN (${placeholders}) AND workspace_id = ? AND deleted_at IS NULL`
+      ).get(...contact_ids, auth.workspace_id) as { cnt: number }).cnt;
+      if (validCount !== contact_ids.length) {
+        throw new Error('CROSS_WORKSPACE_FK');
+      }
       const stmt = rawDb.prepare('INSERT INTO deal_contacts (deal_id, contact_id) VALUES (?, ?)');
       for (const cid of contact_ids) stmt.run(id, cid);
     }
   });
 
-  insertDeal();
+  try {
+    insertDeal();
+  } catch (err) {
+    if (err instanceof Error && err.message === 'CROSS_WORKSPACE_FK') {
+      return c.json({
+        error: { code: 'VALIDATION_ERROR', message: 'One or more contact_ids do not belong to this workspace' }
+      }, 400);
+    }
+    throw err;
+  }
 
   logActivity({
     workspace_id: auth.workspace_id, actor: auth.id, action: 'created',
@@ -171,14 +188,33 @@ app.patch('/:id', async (c) => {
       `UPDATE deals SET ${setClauses.join(', ')} WHERE id = ? AND workspace_id = ?`
     ).run(...values);
 
+    // HIGH #7: validate contact_ids belong to same workspace
     if (contact_ids !== undefined) {
+      if (contact_ids.length > 0) {
+        const placeholders = contact_ids.map(() => '?').join(',');
+        const validCount = (rawDb.prepare(
+          `SELECT COUNT(*) as cnt FROM contacts WHERE id IN (${placeholders}) AND workspace_id = ? AND deleted_at IS NULL`
+        ).get(...contact_ids, auth.workspace_id) as { cnt: number }).cnt;
+        if (validCount !== contact_ids.length) {
+          throw new Error('CROSS_WORKSPACE_FK');
+        }
+      }
       rawDb.prepare('DELETE FROM deal_contacts WHERE deal_id = ?').run(dealId);
       const stmt = rawDb.prepare('INSERT INTO deal_contacts (deal_id, contact_id) VALUES (?, ?)');
       for (const cid of contact_ids) stmt.run(dealId, cid);
     }
   });
 
-  updateDeal();
+  try {
+    updateDeal();
+  } catch (err) {
+    if (err instanceof Error && err.message === 'CROSS_WORKSPACE_FK') {
+      return c.json({
+        error: { code: 'VALIDATION_ERROR', message: 'One or more contact_ids do not belong to this workspace' }
+      }, 400);
+    }
+    throw err;
+  }
 
   const changed = Object.keys(updates).filter(k => updates[k as keyof typeof updates] !== undefined);
   logActivity({

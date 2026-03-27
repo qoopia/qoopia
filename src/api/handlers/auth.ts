@@ -7,7 +7,7 @@ import { logger } from '../../core/logger.js';
 const app = new Hono();
 
 const MAGIC_LINK_EXPIRY_MIN = 15;
-const SESSION_EXPIRY_HOURS = 72;
+const SESSION_EXPIRY_DAYS = 30;
 
 // POST /api/v1/auth/magic-link — request a magic link
 app.post('/magic-link', async (c) => {
@@ -133,19 +133,18 @@ app.get('/verify', (c) => {
   // Generate session token (API key style for simplicity)
   const sessionToken = `qp_s_${crypto.randomBytes(32).toString('hex')}`;
   const sessionHash = crypto.createHash('sha256').update(sessionToken).digest('hex');
-  const sessionExpires = new Date(Date.now() + SESSION_EXPIRY_HOURS * 60 * 60 * 1000)
+  const sessionExpires = new Date(Date.now() + SESSION_EXPIRY_DAYS * 24 * 60 * 60 * 1000)
     .toISOString()
     .replace(/\.\d{3}Z/, 'Z');
 
-  // Store session in a temporary API key on the user (update api_key_hash)
-  // In production, use a sessions table; for now, update user's key
-  rawDb.prepare("UPDATE users SET api_key_hash = ?, last_seen = ? WHERE id = ?")
-    .run(sessionHash, now, link.user_id);
+  // HIGH #6: Store session with server-side expiry
+  rawDb.prepare("UPDATE users SET api_key_hash = ?, session_expires_at = ?, last_seen = ? WHERE id = ?")
+    .run(sessionHash, sessionExpires, now, link.user_id);
 
   logger.info({ user_id: link.user_id, email: link.email }, 'Magic link verified, session created');
 
   // Set session cookie
-  const cookieValue = `qp_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_EXPIRY_HOURS * 3600}`;
+  const cookieValue = `qp_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_EXPIRY_DAYS * 86400}`;
   c.header('Set-Cookie', cookieValue);
 
   return c.json({
