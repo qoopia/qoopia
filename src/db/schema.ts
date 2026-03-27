@@ -294,6 +294,28 @@ export const webhookDeadLetters = sqliteTable('webhook_dead_letters', {
 ]);
 
 // ============================================================
+// Notes (Activity-First Memory)
+// ============================================================
+export const notes = sqliteTable('notes', {
+  id: text('id').primaryKey(),
+  workspace_id: text('workspace_id').notNull().references(() => workspaces.id),
+  agent_id: text('agent_id'),
+  agent_name: text('agent_name'),
+  session_id: text('session_id'),
+  text: text('text').notNull(),
+  project_id: text('project_id').references(() => projects.id),
+  source: text('source').default('manual'),
+  embedding: text('embedding'), // BLOB stored as text ref
+  matched_entities: text('matched_entities').default('[]'),
+  auto_updates: text('auto_updates').default('[]'),
+  created_at: text('created_at').notNull().default(utcNow),
+}, (table) => [
+  index('idx_notes_workspace').on(table.workspace_id, table.created_at),
+  index('idx_notes_agent').on(table.agent_name, table.created_at),
+  index('idx_notes_project').on(table.project_id),
+]);
+
+// ============================================================
 // Schema Versions
 // ============================================================
 export const schemaVersions = sqliteTable('schema_versions', {

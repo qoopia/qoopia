@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qoopia</title>
+<style>
+:root {
+  --bg: #0d1117; --bg2: #161b22; --bg3: #21262d; --bg4: #30363d;
+  --fg: #e6edf3; --fg2: #8b949e; --fg3: #484f58;
+  --accent: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149; --purple: #bc8cff;
+  --radius: 8px; --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: var(--font); background: var(--bg); color: var(--fg); display: flex; height: 100vh; overflow: hidden; }
+
+.sidebar { width: 220px; background: var(--bg2); border-right: 1px solid var(--bg4); display: flex; flex-direction: column; flex-shrink: 0; }
+.sidebar-logo { padding: 20px; font-size: 20px; font-weight: 700; letter-spacing: -0.5px; border-bottom: 1px solid var(--bg3); }
+.sidebar-logo span { color: var(--accent); }
+.sidebar nav { flex: 1; padding: 8px; }
+.nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: var(--radius); cursor: pointer; color: var(--fg2); font-size: 14px; transition: all 0.15s; }
+.nav-item:hover { background: var(--bg3); color: var(--fg); }
+.nav-item.active { background: var(--bg3); color: var(--fg); font-weight: 600; }
+
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.topbar { padding: 16px 24px; border-bottom: 1px solid var(--bg3); display: flex; align-items: center; gap: 16px; }
+.topbar h1 { font-size: 18px; font-weight: 600; }
+.search-box { flex: 1; max-width: 400px; margin-left: auto; }
+.search-box input { width: 100%; padding: 8px 14px; background: var(--bg3); border: 1px solid var(--bg4); border-radius: var(--radius); color: var(--fg); font-size: 13px; outline: none; }
+.search-box input:focus { border-color: var(--accent); }
+.content { flex: 1; overflow-y: auto; padding: 24px; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.card { background: var(--bg2); border: 1px solid var(--bg3); border-radius: var(--radius); padding: 16px; cursor: pointer; transition: border-color 0.15s; }
+.card:hover { border-color: var(--accent); }
+.card-title { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.card-meta { font-size: 12px; color: var(--fg2); display: flex; gap: 12px; flex-wrap: wrap; }
+.card-desc { font-size: 13px; color: var(--fg2); margin-top: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; display: inline-block; }
+.b-active, .b-in_progress { background: #0d419d44; color: var(--accent); }
+.b-done, .b-completed, .b-closed { background: #23863544; color: var(--green); }
+.b-todo, .b-open { background: var(--bg4); color: var(--fg2); }
+.b-waiting, .b-paused { background: #9e6a0344; color: var(--yellow); }
+.b-cancelled, .b-blocked { background: #f8514944; color: var(--red); }
+
+.table { width: 100%; border-collapse: collapse; }
+.table th { text-align: left; font-size: 11px; text-transform: uppercase; color: var(--fg3); padding: 8px 12px; border-bottom: 1px solid var(--bg3); }
+.table td { padding: 10px 12px; font-size: 13px; border-bottom: 1px solid var(--bg3); }
+.table tr:hover td { background: var(--bg2); }
+
+.file-entry { display: flex; align-items: center; gap: 8px; padding: 6px 12px; cursor: pointer; border-radius: 4px; }
+.file-entry:hover { background: var(--bg3); }
+.file-entry .name { flex: 1; font-size: 13px; }
+.file-entry .sz { color: var(--fg3); font-size: 11px; }
+.breadcrumb { display: flex; gap: 4px; align-items: center; margin-bottom: 12px; font-size: 13px; color: var(--fg2); }
+.breadcrumb span { cursor: pointer; padding: 2px 4px; border-radius: 4px; }
+.breadcrumb span:hover { color: var(--accent); background: var(--bg3); }
+.file-viewer { background: var(--bg2); border: 1px solid var(--bg3); border-radius: var(--radius); padding: 16px; margin-top: 12px; }
+.file-viewer pre { white-space: pre-wrap; word-break: break-word; font-family: 'SF Mono', monospace; font-size: 13px; line-height: 1.5; max-height: 70vh; overflow-y: auto; }
+
+.timeline-item { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--bg3); }
+.timeline-item .time { font-size: 11px; color: var(--fg3); min-width: 130px; flex-shrink: 0; }
+.timeline-item .act { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--bg3); color: var(--fg2); margin-right: 6px; }
+
+.detail-overlay { position: fixed; top: 0; right: 0; bottom: 0; width: 480px; background: var(--bg2); border-left: 1px solid var(--bg3); z-index: 100; overflow-y: auto; padding: 24px; display: none; box-shadow: -4px 0 24px rgba(0,0,0,0.4); }
+.detail-overlay.open { display: block; }
+.detail-close { cursor: pointer; font-size: 20px; color: var(--fg2); float: right; }
+.detail-field { margin-bottom: 12px; }
+.detail-field label { font-size: 11px; text-transform: uppercase; color: var(--fg3); display: block; margin-bottom: 4px; }
+.detail-field .val { font-size: 14px; }
+
+.loading { text-align: center; padding: 60px; color: var(--fg3); }
+.error { color: var(--red); padding: 20px; }
+
+@media (max-width: 768px) {
+  .sidebar { width: 60px; }
+  .sidebar-logo span:last-child { display: none; }
+  .nav-item span:not(:first-child) { display: none; }
+  .grid { grid-template-columns: 1fr; }
+  .detail-overlay { width: 100%; }
+}
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-logo"><span>Q</span><span>oopia</span></div>
+  <nav id="nav"></nav>
+</div>
+
+<div class="main">
+  <div class="topbar">
+    <h1 id="title">Projects</h1>
+    <div class="search-box"><input type="text" id="search" placeholder="Search... (Enter)" /></div>
+  </div>
+  <div class="content" id="content"><div class="loading">Connecting...</div></div>
+</div>
+
+<div class="detail-overlay" id="detail">
+  <span class="detail-close" onclick="closeDetail()">✕</span>
+  <div id="detail-body"></div>
+</div>
+
+<script>
+let TOKEN = '';
+let section = 'projects';
+const SECTIONS = [
+  { id: 'projects', icon: '◆' },
+  { id: 'tasks', icon: '☑' },
+  { id: 'deals', icon: '💰' },
+  { id: 'contacts', icon: '👤' },
+  { id: 'finances', icon: '📊' },
+  { id: 'activity', icon: '⚡' },
+  { id: 'files', icon: '📁' },
+];
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function bc(status) { return 'badge b-' + (status || 'open').toLowerCase().replace(/\s+/g, '_'); }
+function ago(ts) {
+  if (!ts) return '';
+  const s = (Date.now() - new Date(ts).getTime()) / 1000;
+  if (s < 60) return 'now'; if (s < 3600) return Math.floor(s/60)+'m'; if (s < 86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d';
+}
+function fmtSize(b) { if (!b) return ''; if (b < 1024) return b+'B'; if (b < 1048576) return (b/1024).toFixed(1)+'K'; return (b/1048576).toFixed(1)+'M'; }
+
+async function auth() {
+  try {
+    const r1 = await fetch('/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'dash-' + Date.now(),
+        redirect_uris: [location.origin + '/callback'],
+        grant_types: ['client_credentials'],
+        token_endpoint_auth_method: 'client_secret_post'
+      })
+    });
+    if (!r1.ok) throw new Error('register ' + r1.status);
+    const c = await r1.json();
+
+    const r2 = await fetch('/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=client_credentials&client_id=' + c.client_id + '&client_secret=' + c.client_secret
+    });
+    if (!r2.ok) throw new Error('token ' + r2.status);
+    const t = await r2.json();
+    TOKEN = t.access_token;
+    sessionStorage.setItem('qt', TOKEN);
+    return true;
+  } catch (e) {
+    console.error('Auth failed:', e);
+    document.getElementById('content').innerHTML = '<div class="error">Auth failed: ' + esc(e.message) + '<br><br>Check console for details.</div>';
+    return false;
+  }
+}
+
+async function api(path) {
+  const r = await fetch('/api/v1/' + path, { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+  if (r.status === 401) {
+    sessionStorage.removeItem('qt');
+    if (await auth()) return api(path);
+    throw new Error('Unauthorized');
+  }
+  if (!r.ok) throw new Error(r.status + '');
+  return r.json();
+}
+
+function renderNav() {
+  document.getElementById('nav').innerHTML = SECTIONS.map(s =>
+    '<div class="nav-item' + (s.id === section ? ' active' : '') + '" onclick="go(\'' + s.id + '\')">' +
+    '<span>' + s.icon + '</span><span>' + s.id.charAt(0).toUpperCase() + s.id.slice(1) + '</span></div>'
+  ).join('');
+}
+
+function go(s) {
+  section = s;
+  renderNav();
+  document.getElementById('title').textContent = s.charAt(0).toUpperCase() + s.slice(1);
+  load();
+}
+
+async function load() {
+  const el = document.getElementById('content');
+  el.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    if (section === 'files') return loadFiles('/');
+    if (section === 'activity') return loadActivity();
+    const data = await api(section + '?limit=100');
+    const items = data.data || [];
+
+    if (section === 'projects') {
+      el.innerHTML = '<div class="grid">' + items.map(p =>
+        '<div class="card" onclick=\'detail(' + JSON.stringify(p).replace(/'/g, "&#39;") + ')\'>' +
+        '<div class="card-title">' + esc(p.name || p.id) + '</div>' +
+        '<div class="card-meta"><span class="' + bc(p.status) + '">' + esc(p.status || '') + '</span><span>' + ago(p.updated_at) + '</span></div>' +
+        (p.description ? '<div class="card-desc">' + esc(p.description) + '</div>' : '') +
+        '</div>'
+      ).join('') + '</div>';
+
+    } else if (section === 'tasks') {
+      el.innerHTML = '<table class="table"><tr><th>Task</th><th>Status</th><th>Priority</th><th>Assignee</th><th>Updated</th></tr>' +
+        items.map(t =>
+          '<tr style="cursor:pointer" onclick=\'detail(' + JSON.stringify(t).replace(/'/g, "&#39;") + ')\'>' +
+          '<td>' + esc(t.title || t.id) + '</td>' +
+          '<td><span class="' + bc(t.status) + '">' + esc(t.status || '') + '</span></td>' +
+          '<td>' + (t.priority ? '<span class="' + bc(t.priority) + '">' + esc(t.priority) + '</span>' : '-') + '</td>' +
+          '<td>' + esc(t.assignee || '-') + '</td>' +
+          '<td style="color:var(--fg3)">' + ago(t.updated_at) + '</td></tr>'
+        ).join('') + '</table>';
+
+    } else if (section === 'deals') {
+      el.innerHTML = '<div class="grid">' + items.map(d =>
+        '<div class="card" onclick=\'detail(' + JSON.stringify(d).replace(/'/g, "&#39;") + ')\'>' +
+        '<div class="card-title">' + esc(d.name || d.id) + '</div>' +
+        '<div class="card-meta"><span class="' + bc(d.status) + '">' + esc(d.status || '') + '</span>' +
+        (d.address ? '<span>' + esc(d.address) + '</span>' : '') + '</div></div>'
+      ).join('') + '</div>';
+
+    } else if (section === 'contacts') {
+      el.innerHTML = '<table class="table"><tr><th>Name</th><th>Company</th><th>Category</th><th>Email</th></tr>' +
+        items.map(c =>
+          '<tr style="cursor:pointer" onclick=\'detail(' + JSON.stringify(c).replace(/'/g, "&#39;") + ')\'>' +
+          '<td>' + esc(c.name || c.id) + '</td><td>' + esc(c.company || '-') + '</td>' +
+          '<td>' + esc(c.category || '-') + '</td><td>' + esc(c.email || '-') + '</td></tr>'
+        ).join('') + '</table>';
+
+    } else if (section === 'finances') {
+      el.innerHTML = '<table class="table"><tr><th>Description</th><th>Type</th><th>Amount</th><th>Status</th></tr>' +
+        items.map(f =>
+          '<tr style="cursor:pointer" onclick=\'detail(' + JSON.stringify(f).replace(/'/g, "&#39;") + ')\'>' +
+          '<td>' + esc(f.description || f.id) + '</td><td>' + esc(f.type || '-') + '</td>' +
+          '<td>' + (f.amount ? '$' + Number(f.amount).toLocaleString() : '-') + '</td>' +
+          '<td><span class="' + bc(f.status) + '">' + esc(f.status || '') + '</span></td></tr>'
+        ).join('') + '</table>';
+    }
+  } catch (e) { el.innerHTML = '<div class="error">Error: ' + esc(e.message) + '</div>'; }
+}
+
+async function loadActivity() {
+  const data = await api('activity?limit=50');
+  const items = data.data || [];
+  document.getElementById('content').innerHTML = items.length ? items.map(a =>
+    '<div class="timeline-item"><div class="time">' + (a.timestamp ? new Date(a.timestamp).toLocaleString() : '') +
+    '</div><div><span class="act">' + esc(a.action || '') + '</span>' + esc(a.summary || '') + '</div></div>'
+  ).join('') : '<div class="loading">No activity</div>';
+}
+
+async function loadFiles(path) {
+  const data = await api('files/list?path=' + encodeURIComponent(path));
+  const entries = data.entries || [];
+  const parts = path.split('/').filter(Boolean);
+
+  let bc_html = '<div class="breadcrumb"><span onclick="loadFiles(\'/\')">root</span>';
+  parts.forEach((p, i) => { bc_html += ' / <span onclick="loadFiles(\'/' + parts.slice(0,i+1).join('/') + '\')">' + esc(p) + '</span>'; });
+  bc_html += '</div>';
+
+  let html = bc_html + '<div class="file-tree">';
+  if (path !== '/') {
+    const parent = '/' + parts.slice(0, -1).join('/');
+    html += '<div class="file-entry" onclick="loadFiles(\'' + parent + '\')"><span>⬆</span><span class="name">..</span></div>';
+  }
+  entries.forEach(e => {
+    if (e.type === 'directory') {
+      html += '<div class="file-entry" onclick="loadFiles(\'' + e.path + '\')"><span>📁</span><span class="name">' + esc(e.name) + '</span></div>';
+    } else {
+      html += '<div class="file-entry" onclick="viewFile(\'' + e.path + '\')"><span>📄</span><span class="name">' + esc(e.name) + '</span><span class="sz">' + fmtSize(e.size) + '</span></div>';
+    }
+  });
+  html += '</div><div id="fv"></div>';
+  document.getElementById('content').innerHTML = html;
+}
+
+async function viewFile(path) {
+  const fv = document.getElementById('fv');
+  fv.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const data = await api('files/read?path=' + encodeURIComponent(path));
+    fv.innerHTML = '<div class="file-viewer"><div style="margin-bottom:8px;color:var(--fg2);font-size:12px">' +
+      esc(path) + ' (' + fmtSize(data.size) + ')</div><pre>' + esc(data.content) + '</pre></div>';
+  } catch (e) { fv.innerHTML = '<div class="error">' + esc(e.message) + '</div>'; }
+}
+
+function detail(item) {
+  document.getElementById('detail-body').innerHTML = Object.entries(item).map(([k,v]) => {
+    if (v == null) return '';
+    return '<div class="detail-field"><label>' + esc(k) + '</label><div class="val">' +
+      (typeof v === 'object' ? '<pre style="font-size:12px">' + esc(JSON.stringify(v,null,2)) + '</pre>' : esc(String(v))) +
+      '</div></div>';
+  }).join('');
+  document.getElementById('detail').classList.add('open');
+}
+function closeDetail() { document.getElementById('detail').classList.remove('open'); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetail(); });
+
+document.getElementById('search').addEventListener('keydown', async e => {
+  if (e.key !== 'Enter') return;
+  const q = e.target.value.trim();
+  if (!q) return;
+  document.getElementById('title').textContent = 'Search: ' + q;
+  const el = document.getElementById('content');
+  el.innerHTML = '<div class="loading">Searching...</div>';
+  try {
+    const data = await api('search?q=' + encodeURIComponent(q));
+    const results = data.data || data.results || [];
+    el.innerHTML = results.length ? '<div class="grid">' + results.map(r =>
+      '<div class="card" onclick=\'detail(' + JSON.stringify(r).replace(/'/g, "&#39;") + ')\'>' +
+      '<div class="card-title">' + esc(r.title || r.name || r.summary || r.id) + '</div>' +
+      '<div class="card-meta"><span class="' + bc(r.status) + '">' + esc(r.status || r.entity_type || '') + '</span></div></div>'
+    ).join('') + '</div>' : '<div class="loading">No results</div>';
+  } catch (e) { el.innerHTML = '<div class="error">' + esc(e.message) + '</div>'; }
+});
+
+// Init
+(async () => {
+  TOKEN = sessionStorage.getItem('qt');
+  if (TOKEN) {
+    // Validate existing token
+    try {
+      const r = await fetch('/api/v1/health');
+      if (!r.ok) throw new Error();
+    } catch(e) { /* health is no-auth, if this fails server is down */ }
+  }
+  if (!TOKEN) {
+    const ok = await auth();
+    if (!ok) return;
+  }
+  renderNav();
+  load();
+})();
+</script>
+</body>
+</html>

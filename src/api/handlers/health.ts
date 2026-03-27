@@ -75,6 +75,25 @@ app.get('/', (c) => {
     response.litestream = litestreamOk ? 'replicating' : 'unknown';
   }
 
+  // Agent freshness from notes
+  try {
+    const agentRows = rawDb.prepare(
+      'SELECT agent_name, MAX(created_at) as last_note FROM notes GROUP BY agent_name'
+    ).all() as Array<{ agent_name: string | null; last_note: string }>;
+    const agents: Record<string, { last_note: string; hours_ago: number }> = {};
+    const nowMs = Date.now();
+    for (const row of agentRows) {
+      if (!row.agent_name) continue;
+      const hoursAgo = Math.round((nowMs - new Date(row.last_note).getTime()) / 3600000 * 10) / 10;
+      agents[row.agent_name] = { last_note: row.last_note, hours_ago: hoursAgo };
+    }
+    if (Object.keys(agents).length > 0) {
+      response.agents = agents;
+    }
+  } catch {
+    // notes table may not exist yet
+  }
+
   return c.json(response, isHealthy ? 200 : 503);
 });
 

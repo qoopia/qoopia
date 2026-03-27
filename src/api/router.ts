@@ -21,6 +21,7 @@ import openapiHandler from './handlers/openapi.js';
 import mcpHandler from './handlers/mcp.js';
 import exportHandler from './handlers/export.js';
 import oauthHandler from './handlers/oauth.js';
+import observeHandler from './handlers/observe.js';
 
 const api = new Hono();
 
@@ -33,7 +34,8 @@ api.route('/api/v1/health', healthHandler);
 api.route('/api/v1/auth', authHandler);
 api.route('/api/v1/openapi.json', openapiHandler);
 
-// OAuth 2.0 routes (no auth middleware — public endpoints)
+// OAuth 2.0 routes — public endpoints except /oauth/authorize which requires auth
+api.use('/oauth/authorize', authMiddleware);
 api.route('/', oauthHandler);
 
 // Auth middleware for all protected routes
@@ -47,6 +49,10 @@ for (const route of protectedRoutes) {
 api.use('/mcp', authMiddleware);
 api.use('/mcp/*', authMiddleware);
 
+// Observe endpoint (auth required)
+api.use('/api/v1/observe', authMiddleware);
+api.use('/api/v1/observe/*', authMiddleware);
+
 // Rate limiting (after auth, before permissions)
 for (const route of protectedRoutes) {
   api.use(`/api/v1/${route}/*`, rateLimitMiddleware);
@@ -54,6 +60,8 @@ for (const route of protectedRoutes) {
 }
 api.use('/mcp', rateLimitMiddleware);
 api.use('/mcp/*', rateLimitMiddleware);
+api.use('/api/v1/observe', rateLimitMiddleware);
+api.use('/api/v1/observe/*', rateLimitMiddleware);
 
 // Permissions middleware for entity routes (not agents/export — those have own checks)
 const entityRoutes = ['projects', 'tasks', 'deals', 'contacts', 'finances', 'activity', 'search', 'events', 'batch'];
@@ -82,6 +90,7 @@ api.route('/api/v1/batch', batchHandler);
 api.route('/api/v1/agents', agentsHandler);
 api.route('/api/v1/export', exportHandler);
 api.route('/mcp', mcpHandler);
+api.route('/api/v1/observe', observeHandler);
 
 // Wire batch handler to route internally through the app
 setBatchRouter(api);

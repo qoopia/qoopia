@@ -3,7 +3,7 @@ import { ulid } from 'ulid';
 import { rawDb } from './connection.js';
 import { logger } from '../core/logger.js';
 
-const CURRENT_VERSION = 2;
+const CURRENT_VERSION = 3;
 
 export function runMigrations() {
   const currentVersion = rawDb.prepare(
@@ -30,6 +30,16 @@ export function runMigrations() {
         'OAuth tables: oauth_clients, oauth_codes, oauth_tokens'
       );
       logger.info('Migration 002 applied');
+    }
+
+    if (latest.v < 3) {
+      logger.info('Running migration 003: Notes table...');
+      rawDb.exec(MIGRATION_003);
+      rawDb.prepare('INSERT INTO schema_versions (version, description) VALUES (?, ?)').run(
+        3,
+        'Notes table with FTS5 and triggers'
+      );
+      logger.info('Migration 003 applied');
     }
 
     if (latest.v >= CURRENT_VERSION) {
@@ -62,7 +72,7 @@ function seedOAuthClients() {
         "INSERT INTO agents (id, workspace_id, name, type, api_key_hash, permissions) VALUES (?, ?, 'system', 'system', ?, ?)"
       ).run(sysId, ws.id, sysHash, JSON.stringify({ projects: '*', rules: [{ entity: '*', actions: ['read', 'create', 'update', 'delete'] }] }));
       agentsToSeed.push({ id: sysId, workspace_id: ws.id, name: 'system' });
-      logger.info({ agent_id: sysId, api_key: sysKey }, 'Created system agent for OAuth');
+      logger.info({ agent_id: sysId }, 'Created system agent for OAuth');
     }
   }
 
@@ -79,7 +89,6 @@ function seedOAuthClients() {
     logger.info({
       client_name: agent.name,
       client_id: clientId,
-      client_secret: clientSecret,
     }, `OAuth client created: ${agent.name}`);
   }
 }
@@ -476,4 +485,41 @@ CREATE INDEX IF NOT EXISTS idx_oauth_tokens_client ON oauth_tokens(client_id);
 CREATE INDEX IF NOT EXISTS idx_oauth_tokens_agent ON oauth_tokens(agent_id);
 CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expires ON oauth_tokens(expires_at) WHERE revoked = 0;
 CREATE INDEX IF NOT EXISTS idx_oauth_clients_agent ON oauth_clients(agent_id);
+`;
+
+const MIGRATION_003 = `
+-- ============================================================
+-- Notes Table (Activity-First Memory)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS notes (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+  agent_id TEXT,
+  agent_name TEXT,
+  session_id TEXT,
+  text TEXT NOT NULL,
+  project_id TEXT REFERENCES projects(id),
+  source TEXT DEFAULT 'manual',
+  embedding BLOB,
+  matched_entities TEXT DEFAULT '[]',
+  auto_updates TEXT DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_workspace ON notes(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_agent ON notes(agent_name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project_id) WHERE project_id IS NOT NULL;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(text, content=notes, content_rowid=rowid);
+
+CREATE TRIGGER IF NOT EXISTS notes_fts_ai AFTER INSERT ON notes BEGIN
+  INSERT INTO notes_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_fts_ad AFTER DELETE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_fts_au AFTER UPDATE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+  INSERT INTO notes_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
 `;

@@ -1,9 +1,35 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+
+# Database
 data/*.db
 data/*.db-wal
 data/*.db-shm
+
+# Secrets & credentials
 .env
+.env.*
+!.env.example
 .api-key
 data/.jwt-secret
+
+# Logs
 *.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.bak

@@ -1,8 +1,9 @@
 import { createMiddleware } from 'hono/factory';
 import crypto from 'node:crypto';
 import { rawDb } from '../../db/connection.js';
+import type { AuthContext } from '../../types/index.js';
 
-export const idempotencyMiddleware = createMiddleware(async (c, next) => {
+export const idempotencyMiddleware = createMiddleware<{ Variables: { auth: AuthContext } }>(async (c, next) => {
   // Only applies to POST requests
   if (c.req.method !== 'POST') {
     return next();
@@ -13,7 +14,13 @@ export const idempotencyMiddleware = createMiddleware(async (c, next) => {
     return next();
   }
 
-  const keyHash = crypto.createHash('sha256').update(idempotencyKey).digest('hex');
+  // Scope key to workspace + route + method to prevent cross-tenant replay
+  const auth = c.get('auth');
+  const workspaceId = auth?.workspace_id || 'anonymous';
+  const route = new URL(c.req.url).pathname;
+  const method = c.req.method;
+  const scopedKey = `${workspaceId}:${route}:${method}:${idempotencyKey}`;
+  const keyHash = crypto.createHash('sha256').update(scopedKey).digest('hex');
 
   // Check if key already exists and not expired
   const existing = rawDb.prepare(

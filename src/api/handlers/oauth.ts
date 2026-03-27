@@ -7,6 +7,7 @@ import { SignJWT, jwtVerify, type JWTPayload } from 'jose';
 import { ulid } from 'ulid';
 import { rawDb } from '../../db/connection.js';
 import { logger } from '../../core/logger.js';
+import type { AuthContext } from '../../types/index.js';
 
 // ── JWT Secret Management ───────────────────────────────────
 
@@ -118,7 +119,7 @@ export function checkOAuthRateLimit(ip: string): { allowed: boolean; retryAfter:
 
 // ── Hono App ────────────────────────────────────────────────
 
-const oauth = new Hono();
+const oauth = new Hono<{ Variables: { auth: AuthContext } }>();
 
 // Rate limit middleware for token/revoke endpoints
 const oauthRateLimitMiddleware = async (c: Parameters<Parameters<typeof oauth.use>[1]>[0], next: Parameters<Parameters<typeof oauth.use>[1]>[1]) => {
@@ -255,6 +256,12 @@ oauth.get('/oauth/authorize', (c) => {
 // ── 3b. POST /oauth/authorize (form submit) ─────────────────
 
 oauth.post('/oauth/authorize', async (c) => {
+  // Require authenticated resource owner (authMiddleware runs before this)
+  const auth = c.get('auth');
+  if (!auth) {
+    return c.json(oauthError('access_denied', 'Authentication required to authorize', 401).body, 401);
+  }
+
   const body = await c.req.parseBody();
   const action = body['action'] as string;
   const clientId = body['client_id'] as string;
@@ -285,10 +292,14 @@ oauth.post('/oauth/authorize', async (c) => {
     return c.json(oauthError('invalid_request', 'redirect_uri not registered').body, 400);
   }
 
-  // Get agent's workspace
+  // Verify the authenticated user belongs to the same workspace as the client's agent
   const agent = rawDb.prepare('SELECT workspace_id FROM agents WHERE id = ?').get(client.agent_id) as { workspace_id: string } | undefined;
   if (!agent) {
     return c.json(oauthError('server_error', 'Agent not found for client').body, 500);
+  }
+
+  if (agent.workspace_id !== auth.workspace_id) {
+    return c.json(oauthError('access_denied', 'Client does not belong to your workspace').body, 403);
   }
 
   // Generate authorization code
@@ -300,7 +311,7 @@ oauth.post('/oauth/authorize', async (c) => {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(codeHash, clientId, redirectUri, agent.workspace_id, client.agent_id, codeChallenge, codeChallengeMethod, isoFuture(AUTH_CODE_TTL));
 
-  logger.info({ client_id: clientId, agent_id: client.agent_id }, 'Authorization code issued');
+  logger.info({ client_id: clientId, agent_id: client.agent_id, authorized_by: auth.id }, 'Authorization code issued');
 
   const url = new URL(redirectUri);
   url.searchParams.set('code', code);

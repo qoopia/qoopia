@@ -30,8 +30,8 @@ for (const agent of agentNames) {
   ).run(agentId, wsId, agent.name, agent.type, hash, JSON.stringify({ projects: '*', rules: [{ entity: '*', actions: ['read', 'create', 'update', 'delete'] }] }));
 
   console.log(`\n  Agent: ${agent.name}`);
-  console.log(`  API Key: ${rawKey}`);
-  console.log(`  (save this — it won't be shown again)`);
+  console.log(`  API Key: ${rawKey.slice(0, 10)}...${rawKey.slice(-4)}`);
+  console.log(`  (save the full key from your secure config — it won't be shown again)`);
 }
 
 // Create user
@@ -39,13 +39,16 @@ const userId = ulid();
 const userKey = `qp_u_${crypto.randomBytes(32).toString('hex')}`;
 const userHash = crypto.createHash('sha256').update(userKey).digest('hex');
 
-rawDb.prepare(
-  "INSERT INTO users (id, workspace_id, name, email, role, api_key_hash) VALUES (?, ?, 'Askhat', 'askhat.soltanov.1984@gmail.com', 'owner', ?)"
-).run(userId, wsId, userHash);
+const seedUserName = process.env.QOOPIA_SEED_USER_NAME || 'Admin';
+const seedUserEmail = process.env.QOOPIA_SEED_USER_EMAIL || 'admin@localhost';
 
-console.log(`\n  User: Askhat (owner)`);
-console.log(`  API Key: ${userKey}`);
-console.log(`  (save this — it won't be shown again)\n`);
+rawDb.prepare(
+  "INSERT INTO users (id, workspace_id, name, email, role, api_key_hash) VALUES (?, ?, ?, ?, 'owner', ?)"
+).run(userId, wsId, seedUserName, seedUserEmail, userHash);
+
+console.log(`\n  User: ${seedUserName} (owner)`);
+console.log(`  API Key: ${userKey.slice(0, 10)}...${userKey.slice(-4)}`);
+console.log(`  (save the full key from your secure config — it won't be shown again)\n`);
 
 rawDb.close();
 logger.info('Seed complete');
