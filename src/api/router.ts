@@ -34,10 +34,14 @@ api.use('*', requestIdMiddleware);
 
 // No-auth routes
 api.route('/api/v1/health', healthHandler);
+api.route('/health', healthHandler);
 api.route('/api/v1/auth', authHandler);
 api.route('/api/v1/openapi.json', openapiHandler);
 
-// OAuth 2.0 routes — all public (authorize must be unauthenticated for OAuth flow)
+// OAuth 2.0 routes — authorize/token/revoke are public, but register requires auth
+// CRITICAL #1: dynamic client registration requires a valid API key to prevent
+// unauthenticated clients from exploiting the auto-approve flow.
+api.use('/oauth/register', authMiddleware);
 api.route('/', oauthHandler);
 
 // Auth middleware for all protected routes

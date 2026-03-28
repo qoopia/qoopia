@@ -609,6 +609,61 @@ function handleToolsList(): unknown {
   return { tools: TOOLS };
 }
 
+// CRITICAL #2: Map tool names to [entity, action] for permission enforcement
+const TOOL_PERMISSIONS: Record<string, [string, string]> = {
+  list_projects: ['project', 'read'],
+  create_project: ['project', 'create'],
+  update_project: ['project', 'update'],
+  delete_project: ['project', 'delete'],
+  list_tasks: ['task', 'read'],
+  get_task: ['task', 'read'],
+  create_task: ['task', 'create'],
+  update_task: ['task', 'update'],
+  delete_task: ['task', 'delete'],
+  list_deals: ['deal', 'read'],
+  create_deal: ['deal', 'create'],
+  update_deal: ['deal', 'update'],
+  delete_deal: ['deal', 'delete'],
+  list_contacts: ['contact', 'read'],
+  create_contact: ['contact', 'create'],
+  update_contact: ['contact', 'update'],
+  delete_contact: ['contact', 'delete'],
+  list_finances: ['finance', 'read'],
+  create_finance: ['finance', 'create'],
+  update_finance: ['finance', 'update'],
+  delete_finance: ['finance', 'delete'],
+  get_activity: ['activity', 'read'],
+  note: ['activity', 'create'],
+  report_activity: ['activity', 'create'],
+  get_dashboard_brief: ['activity', 'read'],
+  semantic_search: ['task', 'read'],
+  get_embeddings_capabilities: ['task', 'read'],
+  read_file: ['file', 'read'],
+  write_file: ['file', 'create'],
+  list_files: ['file', 'read'],
+};
+
+function checkMcpToolPermission(agentId: string, toolName: string, agentName: string): string | null {
+  const required = TOOL_PERMISSIONS[toolName];
+  if (!required) return null; // Unknown tool — let handleToolCall return the error
+
+  const [reqEntity, reqAction] = required;
+
+  const agentRow = rawDb.prepare('SELECT permissions FROM agents WHERE id = ? AND active = 1').get(agentId) as { permissions: string } | undefined;
+  if (!agentRow) return 'Agent not found or inactive';
+
+  let agentPerms: { rules?: Array<{ entity: string; actions: string[] }> } = {};
+  try { agentPerms = JSON.parse(agentRow.permissions); } catch { /* empty perms */ }
+
+  const allowed = (agentPerms.rules || []).some(rule => {
+    if (rule.entity !== '*' && rule.entity !== reqEntity && rule.entity !== reqEntity + 's') return false;
+    const actions = rule.actions.flatMap((a: string) => a === 'write' ? ['create', 'update', 'delete'] : [a]);
+    return actions.includes(reqAction);
+  });
+
+  return allowed ? null : `Agent '${agentName}' does not have '${reqAction}' permission for '${reqEntity}'`;
+}
+
 async function handleToolCall(name: string, args: Record<string, unknown>, workspaceId: string, actorId: string): Promise<unknown> {
   const limit = Math.min(Number(args.limit) || 50, 100);
 
@@ -1287,6 +1342,13 @@ app.post('/', async (c) => {
       const params = body.params as { name: string; arguments?: Record<string, unknown> } | undefined;
       if (!params?.name) {
         return c.json({ jsonrpc: '2.0', id: body.id, error: { code: -32602, message: 'Missing tool name' } } satisfies McpResponse);
+      }
+      // CRITICAL #2: Enforce agent permissions for each MCP tool call
+      if (auth.type === 'agent') {
+        const permError = checkMcpToolPermission(auth.id, params.name, auth.name);
+        if (permError) {
+          return c.json({ jsonrpc: '2.0', id: body.id, error: { code: -32000, message: permError } } satisfies McpResponse);
+        }
       }
       const toolResult = await handleToolCall(params.name, params.arguments || {}, auth.workspace_id, auth.id || 'mcp-user');
       if (toolResult === null) {
