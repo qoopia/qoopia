@@ -429,8 +429,8 @@ function classifyConfidence(text: string, entityName: string, matchMethod: 'llm'
   // Exact title substring → high
   if (textLower.includes(nameLower)) return 'high';
 
-  // >=70% title word overlap → high
-  if (titleOverlapRatio(text, entityName) >= 0.7) return 'high';
+  // >=50% title word overlap → high (3/5 words matching is sufficient for confident match)
+  if (titleOverlapRatio(text, entityName) >= 0.5) return 'high';
 
   // LLM already filtered to high confidence internally
   if (matchMethod === 'llm') return 'medium';
@@ -538,10 +538,19 @@ export function detectStaleTasks(
 
     const updatedAt = task.updated_at || '1970-01-01T00:00:00Z';
 
+    // Build a search keyword from the most meaningful words in the title
+    // Skip common prefixes like "test", "review", short stop words, and pick the first substantive word
+    const titleKeywords = task.title
+      .toLowerCase()
+      .replace(/[^\w\s-]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length > 3 && !['test', 'this', 'that', 'with', 'from', 'into', 'auto', 'review'].includes(w));
+    const searchWord = titleKeywords[0] || task.title.toLowerCase().split(/\s+/)[0];
+
     // Check notes created after task was last updated
     const recentNotes = rawDb.prepare(
       `SELECT text FROM notes WHERE workspace_id = ? AND created_at > ? AND LOWER(text) LIKE ? LIMIT 3`
-    ).all(workspaceId, updatedAt, `%${task.title.toLowerCase().split(/\s+/)[0]}%`) as Array<{ text: string }>;
+    ).all(workspaceId, updatedAt, `%${searchWord}%`) as Array<{ text: string }>;
 
     for (const note of recentNotes) {
       if (donePattern.test(note.text) && titleOverlapRatio(note.text, task.title) >= 0.4) {
@@ -559,7 +568,7 @@ export function detectStaleTasks(
     // Check activity entries
     const recentActivity = rawDb.prepare(
       `SELECT summary FROM activity WHERE workspace_id = ? AND timestamp > ? AND LOWER(summary) LIKE ? LIMIT 3`
-    ).all(workspaceId, updatedAt, `%${task.title.toLowerCase().split(/\s+/)[0]}%`) as Array<{ summary: string }>;
+    ).all(workspaceId, updatedAt, `%${searchWord}%`) as Array<{ summary: string }>;
 
     for (const act of recentActivity) {
       if (donePattern.test(act.summary) && titleOverlapRatio(act.summary, task.title) >= 0.4) {
