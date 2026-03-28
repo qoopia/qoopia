@@ -163,11 +163,16 @@ app.post('/', async (c) => {
   }
 
   // Derive agent name from auth context, not request body
+  // Map Claude Code / coding-agent sub-agent sessions to Claude agent
+  const CLAUDE_AGENT_ID = '01CLAUDE0CODE0AGENT0000001';
+  const isClaudeSession = /claude[\s-]?code|coding[\s-]?agent|session:.*claude/i.test(
+    `${body.content || ''} ${body.session_key || ''}`
+  );
   const buffered: BufferedEvent = {
     ...body,
-    agent: auth.name,
+    agent: isClaudeSession ? 'Claude' : auth.name,
     workspace_id: auth.workspace_id,
-    actor_id: auth.id,
+    actor_id: isClaudeSession ? CLAUDE_AGENT_ID : auth.id,
     received_at: new Date().toISOString(),
   };
 
