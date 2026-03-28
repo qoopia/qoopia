@@ -363,17 +363,22 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
         if(n)AGENT_IDS[a.id]=n;
       });
 
-      // Normalize activity: resolve actor ID to name, map summary to content
-      allActivity=allActivity.map(a=>({
-        ...a,
-        agent_name: a.agent_name || AGENT_IDS[a.actor] || a.actor || 'system',
-        content: a.content || a.summary || a.text || a.description || a.action || ''
-      }));
+      // Normalize activity: resolve actor ID to name, map summary to content, unify Claude variants
+      const CLAUDE_ALIASES=/^claude[\s_-]?(code|chat|sonnet|opus)?$/i;
+      allActivity=allActivity.map(a=>{
+        let name = a.agent_name || AGENT_IDS[a.actor] || a.actor || 'system';
+        if(CLAUDE_ALIASES.test(name)) name='claude';
+        return {
+          ...a,
+          agent_name: name,
+          content: a.content || a.summary || a.text || a.description || a.action || ''
+        };
+      });
 
       // Update agent cards
       updateAgentCards();
 
-      const agentSet=new Set(['aidan','alan','aizek','claude']);
+      const agentSet=new Set(['aidan','alan','aizek','dan','claude']);
       allActivity.forEach(a=>{if(a.agent_name)agentSet.add(a.agent_name.toLowerCase())});
 
       renderChips(agentSet);
@@ -387,7 +392,7 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
   }
 
   function updateAgentCards(){
-    const names=['aidan','alan','aizek','claude'];
+    const names=['aidan','alan','aizek','dan','claude'];
     names.forEach(name=>{
       // Count tasks assigned to this agent
       const agentObj=allAgents.find(a=>(a.name||'').toLowerCase()===name);
@@ -414,7 +419,7 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
   function renderChips(agents){
     const c=$('#agentChips');
     c.innerHTML='<button class="chip'+(activeFilter===null?' active':'')+'" data-a="">All</button>';
-    const names=['aidan','alan','aizek','claude'];
+    const names=['aidan','alan','aizek','dan','claude'];
     [...agents].forEach(n=>{if(!names.includes(n))names.push(n)});
     names.forEach(n=>{
       c.innerHTML+='<button class="chip'+(activeFilter===n?' active':'')+'" data-a="'+n+'">'+cap(n)+'</button>';
