@@ -352,6 +352,13 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
         if(n)AGENT_IDS[a.id]=n;
       });
 
+      // Normalize activity: resolve actor ID to name, map summary to content
+      allActivity=allActivity.map(a=>({
+        ...a,
+        agent_name: a.agent_name || AGENT_IDS[a.actor] || a.actor || 'system',
+        content: a.content || a.summary || a.text || a.description || a.action || ''
+      }));
+
       // Update agent cards
       updateAgentCards();
 
