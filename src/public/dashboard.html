@@ -266,7 +266,7 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
 <script>
 (function(){
   const BASE='https://mcp.qoopia.ai';
-  const TOKEN='qp_a_f61a04a908dd0eb10e0d3c465275dde4a4f389e7d633b70d3c5ab1dc9c92b35d';
+  let TOKEN=sessionStorage.getItem('qoopia_token')||'';
   const AGENT_COLORS={aidan:'#4A7BF7',alan:'#22C55E',aizek:'#F59E0B',claude:'#A78BFA',system:'#7B93B0'};
   const STAGE_COLORS={active:'#4A7BF7',negotiation:'#4A7BF7',proposal:'#A78BFA',discovery:'#7B93B0',paused:'#F59E0B',done:'#22C55E',closed:'#22C55E'};
   const AGENT_IDS={};
@@ -288,7 +288,34 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
     return r.json();
   }
 
+  function showLogin(){
+    document.getElementById('app').innerHTML=`
+      <div style="display:flex;align-items:center;justify-content:center;height:100vh">
+        <div style="background:#111827;padding:2rem;border-radius:12px;max-width:360px;width:100%">
+          <h2 style="color:#fff;margin:0 0 1rem;text-align:center">Qoopia Dashboard</h2>
+          <input id="tokenInput" type="password" placeholder="API Token" style="width:100%;padding:10px;border-radius:8px;border:1px solid #374151;background:#1F2937;color:#fff;box-sizing:border-box;margin-bottom:1rem;font-size:14px">
+          <button id="loginBtn" style="width:100%;padding:10px;border-radius:8px;border:none;background:#4A7BF7;color:#fff;cursor:pointer;font-size:14px">Sign in</button>
+          <p id="loginErr" style="color:#EF4444;text-align:center;margin:0.5rem 0 0;display:none">Invalid token</p>
+        </div>
+      </div>`;
+    document.getElementById('loginBtn').onclick=async()=>{
+      const t=document.getElementById('tokenInput').value.trim();
+      if(!t)return;
+      try{
+        const r=await fetch(BASE+'/api/v1/projects',{headers:{'Authorization':'Bearer '+t}});
+        if(!r.ok)throw new Error();
+        TOKEN=t;
+        sessionStorage.setItem('qoopia_token',t);
+        location.reload();
+      }catch(e){
+        document.getElementById('loginErr').style.display='block';
+      }
+    };
+    document.getElementById('tokenInput').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('loginBtn').click()});
+  }
+
   function init(){
+    if(!TOKEN){showLogin();return;}
     loadAll();
     pollTimer=setInterval(pollActivity,30000);
   }
