@@ -260,7 +260,7 @@ oauth.post('/oauth/authorize', async (c) => {
   if (!auth) {
     // Get the first (and only) workspace for auto-approve
     const ws = rawDb.prepare('SELECT id FROM workspaces LIMIT 1').get() as { id: string } | undefined;
-    auth = { id: 'owner', workspace_id: ws?.id || 'default' };
+    auth = { type: 'user' as const, id: 'owner', workspace_id: ws?.id || 'default', name: 'owner' };
   }
 
   const body = await c.req.parseBody();
