@@ -123,18 +123,47 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
 .ftr a{color:var(--accent);text-decoration:none}
 .ftr a:hover{text-decoration:underline}
 
+/* Notes panel */
+.note-item{padding:12px 20px;border-bottom:1px solid rgba(26,51,88,.5);transition:background .15s}
+.note-item:hover{background:rgba(255,255,255,.02)}
+.note-item:last-child{border-bottom:none}
+.note-head{display:flex;align-items:center;gap:6px;margin-bottom:4px}
+.note-agent{font-size:11px;font-weight:600}
+.note-time{font-size:10px;color:var(--muted);margin-left:auto;font-family:var(--mono)}
+.note-text{font-size:12px;color:var(--muted);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.4}
+
+/* Stale warning badge */
+.stale-badge{display:inline-flex;align-items:center;gap:3px;font-size:9px;padding:2px 6px;border-radius:4px;background:rgba(245,158,11,.12);color:var(--amber);font-weight:500;border:1px solid rgba(245,158,11,.2);flex-shrink:0;margin-left:4px}
+.stale-badge::before{content:'⚠';font-size:9px}
+.task-stale{border-left:2px solid var(--amber);padding-left:8px}
+
 @media(max-width:768px){
   .metrics{grid-template-columns:repeat(2,1fr);gap:10px;padding:14px 16px}
   .main{grid-template-columns:1fr;padding:0 16px 16px}
   .hdr{padding:12px 16px}
   .card-val{font-size:22px}
   .panel-body{max-height:320px}
+  /* Touch-friendly buttons on mobile */
+  .btn,.chip,.tab,.drawer-tab{min-height:36px;display:inline-flex;align-items:center;justify-content:center}
+  .agent-card{padding:14px 16px}
+  .hdr-r .btn{padding:8px 14px}
 }
 @media(max-width:480px){
   .metrics{grid-template-columns:1fr 1fr;gap:8px;padding:10px 12px}
   .main{padding:0 12px 12px;gap:12px}
   .hdr{padding:10px 12px}
   .logo-text{font-size:18px}
+  .badge{display:none}
+  /* Chips scroll horizontally on small screens */
+  .chips{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-bottom:2px}
+  .chips::-webkit-scrollbar{display:none}
+  .chip{white-space:nowrap;flex-shrink:0}
+  /* Task tabs full width */
+  .tabs{overflow-x:auto}
+  /* Notes clamped tighter */
+  .note-text{-webkit-line-clamp:2}
+  /* footer simplified */
+  .ftr{flex-direction:column;gap:4px;text-align:center;padding:12px}
 }
 </style>
 </head>
@@ -265,6 +294,17 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
           <div class="skel" style="width:50%"></div>
         </div>
       </div>
+
+      <div class="panel">
+        <div class="panel-hdr">
+          <div class="panel-title">Recent Notes</div>
+        </div>
+        <div class="panel-body" id="notesList" style="max-height:300px">
+          <div class="skel" style="width:75%"></div>
+          <div class="skel" style="width:60%"></div>
+          <div class="skel" style="width:70%"></div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -284,6 +324,8 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
   let allTasks=[];
   let allActivity=[];
   let allAgents=[];
+  let allNotes=[];
+  let staleTaskIds=new Set();
   let activeFilter=null;
   let activeTab='open';
   let selectedAgent=null;
@@ -339,13 +381,26 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
 
   $('#reconnectBtn').onclick=()=>loadAll();
 
+  async function mcpBrief(){
+    const r=await fetch(BASE+'/mcp',{
+      method:'POST',
+      headers:{'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'},
+      body:JSON.stringify({jsonrpc:'2.0',id:99,method:'tools/call',params:{name:'brief',arguments:{}}})
+    });
+    if(!r.ok)throw new Error(r.status);
+    const j=await r.json();
+    const text=j?.result?.content?.[0]?.text||'{}';
+    return JSON.parse(text);
+  }
+
   async function loadAll(){
     try{
-      const[tasks,deals,activity,agents]=await Promise.all([
+      const[tasks,deals,activity,agents,brief]=await Promise.all([
         api('/api/v1/tasks'),
         api('/api/v1/deals'),
         api('/api/v1/activity?limit=50').catch(()=>({data:[]})),
-        api('/api/v1/agents').catch(()=>({data:[]}))
+        api('/api/v1/agents').catch(()=>({data:[]})),
+        mcpBrief().catch(()=>null)
       ]);
       setStatus(true);
 
@@ -356,6 +411,20 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
       allTasks=Array.isArray(tData)?tData:[];
       allActivity=Array.isArray(aData)?aData:[];
       allAgents=Array.isArray(agData)?agData:[];
+
+      // Extract notes and stale tasks from brief
+      if(brief){
+        allNotes=Array.isArray(brief?.notes?.items)?brief.notes.items:[];
+        // Build stale task set from annotated tasks in brief
+        staleTaskIds=new Set();
+        const briefTasks=Array.isArray(brief?.tasks?.items)?brief.tasks.items:[];
+        briefTasks.forEach(t=>{if(t.stale_warning)staleTaskIds.add(t.id)});
+        // Merge stale_warning into allTasks
+        const briefMap={};
+        briefTasks.forEach(t=>{briefMap[t.id]=t});
+        allTasks=allTasks.map(t=>briefMap[t.id]?{...t,stale_warning:briefMap[t.id].stale_warning}:t);
+      }
+      renderNotes();
 
       // Map agent IDs to names
       allAgents.forEach(a=>{
@@ -448,6 +517,13 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
     }).join('');
   }
 
+  function isStale(t){
+    const SEVEN_DAYS=7*24*60*60*1000;
+    const ref=t.updated_at||t.created_at||t.timestamp;
+    if(!ref)return false;
+    return(Date.now()-new Date(ref))>SEVEN_DAYS&&t.status!=='done'&&t.status!=='cancelled';
+  }
+
   function renderTasks(){
     const el=$('#taskList');
     const filtered=allTasks.filter(t=>{
@@ -460,7 +536,8 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
       const pri=t.priority||'medium';
       const due=t.due_date?fmtDate(t.due_date):'';
       const isOver=t.due_date&&new Date(t.due_date)<new Date()&&t.status!=='done';
-      return '<div class="task"><div class="pri pri-'+pri+'"></div><div class="task-name">'+esc(t.title||t.name)+'</div>'+(due?'<span class="task-date'+(isOver?' overdue':'')+'">'+due+'</span>':'')+'</div>';
+      const stale=isStale(t)||t.stale_warning;
+      return '<div class="task'+(stale?' task-stale':'')+'"><div class="pri pri-'+pri+'"></div><div class="task-name">'+esc(t.title||t.name)+(stale?'<span class="stale-badge"> stale</span>':'')+'</div>'+(due?'<span class="task-date'+(isOver?' overdue':'')+'">'+due+'</span>':'')+'</div>';
     }).join('');
   }
 
@@ -575,6 +652,59 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
       html+='</div>';
       el.innerHTML=html;
     }
+  }
+
+  function renderNotes(){
+    const el=$('#notesList');
+    if(!el)return;
+    // allNotes from brief, or fall back to allActivity filtered to type=note
+    let notes=allNotes;
+    if(!notes||!notes.length){
+      notes=allActivity.filter(a=>
+        (a.type&&a.type.toLowerCase()==='note')||
+        (a.content&&a.content.startsWith('['))
+      ).slice(0,20);
+    }
+    if(!notes.length){
+      // Attempt direct API fetch for notes via activity
+      fetch(BASE+'/api/v1/activity?limit=20',{headers:{'Authorization':'Bearer '+TOKEN}})
+        .then(r=>r.ok?r.json():null)
+        .then(j=>{
+          const items=j?.data||j?.items||j||[];
+          allNotes=Array.isArray(items)?items:[];
+          renderNotesItems(el,allNotes);
+        }).catch(()=>{
+          el.innerHTML='<div style="padding:20px;text-align:center;color:var(--muted);font-size:12px">No notes</div>';
+        });
+      return;
+    }
+    renderNotesItems(el,notes);
+  }
+
+  function renderNotesItems(el,notes){
+    if(!notes||!notes.length){el.innerHTML='<div style="padding:20px;text-align:center;color:var(--muted);font-size:12px">No notes</div>';return}
+    el.innerHTML=notes.map((n,i)=>{
+      const name=(n.agent_name||n.actor||'system').toLowerCase();
+      const color=AGENT_COLORS[name]||AGENT_COLORS.system;
+      const time=fmtTime(n.created_at||n.timestamp);
+      const text=n.content||n.text||n.summary||n.description||'';
+      const preview=text.length>200?text.slice(0,200)+'…':text;
+      return '<div class="note-item" data-ni="'+i+'" style="cursor:pointer"><div class="note-head"><span class="note-agent" style="color:'+color+'">'+cap(name)+'</span><span class="note-time">'+time+'</span></div><div class="note-text" id="note-body-'+i+'">'+esc(preview)+'</div></div>';
+    }).join('');
+    // Expand on click
+    el.querySelectorAll('.note-item').forEach((item,i)=>{
+      item.onclick=()=>{
+        const n=notes[i];
+        const text=n.content||n.text||n.summary||n.description||'';
+        const bodyEl=document.getElementById('note-body-'+i);
+        if(!bodyEl)return;
+        const isExpanded=item.dataset.expanded==='1';
+        bodyEl.style.webkitLineClamp=isExpanded?'2':'unset';
+        bodyEl.style.overflow=isExpanded?'hidden':'visible';
+        bodyEl.textContent=isExpanded?text.slice(0,200)+(text.length>200?'…':''):text;
+        item.dataset.expanded=isExpanded?'0':'1';
+      };
+    });
   }
 
   function cap(s){return s?s[0].toUpperCase()+s.slice(1):''}

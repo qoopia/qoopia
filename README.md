@@ -62,15 +62,15 @@ Agent (OpenClaw / Claude / GPT / custom)
                       (single file, zero ops)
 ```
 
-**29 MCP tools:** 11 read · 14 write · 3 intelligence (`note`, `recall`, `brief`) · plus file tools
+**29 MCP tools:** 11 read · 14 write · 4 intelligence (`note`, `recall`, `brief`, `observe`) · plus file tools
 
-**REST API** mirrors MCP with standard CRUD endpoints under `/api/v1/`. The observer endpoint (`/api/v1/observe`) receives webhook events from agent platforms and auto-logs activity.
+**REST API** mirrors MCP with standard CRUD endpoints under `/api/v1/`. The observer endpoint (`/api/v1/observe`) receives webhook events from agent platforms and auto-logs activity. Health check at `/health` and `/api/v1/health`.
 
 ## Stack
 
 - **Runtime:** Node.js + TypeScript
 - **HTTP:** Hono
-- **Database:** SQLite via better-sqlite3 (WAL mode, zero config)
+- **Database:** SQLite + FTS5 via better-sqlite3 (WAL mode, zero config)
 - **Auth:** API keys (agents & users) + OAuth 2.0 (client_credentials)
 - **Search:** Voyage AI embeddings + SQLite FTS5 (graceful degradation)
 - **Entity matching:** Claude Haiku for LLM matching, keyword fallback
@@ -167,7 +167,13 @@ qoopia migrate [data-dir]         Import V1 data
 
 ## Dashboard
 
-Web dashboard at `/dashboard` for viewing tasks, activity, and system status.
+Web dashboard at `/dashboard` for viewing tasks, activity, deals, notes, and system status. Features:
+- **6 agent cards** (Aidan, Alan, Aizek, Dan, Claude + custom) with task counts and last-seen
+- **Activity feed** with per-agent filtering
+- **Task tabs** (Open / In Progress / Done) with stale warnings (amber badge for tasks with no activity in 7+ days)
+- **Deals pipeline** with stage and value
+- **Recent notes panel** with expandable previews
+- **Mobile responsive** — works on phones and tablets
 
 ## Known limitations
 
