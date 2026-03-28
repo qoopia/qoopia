@@ -97,28 +97,49 @@ api.route('/api/v1/observe', observeHandler);
 // Wire batch handler to route internally through the app
 setBatchRouter(api);
 
-// Dashboard (static HTML)
+// Static files from public/ directory
 const publicDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'public');
-api.get('/dashboard', (c) => {
+
+// Landing page
+api.get('/', (c) => {
   try {
     const html = readFileSync(join(publicDir, 'index.html'), 'utf-8');
+    return c.html(html);
+  } catch {
+    return c.text('Not found', 404);
+  }
+});
+
+// Dashboard
+api.get('/dashboard', (c) => {
+  try {
+    const html = readFileSync(join(publicDir, 'dashboard.html'), 'utf-8');
     return c.html(html);
   } catch {
     return c.text('Dashboard not found', 404);
   }
 });
-api.get('/logo.svg', (c) => {
+
+// Generic static asset handler for public/ (svg, png, ico, css, js, etc.)
+const staticMimeTypes: Record<string, string> = {
+  svg: 'image/svg+xml',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  ico: 'image/x-icon',
+  css: 'text/css',
+  js: 'application/javascript',
+  woff: 'font/woff',
+  woff2: 'font/woff2',
+  webp: 'image/webp',
+};
+api.get('/:file{[^/]+\\.(svg|png|jpg|jpeg|ico|css|woff|woff2|webp)}', (c) => {
+  const filename = c.req.param('file');
   try {
-    const svg = readFileSync(join(publicDir, 'logo.svg'), 'utf-8');
-    return c.body(svg, 200, { 'Content-Type': 'image/svg+xml' });
-  } catch {
-    return c.text('Not found', 404);
-  }
-});
-api.get('/logo-dark.svg', (c) => {
-  try {
-    const svg = readFileSync(join(publicDir, 'logo-dark.svg'), 'utf-8');
-    return c.body(svg, 200, { 'Content-Type': 'image/svg+xml' });
+    const ext = filename.split('.').pop() ?? '';
+    const content = readFileSync(join(publicDir, filename));
+    const mime = staticMimeTypes[ext] ?? 'application/octet-stream';
+    return c.body(content.toString('binary'), 200, { 'Content-Type': mime });
   } catch {
     return c.text('Not found', 404);
   }
