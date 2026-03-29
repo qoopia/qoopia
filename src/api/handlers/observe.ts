@@ -157,7 +157,7 @@ app.post('/', async (c) => {
     return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Missing required fields: type, content' } }, 400);
   }
 
-  const validTypes = ['message_sent', 'session_compact', 'session_end'];
+  const validTypes = ['message_sent', 'session_compact', 'session_end', 'agent_response'];
   if (!validTypes.includes(body.type)) {
     return c.json({ error: { code: 'VALIDATION_ERROR', message: `Invalid type. Must be one of: ${validTypes.join(', ')}` } }, 400);
   }

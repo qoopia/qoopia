@@ -147,6 +147,8 @@ oauth.get('/.well-known/oauth-authorization-server', (c) => {
   // HIGH #10: Use QOOPIA_PUBLIC_URL exclusively, never derive from request headers
   const baseUrl = (process.env.QOOPIA_PUBLIC_URL || `http://localhost:${process.env.PORT || '3000'}`).replace(/\/$/, '');
 
+  logger.info({ step: 'WELL_KNOWN_AUTH_SERVER', baseUrl, user_agent: (c.req.header('User-Agent') || '').slice(0, 120) }, '>>> /.well-known/oauth-authorization-server');
+
   return c.json({
     issuer: baseUrl,
     authorization_endpoint: `${baseUrl}/oauth/authorize`,
@@ -165,6 +167,8 @@ oauth.get('/.well-known/oauth-authorization-server', (c) => {
 oauth.get('/.well-known/oauth-protected-resource', (c) => {
   // HIGH #10: Use QOOPIA_PUBLIC_URL exclusively, never derive from request headers
   const baseUrl = (process.env.QOOPIA_PUBLIC_URL || `http://localhost:${process.env.PORT || '3000'}`).replace(/\/$/, '');
+
+  logger.info({ step: 'WELL_KNOWN_RESOURCE', baseUrl, user_agent: (c.req.header('User-Agent') || '').slice(0, 120) }, '>>> /.well-known/oauth-protected-resource');
 
   return c.json({
     resource: baseUrl,
@@ -186,6 +190,19 @@ oauth.get('/oauth/authorize', (c) => {
   const codeChallenge = c.req.query('code_challenge');
   const codeChallengeMethod = c.req.query('code_challenge_method');
   const scope = c.req.query('scope') || '';
+
+  logger.info({
+    step: 'AUTHORIZE_GET',
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    state: state ? state.slice(0, 20) + '...' : null,
+    response_type: responseType,
+    has_code_challenge: !!codeChallenge,
+    code_challenge_method: codeChallengeMethod,
+    scope,
+    full_url: c.req.url,
+    user_agent: (c.req.header('User-Agent') || '').slice(0, 120),
+  }, '>>> GET /oauth/authorize');
 
   if (!clientId || !redirectUri || !responseType || !codeChallenge) {
     return c.json(oauthError('invalid_request', 'Missing required parameters: client_id, redirect_uri, response_type, code_challenge').body, 400);
@@ -279,6 +296,7 @@ oauth.post('/oauth/authorize', async (c) => {
     auth = { type: 'user' as const, id: 'owner', workspace_id: ws?.id || 'default', name: 'owner' };
   }
 
+  const contentType = c.req.header('content-type') || '';
   const body = await c.req.parseBody();
   const action = body['action'] as string;
   const clientId = body['client_id'] as string;
@@ -286,6 +304,19 @@ oauth.post('/oauth/authorize', async (c) => {
   const state = body['state'] as string;
   const codeChallenge = body['code_challenge'] as string;
   const codeChallengeMethod = (body['code_challenge_method'] as string) || 'S256';
+
+  logger.info({
+    step: 'AUTHORIZE_POST',
+    content_type: contentType,
+    action,
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    state: state ? state.slice(0, 20) + '...' : null,
+    has_code_challenge: !!codeChallenge,
+    code_challenge_method: codeChallengeMethod,
+    body_keys: Object.keys(body),
+    user_agent: (c.req.header('User-Agent') || '').slice(0, 120),
+  }, '>>> POST /oauth/authorize (consent submit)');
 
   if (action === 'deny') {
     const url = new URL(redirectUri);
@@ -328,12 +359,22 @@ oauth.post('/oauth/authorize', async (c) => {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(codeHash, clientId, redirectUri, agent.workspace_id, client.agent_id, codeChallenge, codeChallengeMethod, isoFuture(AUTH_CODE_TTL));
 
-  logger.info({ client_id: clientId, agent_id: client.agent_id, authorized_by: auth.id }, 'Authorization code issued');
-
   const url = new URL(redirectUri);
   url.searchParams.set('code', code);
   if (state) url.searchParams.set('state', state);
-  return c.redirect(url.toString());
+  const redirectTarget = url.toString();
+
+  logger.info({
+    step: 'AUTHORIZE_CODE_ISSUED',
+    client_id: clientId,
+    agent_id: client.agent_id,
+    authorized_by: auth.id,
+    redirect_target: redirectTarget.replace(/code=[^&]+/, 'code=REDACTED'),
+    code_length: code.length,
+    code_prefix: code.slice(0, 8),
+  }, '<<< Authorization code issued, redirecting (302)');
+
+  return c.redirect(redirectTarget);
 });
 
 // ── 4. POST /oauth/token ────────────────────────────────────
@@ -341,6 +382,21 @@ oauth.post('/oauth/authorize', async (c) => {
 oauth.post('/oauth/token', async (c) => {
   let params: Record<string, string>;
   const contentType = c.req.header('content-type') || '';
+
+  // Check for HTTP Basic auth (client_secret_basic) — Claude.ai might use this
+  const authHeader = c.req.header('Authorization') || '';
+  let basicClientId: string | undefined;
+  let basicClientSecret: string | undefined;
+  if (authHeader.startsWith('Basic ')) {
+    try {
+      const decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf-8');
+      const colonIdx = decoded.indexOf(':');
+      if (colonIdx > 0) {
+        basicClientId = decodeURIComponent(decoded.slice(0, colonIdx));
+        basicClientSecret = decodeURIComponent(decoded.slice(colonIdx + 1));
+      }
+    } catch {}
+  }
 
   if (contentType.includes('application/json')) {
     params = await c.req.json();
@@ -351,6 +407,31 @@ oauth.post('/oauth/token', async (c) => {
       if (typeof v === 'string') params[k] = v;
     }
   }
+
+  // If client credentials came via Basic auth, merge them in
+  if (basicClientId && !params.client_id) {
+    params.client_id = basicClientId;
+  }
+  if (basicClientSecret && !params.client_secret) {
+    params.client_secret = basicClientSecret;
+  }
+
+  logger.info({
+    step: 'TOKEN_REQUEST',
+    content_type: contentType,
+    grant_type: params.grant_type,
+    client_id: params.client_id,
+    has_client_secret: !!params.client_secret,
+    has_code: !!params.code,
+    has_code_verifier: !!params.code_verifier,
+    has_redirect_uri: !!params.redirect_uri,
+    redirect_uri: params.redirect_uri,
+    has_refresh_token: !!params.refresh_token,
+    has_basic_auth: !!basicClientId,
+    basic_client_id: basicClientId,
+    param_keys: Object.keys(params),
+    user_agent: (c.req.header('User-Agent') || '').slice(0, 120),
+  }, '>>> POST /oauth/token request');
 
   const grantType = params.grant_type;
 
@@ -394,6 +475,8 @@ oauth.post('/oauth/token', async (c) => {
 
     logger.info({ client_id: clientId, agent_id: client.agent_id, grant: 'client_credentials' }, 'Access token issued');
 
+    c.header('Cache-Control', 'no-store');
+    c.header('Pragma', 'no-cache');
     return c.json({
       access_token: accessToken,
       token_type: 'Bearer',
@@ -435,26 +518,42 @@ oauth.post('/oauth/token', async (c) => {
     } | undefined;
 
     if (!codeRecord) {
+      logger.warn({ step: 'TOKEN_FAIL', reason: 'code_not_found', client_id: clientId }, 'Token exchange: code not found in DB');
       const { body, status } = oauthError('invalid_grant', 'Invalid authorization code');
       return c.json(body, status);
     }
 
+    logger.info({
+      step: 'TOKEN_CODE_FOUND',
+      code_client_id: codeRecord.client_id,
+      code_redirect_uri: codeRecord.redirect_uri,
+      request_redirect_uri: redirectUri,
+      code_used: codeRecord.used,
+      code_expires_at: codeRecord.expires_at,
+      now: new Date().toISOString(),
+      has_code_challenge: !!codeRecord.code_challenge,
+    }, 'Token exchange: code found, validating...');
+
     if (codeRecord.used) {
+      logger.warn({ step: 'TOKEN_FAIL', reason: 'code_already_used' }, 'Token exchange: code already used');
       const { body, status } = oauthError('invalid_grant', 'Authorization code already used');
       return c.json(body, status);
     }
 
     if (new Date(codeRecord.expires_at) < new Date()) {
+      logger.warn({ step: 'TOKEN_FAIL', reason: 'code_expired', expires_at: codeRecord.expires_at, now: new Date().toISOString() }, 'Token exchange: code expired');
       const { body, status } = oauthError('invalid_grant', 'Authorization code expired');
       return c.json(body, status);
     }
 
     if (codeRecord.client_id !== clientId) {
+      logger.warn({ step: 'TOKEN_FAIL', reason: 'client_id_mismatch', expected: codeRecord.client_id, got: clientId }, 'Token exchange: client_id mismatch');
       const { body, status } = oauthError('invalid_grant', 'client_id mismatch');
       return c.json(body, status);
     }
 
     if (redirectUri && codeRecord.redirect_uri !== redirectUri) {
+      logger.warn({ step: 'TOKEN_FAIL', reason: 'redirect_uri_mismatch', expected: codeRecord.redirect_uri, got: redirectUri }, 'Token exchange: redirect_uri mismatch');
       const { body, status } = oauthError('invalid_grant', 'redirect_uri mismatch');
       return c.json(body, status);
     }
@@ -462,6 +561,7 @@ oauth.post('/oauth/token', async (c) => {
     // PKCE verification
     const computedChallenge = computeS256Challenge(codeVerifier);
     if (computedChallenge !== codeRecord.code_challenge) {
+      logger.warn({ step: 'TOKEN_FAIL', reason: 'pkce_mismatch', expected_challenge: codeRecord.code_challenge, computed_challenge: computedChallenge }, 'Token exchange: PKCE verification failed');
       const { body, status } = oauthError('invalid_grant', 'PKCE code_verifier verification failed');
       return c.json(body, status);
     }
@@ -484,14 +584,28 @@ oauth.post('/oauth/token', async (c) => {
        VALUES (?, ?, ?, ?, 'refresh_token', ?)`
     ).run(refreshHash, clientId, codeRecord.agent_id, codeRecord.workspace_id, isoFuture(REFRESH_TOKEN_TTL));
 
-    logger.info({ client_id: clientId, agent_id: codeRecord.agent_id, grant: 'authorization_code' }, 'Token pair issued');
-
-    return c.json({
+    const tokenResponse = {
       access_token: accessToken,
       token_type: 'Bearer',
       expires_in: ACCESS_TOKEN_TTL,
       refresh_token: refreshToken,
-    });
+      scope: '',
+    };
+
+    logger.info({
+      step: 'TOKEN_SUCCESS',
+      client_id: clientId,
+      agent_id: codeRecord.agent_id,
+      grant: 'authorization_code',
+      token_prefix: accessToken.slice(0, 20),
+      has_refresh: true,
+      response_keys: Object.keys(tokenResponse),
+    }, '<<< Token pair issued successfully');
+
+    // RFC 6749 Section 5.1: MUST include Cache-Control: no-store and Pragma: no-cache
+    c.header('Cache-Control', 'no-store');
+    c.header('Pragma', 'no-cache');
+    return c.json(tokenResponse);
   }
 
   // ── 4c. refresh_token ───────────────────────────────────
@@ -567,11 +681,14 @@ oauth.post('/oauth/token', async (c) => {
 
     logger.info({ client_id: clientId, agent_id: tokenRecord.agent_id, grant: 'refresh_token' }, 'Token pair refreshed (rotation)');
 
+    c.header('Cache-Control', 'no-store');
+    c.header('Pragma', 'no-cache');
     return c.json({
       access_token: accessToken,
       token_type: 'Bearer',
       expires_in: ACCESS_TOKEN_TTL,
       refresh_token: newRefreshToken,
+      scope: '',
     });
   }
 
@@ -627,6 +744,17 @@ oauth.post('/oauth/register', async (c) => {
     return c.json(errBody, status);
   }
 
+  logger.info({
+    step: 'REGISTER_REQUEST',
+    client_name: body.client_name,
+    redirect_uris: body.redirect_uris,
+    grant_types: body.grant_types,
+    response_types: body.response_types,
+    token_endpoint_auth_method: body.token_endpoint_auth_method,
+    scope: body.scope,
+    user_agent: (c.req.header('User-Agent') || '').slice(0, 120),
+  }, '>>> /oauth/register request');
+
   const clientName = (typeof body.client_name === 'string' && body.client_name) ? body.client_name : 'Unnamed Client';
   const redirectUris = body.redirect_uris;
 
@@ -668,7 +796,7 @@ oauth.post('/oauth/register', async (c) => {
     'INSERT INTO oauth_clients (id, name, agent_id, client_secret_hash, redirect_uris) VALUES (?, ?, ?, ?, ?)'
   ).run(clientId, clientName, agent.id, secretHash, JSON.stringify(redirectUris));
 
-  logger.info({ client_id: clientId, client_name: clientName, public: isPublic }, 'Dynamic client registered (RFC 7591)');
+  logger.info({ client_id: clientId, client_name: clientName, public: isPublic, auth_method: authMethod }, 'Dynamic client registered (RFC 7591)');
 
   // Determine grant_types: use client-requested values, or default based on auth method
   const defaultGrants = isPublic
@@ -695,6 +823,16 @@ oauth.post('/oauth/register', async (c) => {
     response.client_secret = clientSecret;
     response.client_secret_expires_at = 0; // RFC 7591: 0 means never expires
   }
+
+  logger.info({
+    step: 'REGISTER_RESPONSE',
+    client_id: clientId,
+    has_secret: !!clientSecret,
+    grant_types: grantTypes,
+    response_types: responseTypes,
+    auth_method: authMethod,
+    redirect_uris: redirectUris,
+  }, '<<< /oauth/register response');
 
   return c.json(response, 201);
 });

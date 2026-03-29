@@ -21,7 +21,7 @@ app.get('/', (c) => {
   if (entityType) { query += ' AND entity_type = ?'; params.push(entityType); }
   if (projectId) { query += ' AND project_id = ?'; params.push(projectId); }
 
-  query += ' ORDER BY id DESC LIMIT ?';
+  query += ' ORDER BY timestamp DESC LIMIT ?';
   params.push(limit + 1);
 
   const rows = rawDb.prepare(query).all(...params) as Record<string, unknown>[];
