@@ -97,7 +97,7 @@ function flushWorkspaceBuffer(workspaceId: string): { processed: number; matched
     for (const entity of matched) {
       logActivity({
         workspace_id: workspaceId,
-        actor: agents.join(', '),
+        actor: agents[0] || 'system',
         action: 'observed',
         entity_type: entity.type,
         entity_id: entity.id,
@@ -108,7 +108,7 @@ function flushWorkspaceBuffer(workspaceId: string): { processed: number; matched
   } else {
     logActivity({
       workspace_id: workspaceId,
-      actor: agents.join(', '),
+      actor: agents[0] || 'system',
       action: 'observed',
       entity_type: 'activity',
       summary: `Observed ${events.length} event(s) from ${agents.join(', ')}`,
@@ -164,14 +164,44 @@ app.post('/', async (c) => {
 
   // Derive agent name from auth context, not request body
   // Map sessions to correct agent by content/session heuristics
-  const CLAUDE_AGENT_ID = '01CLAUDE0CODE0AGENT0000001';
-  const DAN_AGENT_ID = '01DAN00AGENT0000000000001';
-  const isClaudeSession = /claude[\s-]?code|coding[\s-]?agent|session:.*claude/i.test(
-    `${body.content || ''} ${body.session_key || ''}`
-  );
-  const isDanSession = auth.name?.toLowerCase() === 'dan' || /\bdan\b/i.test(body.session_key || '');
-  const resolvedAgent = isDanSession ? 'Dan' : isClaudeSession ? 'Claude' : auth.name;
-  const resolvedActorId = isDanSession ? DAN_AGENT_ID : isClaudeSession ? CLAUDE_AGENT_ID : auth.id;
+  const AGENT_MAP: Record<string, { name: string; id: string }> = {
+    'aidan':  { name: 'Aidan',  id: '01KMKRVYF3YW28Q3P5EPSYC9M1' },
+    'alan':   { name: 'Alan',   id: '01KMKRVYF3MJP5WRVWTFN8V83W' },
+    'aizek':  { name: 'Aizek',  id: '01KMKRVYF38WSW95FCM6TH9WR3' },
+    'dan':    { name: 'Dan',    id: '01DAN00AGENT0000000000001' },
+    'claude': { name: 'Claude', id: '01CLAUDE0CODE0AGENT0000001' },
+  };
+
+  // Try to resolve agent from auth name first
+  const authNameLower = (auth.name || '').toLowerCase();
+  const sessionKey = body.session_key || '';
+  const content = body.content || '';
+  const combined = `${authNameLower} ${sessionKey} ${content}`.toLowerCase();
+
+  let resolvedAgent = auth.name;
+  let resolvedActorId = auth.id;
+
+  // Direct match from auth name
+  if (AGENT_MAP[authNameLower]) {
+    resolvedAgent = AGENT_MAP[authNameLower].name;
+    resolvedActorId = AGENT_MAP[authNameLower].id;
+  }
+  // Heuristic: check session_key and content for agent signatures
+  else {
+    for (const [key, val] of Object.entries(AGENT_MAP)) {
+      const pattern = new RegExp(`\\b${key}\\b|agent[:\\-_]${key}|openclaw-${key}`, 'i');
+      if (pattern.test(sessionKey) || pattern.test(content)) {
+        resolvedAgent = val.name;
+        resolvedActorId = val.id;
+        break;
+      }
+    }
+    // Fallback: claude code specific pattern
+    if (resolvedAgent === auth.name && /claude[\s-]?code|coding[\s-]?agent/i.test(combined)) {
+      resolvedAgent = AGENT_MAP['claude'].name;
+      resolvedActorId = AGENT_MAP['claude'].id;
+    }
+  }
   const buffered: BufferedEvent = {
     ...body,
     agent: resolvedAgent,

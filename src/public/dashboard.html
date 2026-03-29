@@ -317,7 +317,7 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
 <script>
 (function(){
   const BASE='https://mcp.qoopia.ai';
-  let TOKEN=sessionStorage.getItem('qoopia_token')||'';
+  let TOKEN=localStorage.getItem('qoopia_token')||'';
   const AGENT_COLORS={aidan:'#4A7BF7',alan:'#22C55E',aizek:'#F59E0B',dan:'#EC4899',claude:'#A78BFA',system:'#7B93B0'};
   const STAGE_COLORS={active:'#4A7BF7',negotiation:'#4A7BF7',proposal:'#A78BFA',discovery:'#7B93B0',paused:'#F59E0B',done:'#22C55E',closed:'#22C55E'};
   const AGENT_IDS={};
@@ -358,7 +358,7 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
         const r=await fetch(BASE+'/api/v1/projects',{headers:{'Authorization':'Bearer '+t}});
         if(!r.ok)throw new Error();
         TOKEN=t;
-        sessionStorage.setItem('qoopia_token',t);
+        localStorage.setItem('qoopia_token',t);
         location.reload();
       }catch(e){
         document.getElementById('loginErr').style.display='block';
@@ -571,8 +571,10 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
       const existIds=new Set(allActivity.map(a=>a.id));
       const newItems=items.filter(a=>a.id&&!existIds.has(a.id));
       if(newItems.length){
+        newItems.forEach(a=>{a.agent_name=a.agent_name||AGENT_IDS[a.actor]||a.actor||'system';});
         allActivity=[...newItems,...allActivity];
         renderActivity();
+        updateAgentCards();
       }
     }catch{setStatus(false)}
   }
