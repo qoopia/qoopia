@@ -198,8 +198,8 @@ oauth.get('/oauth/authorize', (c) => {
 
   // Validate client
   const client = rawDb.prepare(
-    'SELECT id, name, redirect_uris FROM oauth_clients WHERE id = ?'
-  ).get(clientId) as { id: string; name: string; redirect_uris: string } | undefined;
+    'SELECT id, name, agent_id, redirect_uris FROM oauth_clients WHERE id = ?'
+  ).get(clientId) as { id: string; name: string; agent_id: string; redirect_uris: string } | undefined;
 
   if (!client) {
     return c.json(oauthError('invalid_client', 'Unknown client_id').body, 400);
@@ -210,45 +210,28 @@ oauth.get('/oauth/authorize', (c) => {
     return c.json(oauthError('invalid_request', 'redirect_uri not registered for this client').body, 400);
   }
 
-  // Render authorization page
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Authorize — Qoopia</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e5e5e5; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-    .card { background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 2rem; max-width: 420px; width: 100%; }
-    h1 { font-size: 1.25rem; margin-bottom: 0.5rem; }
-    p { color: #a3a3a3; margin-bottom: 1.5rem; font-size: 0.9rem; }
-    .client-name { color: #60a5fa; font-weight: 600; }
-    .btn { display: block; width: 100%; padding: 0.75rem; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; margin-bottom: 0.5rem; }
-    .btn-approve { background: #2563eb; color: white; }
-    .btn-approve:hover { background: #1d4ed8; }
-    .btn-deny { background: transparent; color: #a3a3a3; border: 1px solid #404040; }
-    .btn-deny:hover { background: #262626; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Authorize access</h1>
-    <p>Allow <span class="client-name">${escapeHtml(client.name)}</span> to access Qoopia?</p>
-    <form method="POST" action="/oauth/authorize">
-      <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
-      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
-      <input type="hidden" name="state" value="${escapeHtml(state || '')}">
-      <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
-      <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod || 'S256')}">
-      <button type="submit" name="action" value="approve" class="btn btn-approve">Approve</button>
-      <button type="submit" name="action" value="deny" class="btn btn-deny">Deny</button>
-    </form>
-  </div>
-</body>
-</html>`;
+  // Single-user MCP server: auto-approve on GET (no consent screen needed)
+  // Generate auth code and redirect immediately
+  const ws = rawDb.prepare('SELECT id FROM workspaces LIMIT 1').get() as { id: string } | undefined;
+  const autoAuth = { id: 'owner', workspace_id: ws?.id || 'default' };
 
-  return c.html(html);
+  const agent = rawDb.prepare('SELECT workspace_id FROM agents WHERE id = ?').get(client.agent_id) as { workspace_id: string } | undefined;
+  const workspaceId = agent?.workspace_id || autoAuth.workspace_id;
+
+  const code = crypto.randomBytes(32).toString('hex');
+  const codeHash = sha256(code);
+
+  rawDb.prepare(
+    `INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, workspace_id, agent_id, code_challenge, code_challenge_method, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(codeHash, clientId, redirectUri, workspaceId, client.agent_id || 'default', codeChallenge, codeChallengeMethod || 'S256', isoFuture(AUTH_CODE_TTL));
+
+  logger.info({ client_id: clientId, auto_approve: true }, 'Authorization code issued (single-user auto-approve)');
+
+  const url = new URL(redirectUri);
+  url.searchParams.set('code', code);
+  if (state) url.searchParams.set('state', state);
+  return c.redirect(url.toString());
 });
 
 // ── 3b. POST /oauth/authorize (form submit) ─────────────────
