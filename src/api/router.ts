@@ -52,6 +52,27 @@ for (const route of protectedRoutes) {
 // MCP endpoint (auth required) — /mcp and POST / (Claude.ai sends MCP requests to root)
 api.use('/mcp', authMiddleware);
 api.use('/mcp/*', authMiddleware);
+// Debug: log every POST / to see if Claude.ai sends bearer token
+api.on('POST', '/', async (c, next) => {
+  const { logger } = await import('../core/logger.js');
+  const authHeader = c.req.header('Authorization') || '';
+  const hasBearer = authHeader.startsWith('Bearer ');
+  const contentType = c.req.header('Content-Type') || '';
+  const accept = c.req.header('Accept') || '';
+  const mcpSession = c.req.header('Mcp-Session-Id') || '';
+  logger.info({
+    path: '/',
+    method: 'POST',
+    has_auth: !!authHeader,
+    has_bearer: hasBearer,
+    token_prefix: hasBearer ? authHeader.slice(7, 27) : 'none',
+    content_type: contentType,
+    accept,
+    mcp_session_id: mcpSession,
+    user_agent: (c.req.header('User-Agent') || '').slice(0, 80),
+  }, 'POST / pre-auth debug');
+  return next();
+});
 api.on('POST', '/', authMiddleware);
 
 // Observe endpoint (auth required)

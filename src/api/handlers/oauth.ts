@@ -257,8 +257,8 @@ oauth.get('/oauth/authorize', (c) => {
     </form>
   </div>
   <script>
-    // Auto-approve after 500ms for single-user server (user can click Deny to cancel)
-    setTimeout(() => { document.getElementById('authForm').submit(); }, 500);
+    // No auto-submit — let user or Claude.ai popup handler click Approve
+    // Auto-submit can race with Claude.ai's popup lifecycle
   </script>
 </body>
 </html>`;
@@ -408,7 +408,18 @@ oauth.post('/oauth/token', async (c) => {
     const codeVerifier = params.code_verifier;
     const redirectUri = params.redirect_uri;
 
+    logger.info({
+      grant: 'authorization_code',
+      has_code: !!code,
+      has_client_id: !!clientId,
+      has_code_verifier: !!codeVerifier,
+      has_redirect_uri: !!redirectUri,
+      has_client_secret: !!params.client_secret,
+      redirect_uri: redirectUri,
+    }, 'Token exchange request received');
+
     if (!code || !clientId || !codeVerifier) {
+      logger.warn({ has_code: !!code, has_client_id: !!clientId, has_code_verifier: !!codeVerifier }, 'Token exchange missing params');
       const { body, status } = oauthError('invalid_request', 'Missing code, client_id, or code_verifier');
       return c.json(body, status);
     }
@@ -682,6 +693,7 @@ oauth.post('/oauth/register', async (c) => {
   };
   if (clientSecret) {
     response.client_secret = clientSecret;
+    response.client_secret_expires_at = 0; // RFC 7591: 0 means never expires
   }
 
   return c.json(response, 201);

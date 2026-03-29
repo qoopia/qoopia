@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import crypto from 'node:crypto';
 import { ulid } from 'ulid';
 import { rawDb } from '../../db/connection.js';
 import { logActivity } from '../../core/activity-log.js';
@@ -1322,6 +1323,10 @@ async function mcpPostHandler(c: any) {
     return c.json({ jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Authentication required' } }, 401);
   }
 
+  // Generate session ID for Streamable HTTP (MCP spec requirement)
+  const sessionId = c.req.header('mcp-session-id') || crypto.randomUUID();
+  c.header('Mcp-Session-Id', sessionId);
+
   let body: McpRequest;
   try {
     body = await c.req.json() as McpRequest;
@@ -1333,7 +1338,7 @@ async function mcpPostHandler(c: any) {
     return c.json({ jsonrpc: '2.0', id: body.id ?? null, error: { code: -32600, message: 'Invalid Request' } });
   }
 
-  // Notifications have no id — do not send a response (MCP spec)
+  // Notifications have no id — accept silently (MCP spec)
   if (body.method.startsWith('notifications/')) {
     return c.body(null, 204);
   }
@@ -1447,6 +1452,8 @@ function mcpSseHandler(c: any) {
     return c.json({ error: 'Authentication required' }, 401);
   }
 
+  const sessionId = c.req.header('mcp-session-id') || crypto.randomUUID();
+
   return new Response(
     new ReadableStream({
       start(controller) {
@@ -1474,6 +1481,7 @@ function mcpSseHandler(c: any) {
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
         'Access-Control-Allow-Origin': '*',
+        'Mcp-Session-Id': sessionId,
       },
     },
   );

@@ -17,7 +17,7 @@ export const corsMiddleware = createMiddleware(async (c, next) => {
   if (c.req.method === 'OPTIONS') {
     c.header('Access-Control-Allow-Origin', allowOrigin || ALLOWED_ORIGINS[0] || '*');
     c.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Idempotency-Key, X-Request-ID');
+    c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Idempotency-Key, X-Request-ID, Mcp-Session-Id');
     c.header('Access-Control-Max-Age', '86400');
     if (allowOrigin && allowOrigin !== '*') {
       c.header('Access-Control-Allow-Credentials', 'true');
@@ -28,7 +28,7 @@ export const corsMiddleware = createMiddleware(async (c, next) => {
   // Set CORS headers for actual requests
   if (allowOrigin) {
     c.header('Access-Control-Allow-Origin', allowOrigin);
-    c.header('Access-Control-Expose-Headers', 'X-Request-ID, X-RateLimit-Limit, X-RateLimit-Remaining, Retry-After');
+    c.header('Access-Control-Expose-Headers', 'X-Request-ID, X-RateLimit-Limit, X-RateLimit-Remaining, Retry-After, Mcp-Session-Id');
     if (allowOrigin !== '*') {
       c.header('Access-Control-Allow-Credentials', 'true');
     }
