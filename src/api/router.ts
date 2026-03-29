@@ -18,7 +18,7 @@ import batchHandler, { setBatchRouter } from './handlers/batch.js';
 import agentsHandler from './handlers/agents.js';
 import authHandler from './handlers/auth.js';
 import openapiHandler from './handlers/openapi.js';
-import mcpHandler from './handlers/mcp.js';
+import mcpHandler, { mcpPostHandler } from './handlers/mcp.js';
 import exportHandler from './handlers/export.js';
 import oauthHandler from './handlers/oauth.js';
 import observeHandler from './handlers/observe.js';
@@ -49,9 +49,10 @@ for (const route of protectedRoutes) {
   api.use(`/api/v1/${route}`, authMiddleware);
 }
 
-// MCP endpoint (auth required)
+// MCP endpoint (auth required) — /mcp and POST / (Claude.ai sends MCP requests to root)
 api.use('/mcp', authMiddleware);
 api.use('/mcp/*', authMiddleware);
+api.on('POST', '/', authMiddleware);
 
 // Observe endpoint (auth required)
 api.use('/api/v1/observe', authMiddleware);
@@ -64,6 +65,7 @@ for (const route of protectedRoutes) {
 }
 api.use('/mcp', rateLimitMiddleware);
 api.use('/mcp/*', rateLimitMiddleware);
+api.on('POST', '/', rateLimitMiddleware);
 api.use('/api/v1/observe', rateLimitMiddleware);
 api.use('/api/v1/observe/*', rateLimitMiddleware);
 
@@ -94,6 +96,9 @@ api.route('/api/v1/batch', batchHandler);
 api.route('/api/v1/agents', agentsHandler);
 api.route('/api/v1/export', exportHandler);
 api.route('/mcp', mcpHandler);
+// Mount MCP handler on POST / for Claude.ai MCP connector compatibility
+// (Claude.ai sends MCP requests to root URL, not /mcp)
+api.post('/', mcpPostHandler);
 api.route('/api/v1/observe', observeHandler);
 
 // Wire batch handler to route internally through the app

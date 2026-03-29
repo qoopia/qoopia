@@ -1315,8 +1315,8 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
   }
 }
 
-// MCP Streamable HTTP: POST /mcp
-app.post('/', async (c) => {
+// MCP Streamable HTTP POST handler — shared between /mcp and POST /
+async function mcpPostHandler(c: any) {
   const auth = c.get('auth');
 
   let body: McpRequest;
@@ -1375,7 +1375,9 @@ app.post('/', async (c) => {
   }
 
   return c.json({ jsonrpc: '2.0', id: body.id, result } satisfies McpResponse);
-});
+}
+
+app.post('/', mcpPostHandler);
 
 // GET /mcp — server info for discovery
 app.get('/', (c) => {
@@ -1389,3 +1391,4 @@ app.get('/', (c) => {
 });
 
 export default app;
+export { mcpPostHandler };

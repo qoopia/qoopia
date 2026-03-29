@@ -10,6 +10,8 @@ const wwwAuth = `Bearer resource_metadata_uri="${publicUrl}/.well-known/oauth-pr
 export const authMiddleware = createMiddleware<{ Variables: { auth: AuthContext } }>(async (c, next) => {
   const authHeader = c.req.header('Authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    const logger = (await import('../../core/logger.js')).logger;
+    logger.warn({ path: c.req.path, method: c.req.method, hasAuth: !!authHeader, authPrefix: authHeader?.slice(0, 20) }, 'Auth rejected: missing/invalid header');
     c.header('WWW-Authenticate', wwwAuth);
     return c.json({
       error: {
@@ -88,7 +90,9 @@ export const authMiddleware = createMiddleware<{ Variables: { auth: AuthContext 
       name: agentRecord?.name || payload.sub,
     });
     return next();
-  } catch {
+  } catch (err) {
+    const logger = (await import('../../core/logger.js')).logger;
+    logger.warn({ path: c.req.path, method: c.req.method, err: String(err), tokenPrefix: token.slice(0, 20) }, 'Auth rejected: JWT verification failed');
     c.header('WWW-Authenticate', wwwAuth);
     return c.json({
       error: {
