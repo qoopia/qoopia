@@ -1317,7 +1317,10 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
 
 // MCP Streamable HTTP POST handler — shared between /mcp and POST /
 async function mcpPostHandler(c: any) {
-  const auth = c.get('auth');
+  const auth = c.get('auth') as AuthContext | undefined;
+  if (!auth) {
+    return c.json({ jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Authentication required' } }, 401);
+  }
 
   let body: McpRequest;
   try {
