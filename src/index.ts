@@ -21,7 +21,7 @@ eventBus.subscribe({
 // Start maintenance schedule (activity archival, cleanup)
 startMaintenanceSchedule();
 
-const PORT = parseInt(process.env.PORT || '3000');
+const PORT = parseInt(process.env.PORT || '3737');
 
 const server = serve({
   fetch: api.fetch,
