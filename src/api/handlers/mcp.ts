@@ -439,6 +439,25 @@ const TOOLS = [
   },
 ];
 
+// ── Tool Profiles: let MCP clients declare which tools they need ──
+const TOOL_PROFILES: Record<string, string[]> = {
+  memory: ['note', 'recall', 'brief'],
+  crm: [
+    'note', 'recall', 'brief',
+    'list_projects', 'update_project',
+    'list_tasks', 'get_task', 'create_task', 'update_task', 'delete_task',
+    'list_deals', 'create_deal', 'update_deal', 'delete_deal',
+    'list_contacts', 'create_contact', 'update_contact', 'delete_contact',
+    'list_finances', 'create_finance', 'update_finance', 'delete_finance',
+    'get_activity', 'create_activity', 'report_activity',
+    'search',
+  ],
+  full: [], // empty = all tools
+};
+
+// Store active profile per auth ID (set during initialize)
+const sessionProfiles = new Map<string, string>();
+
 const WORKSPACE_ROOT = process.env.QOOPIA_WORKSPACE_ROOT || resolve(process.cwd(), 'workspace');
 const MAX_FILE_SIZE = 100 * 1024;
 
@@ -1346,22 +1365,46 @@ async function mcpPostHandler(c: any) {
   let result: unknown;
 
   switch (body.method) {
-    case 'initialize':
+    case 'initialize': {
+      // Detect tool profile from _meta.toolProfile or clientInfo.name pattern "profile:xxx"
+      const initParams = body.params as { _meta?: { toolProfile?: string }; clientInfo?: { name?: string } } | undefined;
+      let profile = 'full';
+      if (initParams?._meta?.toolProfile && initParams._meta.toolProfile in TOOL_PROFILES) {
+        profile = initParams._meta.toolProfile;
+      } else if (initParams?.clientInfo?.name) {
+        const m = initParams.clientInfo.name.match(/profile:(\w+)/);
+        if (m && m[1] in TOOL_PROFILES) profile = m[1];
+      }
+      sessionProfiles.set(auth.id, profile);
       result = {
         protocolVersion: '2025-03-26',
         capabilities: { tools: {} },
         serverInfo: { name: 'qoopia', version: '2.0.0' },
       };
       break;
+    }
 
-    case 'tools/list':
-      result = handleToolsList();
+    case 'tools/list': {
+      const profile = sessionProfiles.get(auth.id) || 'full';
+      const allowed = TOOL_PROFILES[profile];
+      if (profile === 'full' || !allowed || allowed.length === 0) {
+        result = handleToolsList();
+      } else {
+        result = { tools: TOOLS.filter(t => allowed.includes(t.name)) };
+      }
       break;
+    }
 
     case 'tools/call': {
       const params = body.params as { name: string; arguments?: Record<string, unknown> } | undefined;
       if (!params?.name) {
         return c.json({ jsonrpc: '2.0', id: body.id, error: { code: -32602, message: 'Missing tool name' } } satisfies McpResponse);
+      }
+      // Enforce tool profile
+      const profile = sessionProfiles.get(auth.id) || 'full';
+      const allowed = TOOL_PROFILES[profile];
+      if (profile !== 'full' && allowed && allowed.length > 0 && !allowed.includes(params.name)) {
+        return c.json({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: `Tool not available in current profile. Requested profile: ${profile}` } } satisfies McpResponse);
       }
       // CRITICAL #2: Enforce agent permissions for each MCP tool call
       if (auth.type === 'agent') {
