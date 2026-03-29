@@ -5,7 +5,7 @@ import { verifyAccessToken } from '../handlers/oauth.js';
 import type { AuthContext } from '../../types/index.js';
 
 const publicUrl = process.env.QOOPIA_PUBLIC_URL || 'http://localhost:3737';
-const wwwAuth = `Bearer resource_metadata_uri="${publicUrl}/.well-known/oauth-protected-resource"`;
+const wwwAuth = `Bearer resource_metadata="${publicUrl}/.well-known/oauth-protected-resource"`;
 
 export const authMiddleware = createMiddleware<{ Variables: { auth: AuthContext } }>(async (c, next) => {
   const authHeader = c.req.header('Authorization');
@@ -92,7 +92,9 @@ export const authMiddleware = createMiddleware<{ Variables: { auth: AuthContext 
     return next();
   } catch (err) {
     const logger = (await import('../../core/logger.js')).logger;
-    logger.warn({ path: c.req.path, method: c.req.method, err: String(err), tokenPrefix: token.slice(0, 20) }, 'Auth rejected: JWT verification failed');
+    const errStr = String(err);
+    const errType = errStr.includes('exp') ? 'expired' : errStr.includes('signature') ? 'invalid_signature' : errStr.includes('JWS') ? 'malformed' : 'unknown';
+    logger.warn({ path: c.req.path, method: c.req.method, err: errStr, errType, tokenPrefix: token.slice(0, 20), tokenLen: token.length }, 'Auth rejected: JWT verification failed');
     c.header('WWW-Authenticate', wwwAuth);
     return c.json({
       error: {
