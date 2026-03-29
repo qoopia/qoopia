@@ -3,6 +3,7 @@ import { ulid } from 'ulid';
 import { rawDb } from '../../db/connection.js';
 import { createTaskSchema, updateTaskSchema } from '../../core/validator.js';
 import { logActivity } from '../../core/activity-log.js';
+import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
@@ -114,7 +115,7 @@ app.post('/', async (c) => {
 
   logActivity({
     workspace_id: auth.workspace_id,
-    actor: auth.id,
+    actor: resolveActorName(auth),
     action: 'created',
     entity_type: 'task',
     entity_id: id,
@@ -194,7 +195,7 @@ app.patch('/:id', async (c) => {
 
   logActivity({
     workspace_id: auth.workspace_id,
-    actor: auth.id,
+    actor: resolveActorName(auth),
     action: 'updated',
     entity_type: 'task',
     entity_id: taskId,
@@ -228,7 +229,7 @@ app.delete('/:id', (c) => {
 
   logActivity({
     workspace_id: auth.workspace_id,
-    actor: auth.id,
+    actor: resolveActorName(auth),
     action: 'deleted',
     entity_type: 'task',
     entity_id: taskId,

@@ -3,6 +3,7 @@ import { ulid } from 'ulid';
 import { rawDb } from '../../db/connection.js';
 import { createDealSchema, updateDealSchema } from '../../core/validator.js';
 import { logActivity } from '../../core/activity-log.js';
+import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
@@ -123,7 +124,7 @@ app.post('/', async (c) => {
   }
 
   logActivity({
-    workspace_id: auth.workspace_id, actor: auth.id, action: 'created',
+    workspace_id: auth.workspace_id, actor: resolveActorName(auth), action: 'created',
     entity_type: 'deal', entity_id: id, project_id: data.project_id,
     summary: `Created deal: ${data.name}`, revision_after: 1,
   });
@@ -218,7 +219,7 @@ app.patch('/:id', async (c) => {
 
   const changed = Object.keys(updates).filter(k => updates[k as keyof typeof updates] !== undefined);
   logActivity({
-    workspace_id: auth.workspace_id, actor: auth.id, action: 'updated',
+    workspace_id: auth.workspace_id, actor: resolveActorName(auth), action: 'updated',
     entity_type: 'deal', entity_id: dealId, project_id: current.project_id as string,
     summary: `Updated deal fields: ${changed.join(', ')}`,
     details: { changes: updates },
@@ -245,7 +246,7 @@ app.delete('/:id', (c) => {
   rawDb.prepare("UPDATE deals SET deleted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?").run(dealId);
 
   logActivity({
-    workspace_id: auth.workspace_id, actor: auth.id, action: 'deleted',
+    workspace_id: auth.workspace_id, actor: resolveActorName(auth), action: 'deleted',
     entity_type: 'deal', entity_id: dealId, project_id: current.project_id as string,
     summary: `Deleted deal: ${current.name}`, revision_before: current.revision as number,
   });

@@ -3,6 +3,7 @@ import { ulid } from 'ulid';
 import { rawDb } from '../../db/connection.js';
 import { createContactSchema, updateContactSchema } from '../../core/validator.js';
 import { logActivity } from '../../core/activity-log.js';
+import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
@@ -97,7 +98,7 @@ app.post('/', async (c) => {
   insertContact();
 
   logActivity({
-    workspace_id: auth.workspace_id, actor: auth.id, action: 'created',
+    workspace_id: auth.workspace_id, actor: resolveActorName(auth), action: 'created',
     entity_type: 'contact', entity_id: id,
     summary: `Created contact: ${data.name}`, revision_after: 1,
   });
@@ -172,7 +173,7 @@ app.patch('/:id', async (c) => {
 
   const changed = Object.keys(updates).filter(k => updates[k as keyof typeof updates] !== undefined);
   logActivity({
-    workspace_id: auth.workspace_id, actor: auth.id, action: 'updated',
+    workspace_id: auth.workspace_id, actor: resolveActorName(auth), action: 'updated',
     entity_type: 'contact', entity_id: contactId,
     summary: `Updated contact fields: ${changed.join(', ')}`,
     details: { changes: updates },
@@ -199,7 +200,7 @@ app.delete('/:id', (c) => {
   rawDb.prepare("UPDATE contacts SET deleted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?").run(contactId);
 
   logActivity({
-    workspace_id: auth.workspace_id, actor: auth.id, action: 'deleted',
+    workspace_id: auth.workspace_id, actor: resolveActorName(auth), action: 'deleted',
     entity_type: 'contact', entity_id: contactId,
     summary: `Deleted contact: ${current.name}`, revision_before: current.revision as number,
   });

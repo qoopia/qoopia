@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { ulid } from 'ulid';
 import { rawDb } from '../../db/connection.js';
 import { logActivity } from '../../core/activity-log.js';
+import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
@@ -58,7 +59,7 @@ app.post('/', async (c) => {
 
   logActivity({
     workspace_id: auth.workspace_id,
-    actor: auth.id,
+    actor: resolveActorName(auth),
     action: 'created',
     entity_type: 'agent',
     entity_id: id,
@@ -138,7 +139,7 @@ app.patch('/:id', async (c) => {
 
   logActivity({
     workspace_id: auth.workspace_id,
-    actor: auth.id,
+    actor: resolveActorName(auth),
     action: 'updated',
     entity_type: 'agent',
     entity_id: agentId,
@@ -177,7 +178,7 @@ app.delete('/:id', (c) => {
 
   logActivity({
     workspace_id: auth.workspace_id,
-    actor: auth.id,
+    actor: resolveActorName(auth),
     action: 'deleted',
     entity_type: 'agent',
     entity_id: agentId,
@@ -223,7 +224,7 @@ app.post('/:id/rotate-key', (c) => {
 
   logActivity({
     workspace_id: auth.workspace_id,
-    actor: auth.id,
+    actor: resolveActorName(auth),
     action: 'rotated_key',
     entity_type: 'agent',
     entity_id: agentId,

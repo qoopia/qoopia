@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { ulid } from 'ulid';
 import { rawDb } from '../../db/connection.js';
 import { logActivity } from '../../core/activity-log.js';
+import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 import { readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, existsSync, realpathSync } from 'fs';
 import { resolve, join, relative, basename } from 'path';
@@ -1079,6 +1080,17 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
         'mcp', JSON.stringify(matchResult.matched_entities), JSON.stringify(autoUpdates), now()
       );
 
+      // Log note creation as activity
+      logActivity({
+        workspace_id: workspaceId,
+        actor: agentName || actorId,
+        action: 'noted',
+        entity_type: 'note',
+        entity_id: noteId,
+        project_id: projectId || undefined,
+        summary: text.length > 200 ? text.substring(0, 200) + '...' : text,
+      });
+
       // Generate embedding in background (fire and forget)
       if (getCapabilities().embeddings) {
         storeEmbedding(noteId, text).catch(() => {});
@@ -1350,7 +1362,7 @@ app.post('/', async (c) => {
           return c.json({ jsonrpc: '2.0', id: body.id, error: { code: -32000, message: permError } } satisfies McpResponse);
         }
       }
-      const toolResult = await handleToolCall(params.name, params.arguments || {}, auth.workspace_id, auth.id || 'mcp-user');
+      const toolResult = await handleToolCall(params.name, params.arguments || {}, auth.workspace_id, resolveActorName(auth) || 'mcp-user');
       if (toolResult === null) {
         return c.json({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: `Unknown tool: ${params.name}` } } satisfies McpResponse);
       }

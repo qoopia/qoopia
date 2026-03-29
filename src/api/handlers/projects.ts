@@ -3,6 +3,7 @@ import { ulid } from 'ulid';
 import { rawDb } from '../../db/connection.js';
 import { createProjectSchema, updateProjectSchema } from '../../core/validator.js';
 import { logActivity } from '../../core/activity-log.js';
+import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
@@ -88,7 +89,7 @@ app.post('/', async (c) => {
 
   logActivity({
     workspace_id: auth.workspace_id,
-    actor: auth.id,
+    actor: resolveActorName(auth),
     action: 'created',
     entity_type: 'project',
     entity_id: id,
@@ -161,7 +162,7 @@ app.patch('/:id', async (c) => {
   const changed = Object.keys(updates).filter(k => updates[k as keyof typeof updates] !== undefined);
   logActivity({
     workspace_id: auth.workspace_id,
-    actor: auth.id,
+    actor: resolveActorName(auth),
     action: 'updated',
     entity_type: 'project',
     entity_id: projectId,
@@ -194,7 +195,7 @@ app.delete('/:id', (c) => {
 
   logActivity({
     workspace_id: auth.workspace_id,
-    actor: auth.id,
+    actor: resolveActorName(auth),
     action: 'deleted',
     entity_type: 'project',
     entity_id: projectId,
