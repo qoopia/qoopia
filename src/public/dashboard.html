@@ -337,6 +337,7 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
 
   async function api(path){
     const r=await fetch(BASE+path,{headers:{'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'}});
+    if(r.status===401){localStorage.removeItem('qoopia_token');TOKEN='';showLogin();throw new Error('401');}
     if(!r.ok)throw new Error(r.status);
     return r.json();
   }
@@ -442,6 +443,10 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
           agent_name: name,
           content: a.content || a.summary || a.text || a.description || a.action || ''
         };
+      }).sort((a,b)=>{
+        const ta=new Date(a.timestamp||a.created_at||0).getTime();
+        const tb=new Date(b.timestamp||b.created_at||0).getTime();
+        return tb-ta;
       });
 
       // Update agent cards
