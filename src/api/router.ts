@@ -18,7 +18,7 @@ import batchHandler, { setBatchRouter } from './handlers/batch.js';
 import agentsHandler from './handlers/agents.js';
 import authHandler from './handlers/auth.js';
 import openapiHandler from './handlers/openapi.js';
-import mcpHandler, { mcpPostHandler } from './handlers/mcp.js';
+import mcpHandler, { mcpPostHandler, mcpSseHandler } from './handlers/mcp.js';
 import exportHandler from './handlers/export.js';
 import oauthHandler from './handlers/oauth.js';
 import observeHandler from './handlers/observe.js';
@@ -107,8 +107,26 @@ setBatchRouter(api);
 // Static files from public/ directory
 const publicDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'public');
 
-// Landing page
-api.get('/', (c) => {
+// GET / — route based on Accept header:
+// - text/event-stream → MCP SSE stream (auth required)
+// - otherwise → landing page HTML (no auth)
+api.get('/', async (c, next) => {
+  const accept = c.req.header('Accept') || '';
+  if (accept.includes('text/event-stream')) {
+    // SSE request (MCP Streamable HTTP) — requires auth
+    const authHeader = c.req.header('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      const publicUrl = (process.env.QOOPIA_PUBLIC_URL || 'http://localhost:3737').replace(/\/$/, '');
+      c.header('WWW-Authenticate', `Bearer resource_metadata="${publicUrl}/.well-known/oauth-protected-resource"`);
+      return c.json({
+        error: { code: 'UNAUTHORIZED', message: 'Missing or invalid Authorization header. Expected: Bearer <token>' }
+      }, 401);
+    }
+    // Run auth middleware inline, then SSE handler
+    const { authMiddleware: inlineAuth } = await import('./middleware/auth.js');
+    return inlineAuth(c as any, async () => mcpSseHandler(c as any));
+  }
+  // Regular browser request — serve landing page
   try {
     const html = readFileSync(join(publicDir, 'index.html'), 'utf-8');
     return c.html(html);

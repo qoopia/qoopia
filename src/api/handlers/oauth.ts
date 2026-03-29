@@ -175,6 +175,8 @@ oauth.get('/.well-known/oauth-protected-resource', (c) => {
 });
 
 // ── 3. GET /oauth/authorize ─────────────────────────────────
+// Claude.ai opens this in a popup — MUST return an HTML page (not instant 302).
+// An instant redirect can cause Claude.ai's popup to close before capturing the code.
 
 oauth.get('/oauth/authorize', (c) => {
   const clientId = c.req.query('client_id');
@@ -183,6 +185,7 @@ oauth.get('/oauth/authorize', (c) => {
   const responseType = c.req.query('response_type');
   const codeChallenge = c.req.query('code_challenge');
   const codeChallengeMethod = c.req.query('code_challenge_method');
+  const scope = c.req.query('scope') || '';
 
   if (!clientId || !redirectUri || !responseType || !codeChallenge) {
     return c.json(oauthError('invalid_request', 'Missing required parameters: client_id, redirect_uri, response_type, code_challenge').body, 400);
@@ -210,28 +213,58 @@ oauth.get('/oauth/authorize', (c) => {
     return c.json(oauthError('invalid_request', 'redirect_uri not registered for this client').body, 400);
   }
 
-  // Single-user MCP server: auto-approve on GET (no consent screen needed)
-  // Generate auth code and redirect immediately
-  const ws = rawDb.prepare('SELECT id FROM workspaces LIMIT 1').get() as { id: string } | undefined;
-  const autoAuth = { id: 'owner', workspace_id: ws?.id || 'default' };
+  // Single-user MCP server: show consent page that auto-submits.
+  // Claude.ai popup needs an HTML page to properly capture the redirect.
+  const safeClientName = escapeHtml(client.name || 'Unknown Client');
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorize — Qoopia</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #0a0a0f; color: #e0e0e0; }
+    .card { background: #1a1a2e; border-radius: 16px; padding: 40px; max-width: 400px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+    .logo { font-size: 32px; margin-bottom: 16px; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    .client { color: #7c8aff; font-weight: 600; }
+    .info { color: #888; font-size: 14px; margin: 16px 0 24px; }
+    .actions { display: flex; gap: 12px; justify-content: center; }
+    button { padding: 12px 32px; border-radius: 8px; border: none; font-size: 16px; font-weight: 600; cursor: pointer; transition: opacity .15s; }
+    button:hover { opacity: 0.85; }
+    .approve { background: #7c8aff; color: #fff; }
+    .deny { background: #2a2a3e; color: #888; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">🔑</div>
+    <h1>Authorize access</h1>
+    <p><span class="client">${safeClientName}</span> wants to connect to Qoopia</p>
+    <p class="info">This will grant access to your projects, tasks, deals, and notes.</p>
+    <form method="POST" action="/oauth/authorize" id="authForm">
+      <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
+      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
+      <input type="hidden" name="state" value="${escapeHtml(state || '')}">
+      <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
+      <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod || 'S256')}">
+      <input type="hidden" name="scope" value="${escapeHtml(scope)}">
+      <input type="hidden" name="action" value="approve">
+      <div class="actions">
+        <button type="submit" name="action" value="deny" class="deny">Deny</button>
+        <button type="submit" name="action" value="approve" class="approve">Approve</button>
+      </div>
+    </form>
+  </div>
+  <script>
+    // Auto-approve after 500ms for single-user server (user can click Deny to cancel)
+    setTimeout(() => { document.getElementById('authForm').submit(); }, 500);
+  </script>
+</body>
+</html>`;
 
-  const agent = rawDb.prepare('SELECT workspace_id FROM agents WHERE id = ?').get(client.agent_id) as { workspace_id: string } | undefined;
-  const workspaceId = agent?.workspace_id || autoAuth.workspace_id;
-
-  const code = crypto.randomBytes(32).toString('hex');
-  const codeHash = sha256(code);
-
-  rawDb.prepare(
-    `INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, workspace_id, agent_id, code_challenge, code_challenge_method, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(codeHash, clientId, redirectUri, workspaceId, client.agent_id || 'default', codeChallenge, codeChallengeMethod || 'S256', isoFuture(AUTH_CODE_TTL));
-
-  logger.info({ client_id: clientId, auto_approve: true }, 'Authorization code issued (single-user auto-approve)');
-
-  const url = new URL(redirectUri);
-  url.searchParams.set('code', code);
-  if (state) url.searchParams.set('state', state);
-  return c.redirect(url.toString());
+  logger.info({ client_id: clientId, client_name: client.name }, 'Consent page shown');
+  return c.html(html);
 });
 
 // ── 3b. POST /oauth/authorize (form submit) ─────────────────

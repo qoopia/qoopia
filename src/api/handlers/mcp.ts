@@ -1382,8 +1382,55 @@ async function mcpPostHandler(c: any) {
 
 app.post('/', mcpPostHandler);
 
-// GET /mcp — server info for discovery
+// GET /mcp — SSE stream for MCP Streamable HTTP transport, or server info for discovery
 app.get('/', (c) => {
+  const accept = c.req.header('Accept') || '';
+
+  // MCP Streamable HTTP: if client asks for SSE, open a keep-alive stream
+  if (accept.includes('text/event-stream')) {
+    const auth = c.get('auth') as AuthContext | undefined;
+    if (!auth) {
+      // This shouldn't happen (auth middleware runs before), but safety check
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+
+    // Return SSE stream — keep connection open for server-initiated notifications
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          // Send initial keep-alive comment
+          controller.enqueue(encoder.encode(': connected\n\n'));
+
+          // Send periodic keep-alive pings (every 30s) to prevent timeout
+          const pingInterval = setInterval(() => {
+            try {
+              controller.enqueue(encoder.encode(': ping\n\n'));
+            } catch {
+              clearInterval(pingInterval);
+            }
+          }, 30_000);
+
+          // Clean up on close
+          c.req.raw.signal?.addEventListener('abort', () => {
+            clearInterval(pingInterval);
+            try { controller.close(); } catch { /* already closed */ }
+          });
+        },
+      }),
+      {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+        },
+      },
+    );
+  }
+
+  // Regular GET — return server info JSON
   return c.json({
     name: 'qoopia',
     version: '2.0.0',
@@ -1393,5 +1440,44 @@ app.get('/', (c) => {
   });
 });
 
+// Exported SSE handler for GET / on the root router (shared logic)
+function mcpSseHandler(c: any) {
+  const auth = c.get('auth') as AuthContext | undefined;
+  if (!auth) {
+    return c.json({ error: 'Authentication required' }, 401);
+  }
+
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        controller.enqueue(encoder.encode(': connected\n\n'));
+
+        const pingInterval = setInterval(() => {
+          try {
+            controller.enqueue(encoder.encode(': ping\n\n'));
+          } catch {
+            clearInterval(pingInterval);
+          }
+        }, 30_000);
+
+        c.req.raw.signal?.addEventListener('abort', () => {
+          clearInterval(pingInterval);
+          try { controller.close(); } catch { /* already closed */ }
+        });
+      },
+    }),
+    {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+      },
+    },
+  );
+}
+
 export default app;
-export { mcpPostHandler };
+export { mcpPostHandler, mcpSseHandler };
