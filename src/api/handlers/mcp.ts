@@ -674,16 +674,16 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
     // ══════════════ READ TOOLS ══════════════
 
     case 'list_projects': {
-      let query = 'SELECT * FROM projects WHERE workspace_id = ? AND deleted_at IS NULL';
+      let query = 'SELECT id, name, description, status, updated_at FROM projects WHERE workspace_id = ? AND deleted_at IS NULL';
       const params: unknown[] = [workspaceId];
       if (args.status) { query += ' AND status = ?'; params.push(args.status); }
       query += ' ORDER BY updated_at DESC LIMIT ?';
       params.push(limit);
-      return { content: [{ type: 'text', text: JSON.stringify(rawDb.prepare(query).all(...params), null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(rawDb.prepare(query).all(...params)) }] };
     }
 
     case 'list_tasks': {
-      let query = 'SELECT * FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL';
+      let query = 'SELECT id, title, status, priority, assignee, due_date, project_id, updated_at FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL';
       const params: unknown[] = [workspaceId];
       if (args.project_id) { query += ' AND project_id = ?'; params.push(args.project_id); }
       if (args.status) { query += ' AND status = ?'; params.push(args.status); }
@@ -701,17 +701,17 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
 
       const result: Record<string, unknown> = { tasks };
       if (context.length > 0) result.context = context.join(' ');
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     }
 
     case 'get_task': {
-      const row = rawDb.prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL').get(args.id, workspaceId);
+      const row = rawDb.prepare('SELECT id, project_id, title, description, status, priority, assignee, due_date, tags, notes, source, revision, created_at, updated_at, updated_by FROM tasks WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL').get(args.id, workspaceId);
       if (!row) return { content: [{ type: 'text', text: 'Task not found' }], isError: true };
-      return { content: [{ type: 'text', text: JSON.stringify(row, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(row) }] };
     }
 
     case 'list_deals': {
-      let query = 'SELECT * FROM deals WHERE workspace_id = ? AND deleted_at IS NULL';
+      let query = 'SELECT id, name, status, asking_price, target_price, updated_at FROM deals WHERE workspace_id = ? AND deleted_at IS NULL';
       const params: unknown[] = [workspaceId];
       if (args.project_id) { query += ' AND project_id = ?'; params.push(args.project_id); }
       if (args.status) { query += ' AND status = ?'; params.push(args.status); }
@@ -726,36 +726,36 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
 
       const result: Record<string, unknown> = { deals };
       if (context.length > 0) result.context = context.join(' ');
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     }
 
     case 'list_contacts': {
-      let query = 'SELECT * FROM contacts WHERE workspace_id = ? AND deleted_at IS NULL';
+      let query = 'SELECT id, name, email, phone, role, company, updated_at FROM contacts WHERE workspace_id = ? AND deleted_at IS NULL';
       const params: unknown[] = [workspaceId];
       if (args.category) { query += ' AND category = ?'; params.push(args.category); }
       query += ' ORDER BY updated_at DESC LIMIT ?';
       params.push(limit);
-      return { content: [{ type: 'text', text: JSON.stringify(rawDb.prepare(query).all(...params), null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(rawDb.prepare(query).all(...params)) }] };
     }
 
     case 'list_finances': {
-      let query = 'SELECT * FROM finances WHERE workspace_id = ? AND deleted_at IS NULL';
+      let query = 'SELECT id, name, amount, type, currency, status, updated_at FROM finances WHERE workspace_id = ? AND deleted_at IS NULL';
       const params: unknown[] = [workspaceId];
       if (args.type) { query += ' AND type = ?'; params.push(args.type); }
       if (args.status) { query += ' AND status = ?'; params.push(args.status); }
       query += ' ORDER BY updated_at DESC LIMIT ?';
       params.push(limit);
-      return { content: [{ type: 'text', text: JSON.stringify(rawDb.prepare(query).all(...params), null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(rawDb.prepare(query).all(...params)) }] };
     }
 
     case 'get_activity': {
-      let query = 'SELECT * FROM activity WHERE workspace_id = ?';
+      let query = 'SELECT id, actor, action, entity_type, summary, timestamp FROM activity WHERE workspace_id = ?';
       const params: unknown[] = [workspaceId];
       if (args.entity_type) { query += ' AND entity_type = ?'; params.push(args.entity_type); }
       if (args.project_id) { query += ' AND project_id = ?'; params.push(args.project_id); }
       query += ' ORDER BY id DESC LIMIT ?';
       params.push(Math.min(Number(args.limit) || 20, 100));
-      return { content: [{ type: 'text', text: JSON.stringify(rawDb.prepare(query).all(...params), null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(rawDb.prepare(query).all(...params)) }] };
     }
 
     case 'search': {
@@ -783,7 +783,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
           }
         } catch { results[trimmed] = []; }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(results) }] };
     }
 
     // ── File tools ──
@@ -811,7 +811,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
             const s = statSync(full);
             return { name: relative(WORKSPACE_ROOT, full), type: (s.isDirectory() ? 'directory' : 'file') as 'file' | 'directory', size: s.isDirectory() ? 0 : s.size, modified: s.mtime.toISOString() };
           });
-      return { content: [{ type: 'text', text: JSON.stringify(entries, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(entries) }] };
     }
 
     case 'write_file': {
@@ -836,7 +836,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       );
       logActivity({ workspace_id: workspaceId, actor: actorId, action: 'created', entity_type: 'task', entity_id: id, project_id: args.project_id as string, summary: `Created task: ${args.title}`, revision_after: 1 });
       const row = rawDb.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
-      return { content: [{ type: 'text', text: JSON.stringify(row, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(row) }] };
     }
 
     case 'update_task': {
@@ -855,7 +855,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       rawDb.prepare(`UPDATE tasks SET ${fields.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...vals);
       logActivity({ workspace_id: workspaceId, actor: actorId, action: 'updated', entity_type: 'task', entity_id: args.id as string, project_id: existing.project_id as string, summary: `Updated task: ${existing.title} [${fields.filter(f => !f.startsWith('revision') && !f.startsWith('updated')).map(f => f.split(' ')[0]).join(', ')}]`, revision_before: existing.revision as number, revision_after: newRev });
       const row = rawDb.prepare('SELECT * FROM tasks WHERE id = ?').get(args.id);
-      return { content: [{ type: 'text', text: JSON.stringify(row, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(row) }] };
     }
 
     case 'delete_task': {
@@ -878,7 +878,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       );
       logActivity({ workspace_id: workspaceId, actor: actorId, action: 'created', entity_type: 'deal', entity_id: id, project_id: args.project_id as string, summary: `Created deal: ${args.name}`, revision_after: 1 });
       const row = rawDb.prepare('SELECT * FROM deals WHERE id = ?').get(id);
-      return { content: [{ type: 'text', text: JSON.stringify(row, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(row) }] };
     }
 
     case 'update_deal': {
@@ -899,7 +899,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       rawDb.prepare(`UPDATE deals SET ${fields.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...vals);
       logActivity({ workspace_id: workspaceId, actor: actorId, action: 'updated', entity_type: 'deal', entity_id: args.id as string, project_id: existing.project_id as string, summary: `Updated deal: ${existing.name}`, revision_before: existing.revision as number, revision_after: newRev });
       const row = rawDb.prepare('SELECT * FROM deals WHERE id = ?').get(args.id);
-      return { content: [{ type: 'text', text: JSON.stringify(row, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(row) }] };
     }
 
     case 'delete_deal': {
@@ -927,7 +927,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       rawDb.prepare(`UPDATE projects SET ${fields.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...vals);
       logActivity({ workspace_id: workspaceId, actor: actorId, action: 'updated', entity_type: 'project', entity_id: args.id as string, summary: `Updated project: ${existing.name}`, revision_before: existing.revision as number, revision_after: newRev });
       const row = rawDb.prepare('SELECT * FROM projects WHERE id = ?').get(args.id);
-      return { content: [{ type: 'text', text: JSON.stringify(row, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(row) }] };
     }
 
     case 'create_contact': {
@@ -941,7 +941,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       );
       logActivity({ workspace_id: workspaceId, actor: actorId, action: 'created', entity_type: 'contact', entity_id: id, summary: `Created contact: ${args.name}`, revision_after: 1 });
       const row = rawDb.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
-      return { content: [{ type: 'text', text: JSON.stringify(row, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(row) }] };
     }
 
     case 'update_contact': {
@@ -960,7 +960,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       rawDb.prepare(`UPDATE contacts SET ${fields.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...vals);
       logActivity({ workspace_id: workspaceId, actor: actorId, action: 'updated', entity_type: 'contact', entity_id: args.id as string, summary: `Updated contact: ${existing.name}`, revision_before: existing.revision as number, revision_after: newRev });
       const row = rawDb.prepare('SELECT * FROM contacts WHERE id = ?').get(args.id);
-      return { content: [{ type: 'text', text: JSON.stringify(row, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(row) }] };
     }
 
     case 'delete_contact': {
@@ -982,7 +982,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       );
       logActivity({ workspace_id: workspaceId, actor: actorId, action: 'created', entity_type: 'finance', entity_id: id, project_id: args.project_id as string ?? undefined, summary: `Created finance: ${args.name} ($${args.amount})`, revision_after: 1 });
       const row = rawDb.prepare('SELECT * FROM finances WHERE id = ?').get(id);
-      return { content: [{ type: 'text', text: JSON.stringify(row, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(row) }] };
     }
 
     case 'update_finance': {
@@ -1001,7 +1001,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       rawDb.prepare(`UPDATE finances SET ${fields.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...vals);
       logActivity({ workspace_id: workspaceId, actor: actorId, action: 'updated', entity_type: 'finance', entity_id: args.id as string, summary: `Updated finance: ${existing.name}`, revision_before: existing.revision as number, revision_after: newRev });
       const row = rawDb.prepare('SELECT * FROM finances WHERE id = ?').get(args.id);
-      return { content: [{ type: 'text', text: JSON.stringify(row, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify(row) }] };
     }
 
     case 'delete_finance': {
@@ -1129,7 +1129,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
             remaining,
             capabilities: getCapabilities(),
             message,
-          }, null, 2),
+          }),
         }],
       };
     }
@@ -1145,10 +1145,10 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
         content: [{
           type: 'text',
           text: JSON.stringify({
-            results: searchResult.results,
+            results: searchResult.results.map((r: any) => ({ ...r, text: r.text ? String(r.text).substring(0, 300) : r.text })),
             method: searchResult.method,
             message: `Found ${searchResult.results.length} relevant item${searchResult.results.length !== 1 ? 's' : ''} using ${searchResult.method} search.`,
-          }, null, 2),
+          }),
         }],
       };
     }
@@ -1191,7 +1191,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
       const dealItems = rawDb.prepare(dealQuery).all(...dealParams) as Array<Record<string, unknown>>;
 
       // Recent notes
-      let notesQuery = 'SELECT id, text, agent_name, created_at FROM notes WHERE workspace_id = ?';
+      let notesQuery = 'SELECT id, substr(text,1,200) as text, created_at, agent_id, agent_name FROM notes WHERE workspace_id = ?';
       const notesParams: unknown[] = [workspaceId];
       if (agentName) { notesQuery += ' AND agent_name = ?'; notesParams.push(agentName); }
       if (projectId) { notesQuery += ' AND project_id = ?'; notesParams.push(projectId); }
@@ -1247,7 +1247,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
             contacts: contactItems,
             health: { last_note_from: health },
             message,
-          }, null, 2),
+          }),
         }],
       };
     }
@@ -1306,7 +1306,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>, works
             auto_updated: autoUpdated.length > 0 ? autoUpdated : undefined,
             suggested: reportStatusChanges.suggested.length > 0 ? reportStatusChanges.suggested : undefined,
             message,
-          }, null, 2),
+          }),
         }],
       };
     }
