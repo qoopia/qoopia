@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { rawDb } from '../../db/connection.js';
 import { logActivity } from '../../core/activity-log.js';
 import { detectAndApplyStatusChanges } from '../../core/intelligence.js';
+import { logger } from '../../core/logger.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
@@ -159,6 +160,8 @@ app.post('/', async (c) => {
 
   const validTypes = ['message_sent', 'session_compact', 'session_end', 'agent_response'];
   if (!validTypes.includes(body.type)) {
+    logger.warn({ receivedType: body.type, validTypes, path: '/api/v1/observe' },
+      `Invalid observe event type: "${body.type}". Add it to validTypes if this is intentional.`);
     return c.json({ error: { code: 'VALIDATION_ERROR', message: `Invalid type. Must be one of: ${validTypes.join(', ')}` } }, 400);
   }
 
