@@ -510,7 +510,7 @@ body{background:linear-gradient(160deg,var(--bg),#1a3a5c);color:var(--white);fon
 
   function renderActivity(){
     const el=$('#actFeed');
-    let items=allActivity;
+    let items=allActivity.filter(a=>a.action!=='observed');
     if(activeFilter)items=items.filter(a=>(a.agent_name||'').toLowerCase()===activeFilter);
     if(!items.length){el.innerHTML='<div style="padding:20px;text-align:center;color:var(--muted);font-size:12px">No activity yet</div>';return}
     el.innerHTML=items.slice(0,50).map(a=>{
