@@ -22,6 +22,7 @@ import mcpHandler, { mcpPostHandler, mcpSseHandler } from './handlers/mcp.js';
 import exportHandler from './handlers/export.js';
 import oauthHandler from './handlers/oauth.js';
 import observeHandler from './handlers/observe.js';
+import reindexHandler from './handlers/reindex.js';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -133,6 +134,7 @@ api.route('/api/v1/events', eventsHandler);
 api.route('/api/v1/batch', batchHandler);
 api.route('/api/v1/agents', agentsHandler);
 api.route('/api/v1/export', exportHandler);
+api.post('/api/v1/notes/reindex', authMiddleware, reindexHandler);
 api.route('/mcp', mcpHandler);
 // Mount MCP handler on POST / for Claude.ai MCP connector compatibility
 // (Claude.ai sends MCP requests to root URL, not /mcp)

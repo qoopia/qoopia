@@ -3,7 +3,7 @@ import { ulid } from 'ulid';
 import { rawDb } from './connection.js';
 import { logger } from '../core/logger.js';
 
-const CURRENT_VERSION = 4;
+const CURRENT_VERSION = 5;
 
 export function runMigrations() {
   const currentVersion = rawDb.prepare(
@@ -50,6 +50,21 @@ export function runMigrations() {
         'Add session_expires_at to users for server-side token expiry (HIGH #6)'
       );
       logger.info('Migration 004 applied');
+    }
+
+    if (latest.v < 5) {
+      logger.info('Running migration 005: notes type column...');
+      const hasType = rawDb.prepare(`SELECT * FROM pragma_table_info('notes') WHERE name='type'`).get();
+      if (!hasType) {
+        rawDb.exec(`ALTER TABLE notes ADD COLUMN type TEXT DEFAULT NULL`);
+      }
+      rawDb.exec(`UPDATE notes SET type = 'memory' WHERE type IS NULL`);
+      rawDb.exec(`CREATE INDEX IF NOT EXISTS idx_notes_type ON notes(workspace_id, type)`);
+      rawDb.prepare('INSERT INTO schema_versions (version, description) VALUES (?, ?)').run(
+        5,
+        'Add type column to notes (rule/memory/knowledge/context) with backfill and index'
+      );
+      logger.info('Migration 005 applied');
     }
 
     if (latest.v >= CURRENT_VERSION) {
