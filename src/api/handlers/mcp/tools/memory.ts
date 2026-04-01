@@ -47,6 +47,14 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
 ];
 
+type RecallResult = {
+  id: string;
+  text: string;
+  type: 'note' | 'task' | 'deal' | 'contact' | 'activity';
+  score: number;
+  created_at?: string;
+};
+
 export async function handleTool(name: string, args: Record<string, unknown>, workspaceId: string, actorId: string): Promise<unknown | null> {
   switch (name) {
     case 'note': {
@@ -155,7 +163,7 @@ export async function handleTool(name: string, args: Record<string, unknown>, wo
       const searchResult = await semanticSearch(query, workspaceId, fetchLimit);
 
       // Apply type filter if provided (only affects notes — other entity types pass through)
-      let filteredResults = searchResult.results;
+      let filteredResults: RecallResult[] = searchResult.results;
       if (typeFilter) {
         // For note results, check type column; non-note results pass through
         const noteIds = filteredResults.filter(r => r.type === 'note').map(r => r.id);
@@ -176,7 +184,7 @@ export async function handleTool(name: string, args: Record<string, unknown>, wo
         content: [{
           type: 'text',
           text: JSON.stringify({
-            results: filteredResults.map((r: any) => ({ ...r, text: r.text ? String(r.text).substring(0, 300) : r.text })),
+            results: filteredResults.map((r) => ({ ...r, text: r.text ? String(r.text).substring(0, 300) : r.text })),
             method: searchResult.method,
             message: `Found ${filteredResults.length} relevant item${filteredResults.length !== 1 ? 's' : ''} using ${searchResult.method} search.`,
           }),

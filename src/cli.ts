@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 
-import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
-import { ulid } from 'ulid';
 
 const args = process.argv.slice(2);
 const command = args[0];

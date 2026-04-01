@@ -597,7 +597,6 @@ oauth.post('/oauth/token', async (c) => {
       client_id: clientId,
       agent_id: codeRecord.agent_id,
       grant: 'authorization_code',
-      token_prefix: accessToken.slice(0, 20),
       has_refresh: true,
       response_keys: Object.keys(tokenResponse),
     }, '<<< Token pair issued successfully');

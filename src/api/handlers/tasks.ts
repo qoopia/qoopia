@@ -7,6 +7,7 @@ import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
+const TASK_COLUMNS = 'id, project_id, workspace_id, title, description, status, priority, assignee, due_date, blocked_by, parent_id, source, tags, notes, attachments, revision, deleted_at, created_at, updated_at, updated_by';
 
 // List tasks
 app.get('/', (c) => {
@@ -19,7 +20,7 @@ app.get('/', (c) => {
   const priority = c.req.query('priority');
   const updatedSince = c.req.query('updated_since');
 
-  let query = 'SELECT * FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL';
+  let query = `SELECT ${TASK_COLUMNS} FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL`;
   const params: unknown[] = [auth.workspace_id];
 
   if (projectId) { query += ' AND project_id = ?'; params.push(projectId); }
@@ -28,7 +29,7 @@ app.get('/', (c) => {
   if (priority) { query += ' AND priority = ?'; params.push(priority); }
   if (updatedSince) { query += ' AND updated_at > ?'; params.push(updatedSince); }
 
-  const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
+  const countQuery = query.replace(`SELECT ${TASK_COLUMNS}`, 'SELECT COUNT(*) as total');
   const total = (rawDb.prepare(countQuery).get(...params) as { total: number }).total;
 
   query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
@@ -47,7 +48,7 @@ app.get('/', (c) => {
 app.get('/:id', (c) => {
   const auth = c.get('auth');
   const row = rawDb.prepare(
-    'SELECT * FROM tasks WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${TASK_COLUMNS} FROM tasks WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(c.req.param('id'), auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!row) {
@@ -124,7 +125,7 @@ app.post('/', async (c) => {
     revision_after: 1,
   });
 
-  const row = rawDb.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Record<string, unknown>;
+  const row = rawDb.prepare(`SELECT ${TASK_COLUMNS} FROM tasks WHERE id = ?`).get(id) as Record<string, unknown>;
   return c.json({ data: formatTask(row) }, 201);
 });
 
@@ -148,7 +149,7 @@ app.patch('/:id', async (c) => {
   const taskId = c.req.param('id');
 
   const current = rawDb.prepare(
-    'SELECT * FROM tasks WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${TASK_COLUMNS} FROM tasks WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(taskId, auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!current) {
@@ -206,7 +207,7 @@ app.patch('/:id', async (c) => {
     revision_after: revision + 1,
   });
 
-  const updated = rawDb.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Record<string, unknown>;
+  const updated = rawDb.prepare(`SELECT ${TASK_COLUMNS} FROM tasks WHERE id = ?`).get(taskId) as Record<string, unknown>;
   return c.json({ data: formatTask(updated) });
 });
 
@@ -216,7 +217,7 @@ app.delete('/:id', (c) => {
   const taskId = c.req.param('id');
 
   const current = rawDb.prepare(
-    'SELECT * FROM tasks WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${TASK_COLUMNS} FROM tasks WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(taskId, auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!current) {

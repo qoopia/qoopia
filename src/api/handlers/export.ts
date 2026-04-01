@@ -3,6 +3,13 @@ import { rawDb } from '../../db/connection.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
+const WORKSPACE_COLUMNS = 'id, name, slug, settings, created_at, updated_at';
+const PROJECT_COLUMNS = 'id, workspace_id, name, description, status, owner_agent_id, color, tags, settings, revision, deleted_at, created_at, updated_at, updated_by';
+const TASK_COLUMNS = 'id, project_id, workspace_id, title, description, status, priority, assignee, due_date, blocked_by, parent_id, source, tags, notes, attachments, revision, deleted_at, created_at, updated_at, updated_by';
+const DEAL_COLUMNS = 'id, project_id, workspace_id, name, address, status, asking_price, target_price, monthly_rent, lease_term_months, metadata, documents, timeline, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
+const CONTACT_COLUMNS = 'id, workspace_id, name, role, company, email, phone, telegram_id, language, timezone, category, communication_rules, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
+const FINANCE_COLUMNS = 'id, workspace_id, project_id, type, name, amount, currency, recurring, status, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
+const ACTIVITY_COLUMNS = 'id, workspace_id, timestamp, actor, action, entity_type, entity_id, project_id, summary, details, revision_before, revision_after';
 
 // GET /api/v1/export — full workspace JSON dump (admin/owner only)
 app.get('/', (c) => {
@@ -28,12 +35,12 @@ app.get('/', (c) => {
 
   const wsId = auth.workspace_id;
 
-  const workspace = rawDb.prepare('SELECT * FROM workspaces WHERE id = ?').get(wsId);
-  const projects = rawDb.prepare('SELECT * FROM projects WHERE workspace_id = ? AND deleted_at IS NULL').all(wsId);
-  const tasks = rawDb.prepare('SELECT * FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL').all(wsId);
-  const deals = rawDb.prepare('SELECT * FROM deals WHERE workspace_id = ? AND deleted_at IS NULL').all(wsId);
-  const contacts = rawDb.prepare('SELECT * FROM contacts WHERE workspace_id = ? AND deleted_at IS NULL').all(wsId);
-  const finances = rawDb.prepare('SELECT * FROM finances WHERE workspace_id = ? AND deleted_at IS NULL').all(wsId);
+  const workspace = rawDb.prepare(`SELECT ${WORKSPACE_COLUMNS} FROM workspaces WHERE id = ?`).get(wsId);
+  const projects = rawDb.prepare(`SELECT ${PROJECT_COLUMNS} FROM projects WHERE workspace_id = ? AND deleted_at IS NULL`).all(wsId);
+  const tasks = rawDb.prepare(`SELECT ${TASK_COLUMNS} FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL`).all(wsId);
+  const deals = rawDb.prepare(`SELECT ${DEAL_COLUMNS} FROM deals WHERE workspace_id = ? AND deleted_at IS NULL`).all(wsId);
+  const contacts = rawDb.prepare(`SELECT ${CONTACT_COLUMNS} FROM contacts WHERE workspace_id = ? AND deleted_at IS NULL`).all(wsId);
+  const finances = rawDb.prepare(`SELECT ${FINANCE_COLUMNS} FROM finances WHERE workspace_id = ? AND deleted_at IS NULL`).all(wsId);
   const agents = rawDb.prepare('SELECT id, workspace_id, name, type, permissions, metadata, last_seen, active, created_at FROM agents WHERE workspace_id = ?').all(wsId);
   const users = rawDb.prepare('SELECT id, workspace_id, name, email, role, last_seen, created_at FROM users WHERE workspace_id = ?').all(wsId);
   const contactProjects = rawDb.prepare(`
@@ -49,7 +56,7 @@ app.get('/', (c) => {
 
   // Recent activity (last 1000 entries)
   const activity = rawDb.prepare(
-    'SELECT * FROM activity WHERE workspace_id = ? ORDER BY id DESC LIMIT 1000'
+    `SELECT ${ACTIVITY_COLUMNS} FROM activity WHERE workspace_id = ? ORDER BY id DESC LIMIT 1000`
   ).all(wsId);
 
   const exported = {

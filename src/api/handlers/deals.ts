@@ -7,6 +7,8 @@ import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
+const DEAL_COLUMNS = 'id, project_id, workspace_id, name, address, status, asking_price, target_price, monthly_rent, lease_term_months, metadata, documents, timeline, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
+const CONTACT_WITH_DEAL_ROLE_COLUMNS = 'c.id, c.workspace_id, c.name, c.role, c.company, c.email, c.phone, c.telegram_id, c.language, c.timezone, c.category, c.communication_rules, c.tags, c.notes, c.revision, c.deleted_at, c.created_at, c.updated_at, c.updated_by, dc.role as deal_role';
 
 // List deals
 app.get('/', (c) => {
@@ -17,14 +19,14 @@ app.get('/', (c) => {
   const status = c.req.query('status');
   const updatedSince = c.req.query('updated_since');
 
-  let query = 'SELECT * FROM deals WHERE workspace_id = ? AND deleted_at IS NULL';
+  let query = `SELECT ${DEAL_COLUMNS} FROM deals WHERE workspace_id = ? AND deleted_at IS NULL`;
   const params: unknown[] = [auth.workspace_id];
 
   if (projectId) { query += ' AND project_id = ?'; params.push(projectId); }
   if (status) { query += ' AND status = ?'; params.push(status); }
   if (updatedSince) { query += ' AND updated_at > ?'; params.push(updatedSince); }
 
-  const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
+  const countQuery = query.replace(`SELECT ${DEAL_COLUMNS}`, 'SELECT COUNT(*) as total');
   const total = (rawDb.prepare(countQuery).get(...params) as { total: number }).total;
 
   query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
@@ -43,7 +45,7 @@ app.get('/', (c) => {
 app.get('/:id', (c) => {
   const auth = c.get('auth');
   const row = rawDb.prepare(
-    'SELECT * FROM deals WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${DEAL_COLUMNS} FROM deals WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(c.req.param('id'), auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!row) {
@@ -51,7 +53,7 @@ app.get('/:id', (c) => {
   }
 
   const contacts = rawDb.prepare(
-    'SELECT c.*, dc.role as deal_role FROM contacts c JOIN deal_contacts dc ON dc.contact_id = c.id WHERE dc.deal_id = ? AND c.deleted_at IS NULL'
+    `SELECT ${CONTACT_WITH_DEAL_ROLE_COLUMNS} FROM contacts c JOIN deal_contacts dc ON dc.contact_id = c.id WHERE dc.deal_id = ? AND c.deleted_at IS NULL`
   ).all(c.req.param('id')) as Record<string, unknown>[];
 
   const formatted = formatDeal(row);
@@ -129,7 +131,7 @@ app.post('/', async (c) => {
     summary: `Created deal: ${data.name}`, revision_after: 1,
   });
 
-  const row = rawDb.prepare('SELECT * FROM deals WHERE id = ?').get(id) as Record<string, unknown>;
+  const row = rawDb.prepare(`SELECT ${DEAL_COLUMNS} FROM deals WHERE id = ?`).get(id) as Record<string, unknown>;
   return c.json({ data: formatDeal(row) }, 201);
 });
 
@@ -149,7 +151,7 @@ app.patch('/:id', async (c) => {
   const dealId = c.req.param('id');
 
   const current = rawDb.prepare(
-    'SELECT * FROM deals WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${DEAL_COLUMNS} FROM deals WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(dealId, auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!current) {
@@ -226,7 +228,7 @@ app.patch('/:id', async (c) => {
     revision_before: revision, revision_after: revision + 1,
   });
 
-  const updated = rawDb.prepare('SELECT * FROM deals WHERE id = ?').get(dealId) as Record<string, unknown>;
+  const updated = rawDb.prepare(`SELECT ${DEAL_COLUMNS} FROM deals WHERE id = ?`).get(dealId) as Record<string, unknown>;
   return c.json({ data: formatDeal(updated) });
 });
 
@@ -236,7 +238,7 @@ app.delete('/:id', (c) => {
   const dealId = c.req.param('id');
 
   const current = rawDb.prepare(
-    'SELECT * FROM deals WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${DEAL_COLUMNS} FROM deals WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(dealId, auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!current) {

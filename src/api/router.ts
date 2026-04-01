@@ -53,32 +53,6 @@ for (const route of protectedRoutes) {
 // MCP endpoint (auth required) — /mcp and POST / (Claude.ai sends MCP requests to root)
 api.use('/mcp', authMiddleware);
 api.use('/mcp/*', authMiddleware);
-// Debug: log EVERY request to / (any method) to catch Claude.ai
-api.all('/', async (c, next) => {
-  const { logger } = await import('../core/logger.js');
-  const method = c.req.method;
-  const authHeader = c.req.header('Authorization') || '';
-  const hasBearer = authHeader.startsWith('Bearer ');
-  const contentType = c.req.header('Content-Type') || '';
-  const accept = c.req.header('Accept') || '';
-  const mcpSession = c.req.header('Mcp-Session-Id') || '';
-  logger.info({
-    step: 'ROOT_REQUEST',
-    path: '/',
-    method,
-    has_auth: !!authHeader,
-    has_bearer: hasBearer,
-    auth_type: authHeader ? (authHeader.startsWith('Bearer ') ? 'bearer' : authHeader.startsWith('Basic ') ? 'basic' : 'other') : 'none',
-    token_prefix: hasBearer ? authHeader.slice(7, 27) : 'none',
-    content_type: contentType,
-    accept,
-    mcp_session_id: mcpSession,
-    user_agent: (c.req.header('User-Agent') || '').slice(0, 120),
-    origin: c.req.header('Origin') || '',
-    referer: c.req.header('Referer') || '',
-  }, `${method} / pre-auth debug`);
-  return next();
-});
 api.on('POST', '/', authMiddleware);
 
 // DELETE / — MCP session termination (spec says respond 405 if not supported, or 204 if terminated)
@@ -164,7 +138,12 @@ api.get('/', async (c, next) => {
     }
     // Run auth middleware inline, then SSE handler
     const { authMiddleware: inlineAuth } = await import('./middleware/auth.js');
-    return inlineAuth(c as any, async () => mcpSseHandler(c as any));
+    const mcpContext = c as unknown as Parameters<typeof mcpPostHandler>[0];
+    let response: Response | undefined;
+    await inlineAuth(mcpContext, async () => {
+      response = mcpSseHandler(mcpContext);
+    });
+    return response ?? c.res;
   }
   // Regular browser request — serve landing page
   try {

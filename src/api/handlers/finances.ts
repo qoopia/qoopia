@@ -7,6 +7,7 @@ import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
+const FINANCE_COLUMNS = 'id, workspace_id, project_id, type, name, amount, currency, recurring, status, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
 
 // List finances
 app.get('/', (c) => {
@@ -18,7 +19,7 @@ app.get('/', (c) => {
   const status = c.req.query('status');
   const updatedSince = c.req.query('updated_since');
 
-  let query = 'SELECT * FROM finances WHERE workspace_id = ? AND deleted_at IS NULL';
+  let query = `SELECT ${FINANCE_COLUMNS} FROM finances WHERE workspace_id = ? AND deleted_at IS NULL`;
   const params: unknown[] = [auth.workspace_id];
 
   if (projectId) { query += ' AND project_id = ?'; params.push(projectId); }
@@ -26,7 +27,7 @@ app.get('/', (c) => {
   if (status) { query += ' AND status = ?'; params.push(status); }
   if (updatedSince) { query += ' AND updated_at > ?'; params.push(updatedSince); }
 
-  const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
+  const countQuery = query.replace(`SELECT ${FINANCE_COLUMNS}`, 'SELECT COUNT(*) as total');
   const total = (rawDb.prepare(countQuery).get(...params) as { total: number }).total;
 
   query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
@@ -45,7 +46,7 @@ app.get('/', (c) => {
 app.get('/:id', (c) => {
   const auth = c.get('auth');
   const row = rawDb.prepare(
-    'SELECT * FROM finances WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${FINANCE_COLUMNS} FROM finances WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(c.req.param('id'), auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!row) {
@@ -98,7 +99,7 @@ app.post('/', async (c) => {
     revision_after: 1,
   });
 
-  const row = rawDb.prepare('SELECT * FROM finances WHERE id = ?').get(id) as Record<string, unknown>;
+  const row = rawDb.prepare(`SELECT ${FINANCE_COLUMNS} FROM finances WHERE id = ?`).get(id) as Record<string, unknown>;
   return c.json({ data: formatFinance(row) }, 201);
 });
 
@@ -118,7 +119,7 @@ app.patch('/:id', async (c) => {
   const financeId = c.req.param('id');
 
   const current = rawDb.prepare(
-    'SELECT * FROM finances WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${FINANCE_COLUMNS} FROM finances WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(financeId, auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!current) {
@@ -166,7 +167,7 @@ app.patch('/:id', async (c) => {
     revision_before: revision, revision_after: revision + 1,
   });
 
-  const updated = rawDb.prepare('SELECT * FROM finances WHERE id = ?').get(financeId) as Record<string, unknown>;
+  const updated = rawDb.prepare(`SELECT ${FINANCE_COLUMNS} FROM finances WHERE id = ?`).get(financeId) as Record<string, unknown>;
   return c.json({ data: formatFinance(updated) });
 });
 
@@ -176,7 +177,7 @@ app.delete('/:id', (c) => {
   const financeId = c.req.param('id');
 
   const current = rawDb.prepare(
-    'SELECT * FROM finances WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${FINANCE_COLUMNS} FROM finances WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(financeId, auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!current) {

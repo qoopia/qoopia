@@ -7,6 +7,7 @@ import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
+const CONTACT_COLUMNS = 'id, workspace_id, name, role, company, email, phone, telegram_id, language, timezone, category, communication_rules, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
 
 // List contacts
 app.get('/', (c) => {
@@ -17,7 +18,7 @@ app.get('/', (c) => {
   const projectId = c.req.query('project_id');
   const updatedSince = c.req.query('updated_since');
 
-  let query = 'SELECT * FROM contacts WHERE workspace_id = ? AND deleted_at IS NULL';
+  let query = `SELECT ${CONTACT_COLUMNS} FROM contacts WHERE workspace_id = ? AND deleted_at IS NULL`;
   const params: unknown[] = [auth.workspace_id];
 
   if (category) { query += ' AND category = ?'; params.push(category); }
@@ -27,7 +28,7 @@ app.get('/', (c) => {
   }
   if (updatedSince) { query += ' AND updated_at > ?'; params.push(updatedSince); }
 
-  const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
+  const countQuery = query.replace(`SELECT ${CONTACT_COLUMNS}`, 'SELECT COUNT(*) as total');
   const total = (rawDb.prepare(countQuery).get(...params) as { total: number }).total;
 
   query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
@@ -46,7 +47,7 @@ app.get('/', (c) => {
 app.get('/:id', (c) => {
   const auth = c.get('auth');
   const row = rawDb.prepare(
-    'SELECT * FROM contacts WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${CONTACT_COLUMNS} FROM contacts WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(c.req.param('id'), auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!row) {
@@ -103,7 +104,7 @@ app.post('/', async (c) => {
     summary: `Created contact: ${data.name}`, revision_after: 1,
   });
 
-  const row = rawDb.prepare('SELECT * FROM contacts WHERE id = ?').get(id) as Record<string, unknown>;
+  const row = rawDb.prepare(`SELECT ${CONTACT_COLUMNS} FROM contacts WHERE id = ?`).get(id) as Record<string, unknown>;
   return c.json({ data: formatContact(row) }, 201);
 });
 
@@ -123,7 +124,7 @@ app.patch('/:id', async (c) => {
   const contactId = c.req.param('id');
 
   const current = rawDb.prepare(
-    'SELECT * FROM contacts WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${CONTACT_COLUMNS} FROM contacts WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(contactId, auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!current) {
@@ -180,7 +181,7 @@ app.patch('/:id', async (c) => {
     revision_before: revision, revision_after: revision + 1,
   });
 
-  const updated = rawDb.prepare('SELECT * FROM contacts WHERE id = ?').get(contactId) as Record<string, unknown>;
+  const updated = rawDb.prepare(`SELECT ${CONTACT_COLUMNS} FROM contacts WHERE id = ?`).get(contactId) as Record<string, unknown>;
   return c.json({ data: formatContact(updated) });
 });
 
@@ -190,7 +191,7 @@ app.delete('/:id', (c) => {
   const contactId = c.req.param('id');
 
   const current = rawDb.prepare(
-    'SELECT * FROM contacts WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL'
+    `SELECT ${CONTACT_COLUMNS} FROM contacts WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`
   ).get(contactId, auth.workspace_id) as Record<string, unknown> | undefined;
 
   if (!current) {

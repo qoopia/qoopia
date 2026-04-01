@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import crypto from 'node:crypto';
 import { rawDb } from '../../../db/connection.js';
 import { resolveActorName } from '../../utils/resolve-actor.js';
@@ -18,7 +18,7 @@ interface McpRequest {
 
 interface McpResponse {
   jsonrpc: '2.0';
-  id: string | number;
+  id: string | number | null;
   result?: unknown;
   error?: { code: number; message: string };
 }
@@ -52,7 +52,9 @@ function checkMcpToolPermission(agentId: string, toolName: string, agentName: st
 }
 
 // MCP Streamable HTTP POST handler — shared between /mcp and POST /
-async function mcpPostHandler(c: any) {
+type McpContext = Context<{ Variables: { auth: AuthContext } }>;
+
+async function mcpPostHandler(c: McpContext) {
   const auth = c.get('auth') as AuthContext | undefined;
   if (!auth) {
     return c.json({ jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Authentication required' } }, 401);
@@ -205,7 +207,7 @@ app.get('/', (c) => {
 });
 
 // Exported SSE handler for GET / on the root router (shared logic)
-function mcpSseHandler(c: any) {
+function mcpSseHandler(c: McpContext) {
   const auth = c.get('auth') as AuthContext | undefined;
   if (!auth) {
     return c.json({ error: 'Authentication required' }, 401);
