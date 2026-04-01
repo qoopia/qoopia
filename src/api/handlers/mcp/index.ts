@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { rawDb } from '../../../db/connection.js';
 import { resolveActorName } from '../../utils/resolve-actor.js';
 import type { AuthContext } from '../../../types/index.js';
-import { TOOLS, TOOL_PROFILES, TOOL_PERMISSIONS, handleToolCall } from './registry.js';
+import { TOOLS, TOOL_PROFILES, TOOL_PERMISSIONS, resolveToolPermission, handleToolCall } from './registry.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
 
@@ -30,8 +30,8 @@ function handleToolsList(): unknown {
   return { tools: TOOLS };
 }
 
-function checkMcpToolPermission(agentId: string, toolName: string, agentName: string): string | null {
-  const required = TOOL_PERMISSIONS[toolName];
+function checkMcpToolPermission(agentId: string, toolName: string, agentName: string, toolArgs?: Record<string, unknown>): string | null {
+  const required = resolveToolPermission(toolName, toolArgs);
   if (!required) return null; // Unknown tool — let handleToolCall return the error
 
   const [reqEntity, reqAction] = required;
@@ -126,7 +126,7 @@ async function mcpPostHandler(c: McpContext) {
       }
       // CRITICAL #2: Enforce agent permissions for each MCP tool call
       if (auth.type === 'agent') {
-        const permError = checkMcpToolPermission(auth.id, params.name, auth.name);
+        const permError = checkMcpToolPermission(auth.id, params.name, auth.name, params.arguments);
         if (permError) {
           return c.json({ jsonrpc: '2.0', id: body.id, error: { code: -32000, message: permError } } satisfies McpResponse);
         }

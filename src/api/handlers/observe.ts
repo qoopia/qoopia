@@ -21,20 +21,6 @@ interface ObserveEvent {
   metadata?: Record<string, unknown>;
 }
 
-interface BufferedEvent extends ObserveEvent {
-  workspace_id: string;
-  actor_id: string;
-  received_at: string;
-}
-
-// ── Buffer/Flush mechanism (per-workspace) ──
-
-const workspaceBuffers = new Map<string, BufferedEvent[]>();
-const workspaceTimers = new Map<string, ReturnType<typeof setTimeout>>();
-const FLUSH_INTERVAL = 60_000; // 60 seconds
-const FLUSH_THRESHOLD = 20;    // flush after 20 events
-const MAX_BUFFER = 100;        // hard cap per workspace
-
 function matchEntitiesFromText(text: string, workspaceId: string): Array<{ type: string; id: string; name: string }> {
   const matched: Array<{ type: string; id: string; name: string }> = [];
   const seen = new Set<string>();
@@ -80,82 +66,6 @@ function matchEntitiesFromText(text: string, workspaceId: string): Array<{ type:
   return matched.slice(0, 20);
 }
 
-function flushWorkspaceBuffer(workspaceId: string): { processed: number; matched: number } {
-  const buffer = workspaceBuffers.get(workspaceId);
-  if (!buffer || buffer.length === 0) return { processed: 0, matched: 0 };
-
-  const events = buffer.splice(0);
-  const timer = workspaceTimers.get(workspaceId);
-  if (timer) { clearTimeout(timer); workspaceTimers.delete(workspaceId); }
-  if (events.length === 0) { workspaceBuffers.delete(workspaceId); return { processed: 0, matched: 0 }; }
-
-  const combinedText = events.map(e => `[${e.agent}] ${e.content}`).join('\n');
-  const agents = [...new Set(events.map(e => e.agent))];
-  const actorId = events[0]?.actor_id || agents[0] || 'observe';
-
-  const matched = matchEntitiesFromText(combinedText, workspaceId);
-
-  // Auto-status sync: detect and apply status changes from observed text
-  const statusChanges = detectAndApplyStatusChanges(combinedText, workspaceId, actorId, 'observe');
-  for (const upd of statusChanges.applied) {
-    logActivity({
-      workspace_id: workspaceId,
-      actor: actorId,
-      action: 'auto-update',
-      entity_type: upd.type,
-      entity_id: upd.id,
-      summary: `Auto-updated ${upd.type} "${upd.name}": ${upd.previous_status} → ${upd.new_status} (from observe)`,
-      details: { source: 'observe', event_count: events.length, agents },
-    });
-  }
-
-  if (matched.length > 0) {
-    for (const entity of matched) {
-      logActivity({
-        workspace_id: workspaceId,
-        actor: agents[0] || 'system',
-        action: 'observed',
-        entity_type: entity.type,
-        entity_id: entity.id,
-        summary: `Observed activity from ${agents.join(', ')} mentioning ${entity.name}`,
-        details: { source: 'observe', event_count: events.length, agents, auto_updated: statusChanges.applied.length },
-      });
-    }
-  } else {
-    logActivity({
-      workspace_id: workspaceId,
-      actor: agents[0] || 'system',
-      action: 'observed',
-      entity_type: 'activity',
-      summary: `Observed ${events.length} event(s) from ${agents.join(', ')}`,
-      details: { source: 'observe', event_count: events.length, agents, auto_updated: statusChanges.applied.length },
-    });
-  }
-
-  if (buffer.length === 0) workspaceBuffers.delete(workspaceId);
-  return { processed: events.length, matched: matched.length };
-}
-
-export function flushBuffer(): { processed: number; matched: number } {
-  let totalProcessed = 0;
-  let totalMatched = 0;
-  for (const wsId of [...workspaceBuffers.keys()]) {
-    const r = flushWorkspaceBuffer(wsId);
-    totalProcessed += r.processed;
-    totalMatched += r.matched;
-  }
-  return { processed: totalProcessed, matched: totalMatched };
-}
-
-function scheduleFlush(workspaceId: string): void {
-  if (!workspaceTimers.has(workspaceId)) {
-    workspaceTimers.set(workspaceId, setTimeout(() => {
-      workspaceTimers.delete(workspaceId);
-      flushWorkspaceBuffer(workspaceId);
-    }, FLUSH_INTERVAL));
-  }
-}
-
 function resolveObservedAgent(
   auth: AuthContext,
   body: ObserveEvent,
@@ -185,6 +95,7 @@ function resolveObservedAgent(
 }
 
 // ── POST /api/v1/observe ──
+// Auto-status detection only: match entities, detect status transitions, drop if none found.
 
 app.post('/', async (c) => {
   const auth = c.get('auth');
@@ -209,35 +120,39 @@ app.post('/', async (c) => {
   }
 
   const resolvedAgent = resolveObservedAgent(auth, body);
-  const buffered: BufferedEvent = {
-    ...body,
-    agent: resolvedAgent.agentName,
-    workspace_id: auth.workspace_id,
-    actor_id: resolvedAgent.actorId,
-    received_at: new Date().toISOString(),
-  };
-
   const wsId = auth.workspace_id;
-  let buffer = workspaceBuffers.get(wsId);
-  if (!buffer) { buffer = []; workspaceBuffers.set(wsId, buffer); }
+  const actorId = resolvedAgent.actorId;
+  const content = body.content;
 
-  // Enforce max buffer size per workspace
-  if (buffer.length >= MAX_BUFFER) {
-    flushWorkspaceBuffer(wsId);
-    buffer = workspaceBuffers.get(wsId) || [];
-    if (!workspaceBuffers.has(wsId)) { workspaceBuffers.set(wsId, buffer); }
+  // Match entities mentioned in the event
+  const matched = matchEntitiesFromText(content, wsId);
+
+  // Detect status transitions
+  const statusChanges = detectAndApplyStatusChanges(content, wsId, actorId, 'observe');
+
+  // If no status transitions detected — drop the event silently
+  if (statusChanges.applied.length === 0) {
+    return c.json({ accepted: true, status_changes: 0 }, 202);
   }
 
-  buffer.push(buffered);
-
-  // Flush if threshold reached, otherwise schedule timer
-  if (buffer.length >= FLUSH_THRESHOLD) {
-    flushWorkspaceBuffer(wsId);
-  } else {
-    scheduleFlush(wsId);
+  // Status transition found — log ONE activity entry per update
+  for (const upd of statusChanges.applied) {
+    logActivity({
+      workspace_id: wsId,
+      actor: actorId,
+      action: 'auto-update',
+      entity_type: upd.type,
+      entity_id: upd.id,
+      summary: `Auto-updated ${upd.type} "${upd.name}": ${upd.previous_status} → ${upd.new_status} (from observe)`,
+      details: { source: 'observe', agent: resolvedAgent.agentName },
+    });
   }
 
-  return c.json({ accepted: true, buffered: (workspaceBuffers.get(wsId) || []).length }, 202);
+  return c.json({
+    accepted: true,
+    status_changes: statusChanges.applied.length,
+    applied: statusChanges.applied.map(u => ({ type: u.type, id: u.id, name: u.name, new_status: u.new_status })),
+  }, 200);
 });
 
 export default app;

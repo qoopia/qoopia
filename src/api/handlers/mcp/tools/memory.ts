@@ -2,19 +2,21 @@ import { ulid } from 'ulid';
 import { rawDb } from '../../../../db/connection.js';
 import { logActivity } from '../../../../core/activity-log.js';
 import { matchFromNote, semanticSearch, getCapabilities, storeEmbedding, detectAndApplyStatusChanges, detectStaleTasks } from '../../../../core/intelligence.js';
-import { now, jsonStr } from '../utils.js';
+import { now, jsonStr, matchEntities } from '../utils.js';
 import type { ToolDefinition } from '../utils.js';
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'note',
-    description: 'Record what you did, learned, or decided. Your memory persists here — next session, use recall or brief to remember. Qoopia automatically links your note to relevant tasks and deals, updating statuses when work is completed.',
+    description: 'Record what you did, learned, or decided. Also use this to report completed work (replaces report_activity). Qoopia auto-links notes to tasks/deals and updates statuses when work is completed. Call after finishing a task, closing a deal, or any meaningful action.',
     inputSchema: {
       type: 'object',
       properties: {
         text: { type: 'string', description: 'What happened, in your own words' },
         project: { type: 'string', description: 'Project name or ID (optional, helps accuracy)' },
         agent_name: { type: 'string', description: 'Your name (e.g. aidan, alan, claude)' },
+        session_id: { type: 'string', description: 'Session identifier for grouping activities' },
+        entities_hint: { type: 'array', items: { type: 'string' }, description: 'Entity IDs that may be affected (helps matching accuracy)' },
         type: { type: 'string', enum: ['rule', 'memory', 'knowledge', 'context'], description: 'Note type: rule=instructions/constraints, memory=events/facts, knowledge=reference info, context=current project/task status. Default: memory' },
       },
       required: ['text'],
@@ -22,13 +24,14 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'recall',
-    description: 'Search your memory. Ask anything about past work, decisions, contacts, or deals. Returns relevant notes and structured data.',
+    description: 'Search your memory and workspace data. Ask anything about past work, decisions, contacts, or deals. Uses semantic search (embeddings) when available, falls back to full-text search. Also replaces the standalone search tool.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'What you want to remember — natural language question' },
+        query: { type: 'string', description: 'What you want to remember — natural language question or search terms' },
         limit: { type: 'number', description: 'Max results (default 10)' },
         type: { type: 'string', enum: ['rule', 'memory', 'knowledge', 'context'], description: 'Filter by note type' },
+        entities: { type: 'string', description: 'Comma-separated entity types to search: tasks,deals,contacts,activity. If omitted, searches all.' },
       },
       required: ['query'],
     },
@@ -62,6 +65,8 @@ export async function handleTool(name: string, args: Record<string, unknown>, wo
       if (!text) return { content: [{ type: 'text', text: 'Text is required' }], isError: true };
 
       const agentName = args.agent_name ? String(args.agent_name) : undefined;
+      const sessionId = args.session_id ? String(args.session_id) : undefined;
+      const hintsIds = Array.isArray(args.entities_hint) ? args.entities_hint.map(String) : undefined;
 
       // Resolve project
       let projectId: string | null = null;
@@ -76,8 +81,18 @@ export async function handleTool(name: string, args: Record<string, unknown>, wo
         }
       }
 
-      // Match entities from note text
+      // Match entities from note text (use hint IDs for higher accuracy when provided)
       const matchResult = await matchFromNote(text, workspaceId);
+      if (hintsIds && hintsIds.length > 0) {
+        const hintMatched = matchEntities(text, workspaceId, hintsIds);
+        // Merge hint-matched entities that aren't already in matchResult
+        const existingIds = new Set(matchResult.matched_entities.map((e: { id: string }) => e.id));
+        for (const hm of hintMatched) {
+          if (!existingIds.has(hm.id)) {
+            matchResult.matched_entities.push(hm);
+          }
+        }
+      }
 
       // Auto-status sync: detect and apply status changes with confidence gating
       const statusChanges = detectAndApplyStatusChanges(text, workspaceId, actorId, 'note', matchResult);
@@ -108,6 +123,7 @@ export async function handleTool(name: string, args: Record<string, unknown>, wo
         entity_id: noteId,
         project_id: projectId || undefined,
         summary: text.length > 200 ? text.substring(0, 200) + '...' : text,
+        details: sessionId ? { session_id: sessionId } : undefined,
       });
 
       // Generate embedding in background (fire and forget)
@@ -157,15 +173,28 @@ export async function handleTool(name: string, args: Record<string, unknown>, wo
       if (!query) return { content: [{ type: 'text', text: 'Query is required' }], isError: true };
 
       const typeFilter = args.type ? String(args.type) : undefined;
+      const entitiesFilter = args.entities ? String(args.entities).split(',').map(s => s.trim()).filter(Boolean) : undefined;
       const searchLimit = Math.min(Number(args.limit) || 10, 50);
-      // Fetch extra results if filtering by type to compensate for post-filter reduction
-      const fetchLimit = typeFilter ? searchLimit * 3 : searchLimit;
+      // Fetch extra results if filtering to compensate for post-filter reduction
+      const fetchLimit = (typeFilter || entitiesFilter) ? searchLimit * 3 : searchLimit;
       const searchResult = await semanticSearch(query, workspaceId, fetchLimit);
 
-      // Apply type filter if provided (only affects notes — other entity types pass through)
+      // Apply filters
       let filteredResults: RecallResult[] = searchResult.results;
+
+      // Entity type filter (tasks, deals, contacts, activity, note)
+      if (entitiesFilter && entitiesFilter.length > 0) {
+        // Map plural to singular for matching (tasks→task, deals→deal, etc.)
+        const allowed = new Set(entitiesFilter.flatMap(e => {
+          const singular = e.replace(/s$/, '');
+          return [e, singular];
+        }));
+        // 'note' is always included if not explicitly filtered
+        filteredResults = filteredResults.filter(r => allowed.has(r.type));
+      }
+
+      // Note type filter (rule, memory, knowledge, context)
       if (typeFilter) {
-        // For note results, check type column; non-note results pass through
         const noteIds = filteredResults.filter(r => r.type === 'note').map(r => r.id);
         const typedNoteIds = new Set<string>();
         if (noteIds.length > 0) {
@@ -177,8 +206,10 @@ export async function handleTool(name: string, args: Record<string, unknown>, wo
         }
         filteredResults = filteredResults.filter(r =>
           r.type !== 'note' || typedNoteIds.has(r.id)
-        ).slice(0, searchLimit);
+        );
       }
+
+      filteredResults = filteredResults.slice(0, searchLimit);
 
       return {
         content: [{
