@@ -2,7 +2,7 @@ import { createMiddleware } from 'hono/factory';
 import type { AuthContext } from '../../types/index.js';
 
 const READ_LIMIT = 300;   // per minute per API key
-const WRITE_LIMIT = 100;  // per minute per API key
+const WRITE_LIMIT = 300;  // per minute per API key
 const WINDOW_MS = 60_000; // 1 minute
 
 interface RequestRecord {
