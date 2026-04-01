@@ -9,6 +9,7 @@ app.get('/', (c) => {
   const auth = c.get('auth');
   const q = c.req.query('q');
   const entities = (c.req.query('entities') || 'tasks,deals,contacts,activity').split(',');
+  const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '10', 10) || 10, 1), 100);
 
   if (!q || q.trim().length === 0) {
     return c.json({
@@ -29,8 +30,8 @@ app.get('/', (c) => {
         JOIN tasks t ON tasks_fts.rowid = t.rowid
         WHERE tasks_fts MATCH ? AND t.workspace_id = ? AND t.deleted_at IS NULL
         ORDER BY rank
-        LIMIT 20
-      `).all(ftsQuery, auth.workspace_id);
+        LIMIT ?
+      `).all(ftsQuery, auth.workspace_id, limit);
     }
 
     if (entities.includes('deals')) {
@@ -41,8 +42,8 @@ app.get('/', (c) => {
         JOIN deals d ON deals_fts.rowid = d.rowid
         WHERE deals_fts MATCH ? AND d.workspace_id = ? AND d.deleted_at IS NULL
         ORDER BY rank
-        LIMIT 20
-      `).all(ftsQuery, auth.workspace_id);
+        LIMIT ?
+      `).all(ftsQuery, auth.workspace_id, limit);
     }
 
     if (entities.includes('contacts')) {
@@ -53,8 +54,8 @@ app.get('/', (c) => {
         JOIN contacts c ON contacts_fts.rowid = c.rowid
         WHERE contacts_fts MATCH ? AND c.workspace_id = ? AND c.deleted_at IS NULL
         ORDER BY rank
-        LIMIT 20
-      `).all(ftsQuery, auth.workspace_id);
+        LIMIT ?
+      `).all(ftsQuery, auth.workspace_id, limit);
     }
 
     if (entities.includes('activity')) {
@@ -65,8 +66,8 @@ app.get('/', (c) => {
         JOIN activity a ON activity_fts.rowid = a.rowid
         WHERE activity_fts MATCH ? AND a.workspace_id = ?
         ORDER BY rank
-        LIMIT 20
-      `).all(ftsQuery, auth.workspace_id);
+        LIMIT ?
+      `).all(ftsQuery, auth.workspace_id, limit);
     }
   } catch {
     return c.json({
@@ -74,7 +75,7 @@ app.get('/', (c) => {
     }, 400);
   }
 
-  return c.json({ data: result });
+  return c.json({ data: result, limit });
 });
 
 export default app;

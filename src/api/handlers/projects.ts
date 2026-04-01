@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { ulid } from 'ulid';
+import { PROJECT_COLUMNS } from '../../db/columns.js';
 import { rawDb } from '../../db/connection.js';
 import { createProjectSchema, updateProjectSchema } from '../../core/validator.js';
 import { logActivity } from '../../core/activity-log.js';
@@ -7,7 +8,6 @@ import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
-const PROJECT_COLUMNS = 'id, workspace_id, name, description, status, owner_agent_id, color, tags, settings, revision, deleted_at, created_at, updated_at, updated_by';
 
 // List projects
 app.get('/', (c) => {

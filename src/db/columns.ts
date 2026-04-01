@@ -1,0 +1,8 @@
+export const WORKSPACE_COLUMNS = 'id, name, slug, settings, created_at, updated_at';
+export const PROJECT_COLUMNS = 'id, workspace_id, name, description, status, owner_agent_id, color, tags, settings, revision, deleted_at, created_at, updated_at, updated_by';
+export const TASK_COLUMNS = 'id, project_id, workspace_id, title, description, status, priority, assignee, due_date, blocked_by, parent_id, source, tags, notes, attachments, revision, deleted_at, created_at, updated_at, updated_by';
+export const DEAL_COLUMNS = 'id, project_id, workspace_id, name, address, status, asking_price, target_price, monthly_rent, lease_term_months, metadata, documents, timeline, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
+export const CONTACT_COLUMNS = 'id, workspace_id, name, role, company, email, phone, telegram_id, language, timezone, category, communication_rules, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
+export const CONTACT_WITH_DEAL_ROLE_COLUMNS = 'c.id, c.workspace_id, c.name, c.role, c.company, c.email, c.phone, c.telegram_id, c.language, c.timezone, c.category, c.communication_rules, c.tags, c.notes, c.revision, c.deleted_at, c.created_at, c.updated_at, c.updated_by, dc.role as deal_role';
+export const FINANCE_COLUMNS = 'id, workspace_id, project_id, type, name, amount, currency, recurring, status, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
+export const ACTIVITY_COLUMNS = 'id, workspace_id, timestamp, actor, action, entity_type, entity_id, project_id, summary, details, revision_before, revision_after';

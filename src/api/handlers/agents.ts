@@ -11,13 +11,19 @@ const app = new Hono<{ Variables: { auth: AuthContext } }>();
 // List agents
 app.get('/', (c) => {
   const auth = c.get('auth');
+  const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '50', 10) || 50, 1), 100);
+  const offset = Math.max(parseInt(c.req.query('offset') || '0', 10) || 0, 0);
+
+  const total = (rawDb.prepare(
+    'SELECT COUNT(*) as total FROM agents WHERE workspace_id = ?'
+  ).get(auth.workspace_id) as { total: number }).total;
 
   const rows = rawDb.prepare(
-    'SELECT id, workspace_id, name, type, key_rotated_at, permissions, metadata, last_seen, active, created_at FROM agents WHERE workspace_id = ?'
-  ).all(auth.workspace_id) as Record<string, unknown>[];
+    'SELECT id, workspace_id, name, type, key_rotated_at, permissions, metadata, last_seen, active, created_at FROM agents WHERE workspace_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?'
+  ).all(auth.workspace_id, limit, offset) as Record<string, unknown>[];
 
   const data = rows.map(formatAgent);
-  return c.json({ data });
+  return c.json({ data, total, limit, offset });
 });
 
 // Register new agent

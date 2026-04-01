@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { ulid } from 'ulid';
+import { TASK_COLUMNS } from '../../db/columns.js';
 import { rawDb } from '../../db/connection.js';
 import { createTaskSchema, updateTaskSchema } from '../../core/validator.js';
 import { logActivity } from '../../core/activity-log.js';
@@ -7,7 +8,6 @@ import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
-const TASK_COLUMNS = 'id, project_id, workspace_id, title, description, status, priority, assignee, due_date, blocked_by, parent_id, source, tags, notes, attachments, revision, deleted_at, created_at, updated_at, updated_by';
 
 // List tasks
 app.get('/', (c) => {

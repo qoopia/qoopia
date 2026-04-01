@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { ulid } from 'ulid';
+import { FINANCE_COLUMNS } from '../../db/columns.js';
 import { rawDb } from '../../db/connection.js';
 import { createFinanceSchema, updateFinanceSchema } from '../../core/validator.js';
 import { logActivity } from '../../core/activity-log.js';
@@ -7,7 +8,6 @@ import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
-const FINANCE_COLUMNS = 'id, workspace_id, project_id, type, name, amount, currency, recurring, status, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
 
 // List finances
 app.get('/', (c) => {

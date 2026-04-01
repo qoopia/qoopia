@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { ulid } from 'ulid';
+import { CONTACT_COLUMNS } from '../../db/columns.js';
 import { rawDb } from '../../db/connection.js';
 import { createContactSchema, updateContactSchema } from '../../core/validator.js';
 import { logActivity } from '../../core/activity-log.js';
@@ -7,7 +8,6 @@ import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
-const CONTACT_COLUMNS = 'id, workspace_id, name, role, company, email, phone, telegram_id, language, timezone, category, communication_rules, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
 
 // List contacts
 app.get('/', (c) => {

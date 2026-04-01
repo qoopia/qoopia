@@ -6,6 +6,7 @@
 
 import { rawDb } from '../db/connection.js';
 import { logger } from './logger.js';
+import { extractKeywords } from './keywords.js';
 
 // ── Interfaces ──
 
@@ -127,33 +128,12 @@ async function fetchWithRetry(
 // ── Status patterns ──
 
 const STATUS_PATTERNS: Array<{ pattern: RegExp; status: string }> = [
-  { pattern: /\b(?:complete[d]?|finished|done with|done|closed|shipped|launched|COMPLETE)\b/i, status: 'done' },
+  { pattern: /\b(?:complete[d]?|(?<!almost\s)(?<!nearly\s)finished|done with|done|closed|shipped|launched|COMPLETE)\b/i, status: 'done' },
   { pattern: /\b(?:cancelled|canceled|abandoned)\b/i, status: 'cancelled' },
   { pattern: /\b(?:started|began|working on)\b/i, status: 'in_progress' },
 ];
 
 // ── Keyword extraction ──
-
-const STOP_WORDS = new Set([
-  'the', 'a', 'an', 'is', 'was', 'are', 'were', 'be', 'been', 'being',
-  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-  'should', 'may', 'might', 'can', 'shall', 'to', 'of', 'in', 'for',
-  'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during',
-  'before', 'after', 'then', 'when', 'where', 'why', 'how', 'all',
-  'each', 'some', 'no', 'not', 'only', 'so', 'than', 'too', 'very',
-  'just', 'and', 'but', 'or', 'if', 'while', 'that', 'this', 'it',
-  'its', 'i', 'my', 'we', 'our', 'you', 'your', 'he', 'she', 'they',
-  'them', 'his', 'her', 'task', 'deal', 'contact', 'completed',
-  'finished', 'started', 'cancelled', 'done', 'report', 'activity',
-]);
-
-function extractKeywords(text: string): string[] {
-  return text
-    .replace(/[^\w\s-]/g, ' ')
-    .split(/\s+/)
-    .filter(w => w.length > 2 && !STOP_WORDS.has(w.toLowerCase()))
-    .map(w => w.toLowerCase());
-}
 
 function buildKeywordPatterns(text: string): string[] {
   return [...new Set(extractKeywords(text))].map(keyword => `%${keyword}%`);

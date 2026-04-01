@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { rawDb } from '../../db/connection.js';
 import { logActivity } from '../../core/activity-log.js';
 import { detectAndApplyStatusChanges } from '../../core/intelligence.js';
+import { extractKeywords } from '../../core/keywords.js';
 import { logger } from '../../core/logger.js';
 import type { AuthContext } from '../../types/index.js';
 
@@ -13,6 +14,8 @@ interface ObserveEvent {
   type: 'message_sent' | 'session_compact' | 'session_end';
   agent: string;
   content: string;
+  actor_id?: string;
+  agent_id?: string;
   session_key?: string;
   timestamp?: string;
   metadata?: Record<string, unknown>;
@@ -31,15 +34,6 @@ const workspaceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const FLUSH_INTERVAL = 60_000; // 60 seconds
 const FLUSH_THRESHOLD = 20;    // flush after 20 events
 const MAX_BUFFER = 100;        // hard cap per workspace
-
-function extractKeywords(text: string): string[] {
-  const stopWords = new Set(['the', 'a', 'an', 'is', 'was', 'are', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'shall', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after', 'then', 'when', 'where', 'why', 'how', 'all', 'each', 'some', 'no', 'not', 'only', 'so', 'than', 'too', 'very', 'just', 'and', 'but', 'or', 'if', 'while', 'that', 'this', 'it', 'its', 'i', 'my', 'we', 'our', 'you', 'your', 'he', 'she', 'they', 'them']);
-  return text
-    .replace(/[^\w\s-]/g, ' ')
-    .split(/\s+/)
-    .filter(w => w.length > 2 && !stopWords.has(w.toLowerCase()))
-    .map(w => w.toLowerCase());
-}
 
 function matchEntitiesFromText(text: string, workspaceId: string): Array<{ type: string; id: string; name: string }> {
   const matched: Array<{ type: string; id: string; name: string }> = [];
@@ -162,6 +156,34 @@ function scheduleFlush(workspaceId: string): void {
   }
 }
 
+function resolveObservedAgent(
+  auth: AuthContext,
+  body: ObserveEvent,
+): { actorId: string; agentName: string } {
+  if (auth.type === 'agent') {
+    const agent = rawDb.prepare(
+      'SELECT id, name FROM agents WHERE id = ? AND workspace_id = ? AND active = 1'
+    ).get(auth.id, auth.workspace_id) as { id: string; name: string } | undefined;
+    if (agent) {
+      return { actorId: agent.id, agentName: agent.name };
+    }
+  }
+
+  const requestedAgentId = [body.actor_id, body.agent_id]
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+  if (requestedAgentId) {
+    const agent = rawDb.prepare(
+      'SELECT id, name FROM agents WHERE id = ? AND workspace_id = ? AND active = 1'
+    ).get(requestedAgentId, auth.workspace_id) as { id: string; name: string } | undefined;
+    if (agent) {
+      return { actorId: agent.id, agentName: agent.name };
+    }
+  }
+
+  return { actorId: 'unknown', agentName: 'unknown' };
+}
+
 // ── POST /api/v1/observe ──
 
 app.post('/', async (c) => {
@@ -186,51 +208,12 @@ app.post('/', async (c) => {
     return c.json({ error: { code: 'VALIDATION_ERROR', message: `Invalid type. Must be one of: ${validTypes.join(', ')}` } }, 400);
   }
 
-  // Derive agent name from auth context, not request body
-  // Map sessions to correct agent by content/session heuristics
-  const AGENT_MAP: Record<string, { name: string; id: string }> = {
-    'aidan':  { name: 'Aidan',  id: '01KMKRVYF3YW28Q3P5EPSYC9M1' },
-    'alan':   { name: 'Alan',   id: '01KMKRVYF3MJP5WRVWTFN8V83W' },
-    'aizek':  { name: 'Aizek',  id: '01KMKRVYF38WSW95FCM6TH9WR3' },
-    'dan':    { name: 'Dan',    id: '01DAN00AGENT0000000000001' },
-    'claude': { name: 'Claude', id: '01CLAUDE0CODE0AGENT0000001' },
-  };
-
-  // Try to resolve agent from auth name first
-  const authNameLower = (auth.name || '').toLowerCase();
-  const sessionKey = body.session_key || '';
-  const content = body.content || '';
-  const combined = `${authNameLower} ${sessionKey} ${content}`.toLowerCase();
-
-  let resolvedAgent = auth.name;
-  let resolvedActorId = auth.id;
-
-  // Direct match from auth name
-  if (AGENT_MAP[authNameLower]) {
-    resolvedAgent = AGENT_MAP[authNameLower].name;
-    resolvedActorId = AGENT_MAP[authNameLower].id;
-  }
-  // Heuristic: check session_key and content for agent signatures
-  else {
-    for (const [key, val] of Object.entries(AGENT_MAP)) {
-      const pattern = new RegExp(`\\b${key}\\b|agent[:\\-_]${key}|openclaw-${key}`, 'i');
-      if (pattern.test(sessionKey) || pattern.test(content)) {
-        resolvedAgent = val.name;
-        resolvedActorId = val.id;
-        break;
-      }
-    }
-    // Fallback: claude code specific pattern
-    if (resolvedAgent === auth.name && /claude[\s-]?code|coding[\s-]?agent/i.test(combined)) {
-      resolvedAgent = AGENT_MAP['claude'].name;
-      resolvedActorId = AGENT_MAP['claude'].id;
-    }
-  }
+  const resolvedAgent = resolveObservedAgent(auth, body);
   const buffered: BufferedEvent = {
     ...body,
-    agent: resolvedAgent,
+    agent: resolvedAgent.agentName,
     workspace_id: auth.workspace_id,
-    actor_id: resolvedActorId,
+    actor_id: resolvedAgent.actorId,
     received_at: new Date().toISOString(),
   };
 

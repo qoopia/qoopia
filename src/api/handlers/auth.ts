@@ -8,9 +8,73 @@ const app = new Hono();
 
 const MAGIC_LINK_EXPIRY_MIN = 15;
 const SESSION_EXPIRY_DAYS = 30;
+const RESEND_RETRY_DELAY_MS = 1000;
 
 function isLocalhostHost(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function sendMagicLinkEmail(payload: {
+  resendApiKey: string;
+  email: string;
+  userName: string;
+  userId: string;
+  verifyUrl: string;
+}): Promise<boolean> {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${payload.resendApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: process.env.RESEND_FROM || 'Qoopia <noreply@qoopia.ai>',
+          to: [payload.email],
+          subject: 'Your Qoopia login link',
+          html: `
+            <p>Hi ${payload.userName},</p>
+            <p>Click the link below to sign in to Qoopia:</p>
+            <p><a href="${payload.verifyUrl}">${payload.verifyUrl}</a></p>
+            <p>This link expires in ${MAGIC_LINK_EXPIRY_MIN} minutes.</p>
+            <p>If you didn't request this, you can safely ignore this email.</p>
+          `,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (response.ok) {
+        logger.info({ email: payload.email, user_id: payload.userId }, 'Magic link email sent');
+        return true;
+      }
+
+      const err = await response.text().catch(() => 'unknown error');
+      if (attempt < 2) {
+        logger.warn({ email: payload.email, attempt, retry_in_ms: RESEND_RETRY_DELAY_MS, status: response.status, error: err }, 'Retrying Resend magic link email');
+        await sleep(RESEND_RETRY_DELAY_MS);
+        continue;
+      }
+
+      logger.error({ status: response.status, error: err }, 'Resend email failed');
+      return false;
+    } catch (error) {
+      if (attempt < 2) {
+        logger.warn({ email: payload.email, attempt, retry_in_ms: RESEND_RETRY_DELAY_MS, error }, 'Retrying Resend magic link email');
+        await sleep(RESEND_RETRY_DELAY_MS);
+        continue;
+      }
+
+      logger.error({ error }, 'Failed to send magic link email');
+      return false;
+    }
+  }
+
+  return false;
 }
 
 // POST /api/v1/auth/magic-link — request a magic link
@@ -56,37 +120,13 @@ app.post('/magic-link', async (c) => {
   const verifyUrl = `${baseUrl}/api/v1/auth/verify?token=${rawToken}`;
 
   if (resendApiKey) {
-    try {
-      const response = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${resendApiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          from: process.env.RESEND_FROM || 'Qoopia <noreply@qoopia.ai>',
-          to: [email],
-          subject: 'Your Qoopia login link',
-          html: `
-            <p>Hi ${user.name},</p>
-            <p>Click the link below to sign in to Qoopia:</p>
-            <p><a href="${verifyUrl}">${verifyUrl}</a></p>
-            <p>This link expires in ${MAGIC_LINK_EXPIRY_MIN} minutes.</p>
-            <p>If you didn't request this, you can safely ignore this email.</p>
-          `,
-        }),
-        signal: AbortSignal.timeout(10_000),
-      });
-
-      if (!response.ok) {
-        const err = await response.text().catch(() => 'unknown error');
-        logger.error({ status: response.status, error: err }, 'Resend email failed');
-      } else {
-        logger.info({ email, user_id: user.id }, 'Magic link email sent');
-      }
-    } catch (err) {
-      logger.error({ error: err }, 'Failed to send magic link email');
-    }
+    await sendMagicLinkEmail({
+      resendApiKey,
+      email,
+      userName: user.name,
+      userId: user.id,
+      verifyUrl,
+    });
   } else {
     // Dev mode: log the link
     logger.info({

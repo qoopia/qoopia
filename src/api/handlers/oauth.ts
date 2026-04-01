@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -60,6 +60,48 @@ function oauthError(code: string, description: string, status: ContentfulStatusC
 function computeS256Challenge(verifier: string): string {
   const hash = crypto.createHash('sha256').update(verifier).digest();
   return hash.toString('base64url');
+}
+
+function getCookieValue(cookieHeader: string | undefined, name: string): string | null {
+  if (!cookieHeader) return null;
+
+  for (const part of cookieHeader.split(';')) {
+    const [cookieName, ...rest] = part.trim().split('=');
+    if (cookieName === name) {
+      return rest.join('=') || null;
+    }
+  }
+
+  return null;
+}
+
+function resolveAuthorizeAuth(c: Context<{ Variables: { auth: AuthContext } }>): AuthContext | undefined {
+  const existingAuth = c.get('auth');
+  if (existingAuth) return existingAuth;
+
+  const sessionToken = getCookieValue(c.req.header('cookie'), 'qp_session');
+  if (!sessionToken) return undefined;
+
+  const user = rawDb.prepare(
+    'SELECT id, workspace_id, name, role, session_expires_at FROM users WHERE api_key_hash = ?'
+  ).get(sha256(sessionToken)) as {
+    id: string;
+    workspace_id: string;
+    name: string;
+    role: string;
+    session_expires_at: string | null;
+  } | undefined;
+
+  if (!user) return undefined;
+  if (user.session_expires_at && user.session_expires_at < isoNow()) return undefined;
+
+  return {
+    type: 'user',
+    id: user.id,
+    workspace_id: user.workspace_id,
+    name: user.name,
+    role: user.role,
+  };
 }
 
 export interface QoopiaJwtPayload extends JWTPayload {
@@ -287,7 +329,7 @@ oauth.get('/oauth/authorize', (c) => {
 // ── 3b. POST /oauth/authorize (form submit) ─────────────────
 
 oauth.post('/oauth/authorize', async (c) => {
-  const auth = c.get('auth');
+  const auth = resolveAuthorizeAuth(c);
   if (!auth) {
     const { body, status } = oauthError('access_denied', 'Authentication required to authorize this client', 401);
     return c.json(body, status);

@@ -1,15 +1,17 @@
 import { Hono } from 'hono';
+import {
+  ACTIVITY_COLUMNS,
+  CONTACT_COLUMNS,
+  DEAL_COLUMNS,
+  FINANCE_COLUMNS,
+  PROJECT_COLUMNS,
+  TASK_COLUMNS,
+  WORKSPACE_COLUMNS,
+} from '../../db/columns.js';
 import { rawDb } from '../../db/connection.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
-const WORKSPACE_COLUMNS = 'id, name, slug, settings, created_at, updated_at';
-const PROJECT_COLUMNS = 'id, workspace_id, name, description, status, owner_agent_id, color, tags, settings, revision, deleted_at, created_at, updated_at, updated_by';
-const TASK_COLUMNS = 'id, project_id, workspace_id, title, description, status, priority, assignee, due_date, blocked_by, parent_id, source, tags, notes, attachments, revision, deleted_at, created_at, updated_at, updated_by';
-const DEAL_COLUMNS = 'id, project_id, workspace_id, name, address, status, asking_price, target_price, monthly_rent, lease_term_months, metadata, documents, timeline, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
-const CONTACT_COLUMNS = 'id, workspace_id, name, role, company, email, phone, telegram_id, language, timezone, category, communication_rules, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
-const FINANCE_COLUMNS = 'id, workspace_id, project_id, type, name, amount, currency, recurring, status, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
-const ACTIVITY_COLUMNS = 'id, workspace_id, timestamp, actor, action, entity_type, entity_id, project_id, summary, details, revision_before, revision_after';
 
 // GET /api/v1/export — full workspace JSON dump (admin/owner only)
 app.get('/', (c) => {

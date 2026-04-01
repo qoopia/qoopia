@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { ulid } from 'ulid';
+import { CONTACT_WITH_DEAL_ROLE_COLUMNS, DEAL_COLUMNS } from '../../db/columns.js';
 import { rawDb } from '../../db/connection.js';
 import { createDealSchema, updateDealSchema } from '../../core/validator.js';
 import { logActivity } from '../../core/activity-log.js';
@@ -7,8 +8,6 @@ import { resolveActorName } from '../utils/resolve-actor.js';
 import type { AuthContext } from '../../types/index.js';
 
 const app = new Hono<{ Variables: { auth: AuthContext } }>();
-const DEAL_COLUMNS = 'id, project_id, workspace_id, name, address, status, asking_price, target_price, monthly_rent, lease_term_months, metadata, documents, timeline, tags, notes, revision, deleted_at, created_at, updated_at, updated_by';
-const CONTACT_WITH_DEAL_ROLE_COLUMNS = 'c.id, c.workspace_id, c.name, c.role, c.company, c.email, c.phone, c.telegram_id, c.language, c.timezone, c.category, c.communication_rules, c.tags, c.notes, c.revision, c.deleted_at, c.created_at, c.updated_at, c.updated_by, dc.role as deal_role';
 
 // List deals
 app.get('/', (c) => {

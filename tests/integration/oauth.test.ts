@@ -10,6 +10,7 @@ let serverProcess: ReturnType<typeof import('node:child_process').spawn> | null 
 let testClientId: string;
 let testClientSecret: string;
 let testAgentApiKey: string;
+let testUserSessionCookie: string;
 
 beforeAll(async () => {
   const { spawn } = await import('node:child_process');
@@ -170,6 +171,14 @@ beforeAll(async () => {
   db.prepare(
     "INSERT INTO oauth_clients (id, name, agent_id, client_secret_hash, redirect_uris) VALUES (?, 'TestAgent', ?, ?, ?)"
   ).run(testClientId, agentId, csHash, JSON.stringify(['https://claude.ai/api/mcp/auth_callback', 'http://localhost:9999/callback']));
+
+  const userId = ulid();
+  const sessionToken = `qp_s_${crypto.randomBytes(32).toString('hex')}`;
+  const sessionHash = crypto.createHash('sha256').update(sessionToken).digest('hex');
+  db.prepare(
+    "INSERT INTO users (id, workspace_id, name, email, role, api_key_hash) VALUES (?, ?, 'Owner User', 'owner@example.com', 'owner', ?)"
+  ).run(userId, wsId, sessionHash);
+  testUserSessionCookie = `qp_session=${sessionToken}`;
 
   db.close();
 
@@ -352,7 +361,10 @@ describe('OAuth 2.0 Provider', () => {
     // POST approve (simulates form submission)
     const approveRes = await fetch(`${baseUrl}/oauth/authorize`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Cookie: testUserSessionCookie,
+      },
       body: new URLSearchParams({
         action: 'approve',
         client_id: testClientId,
@@ -408,6 +420,7 @@ describe('OAuth 2.0 Provider', () => {
         grant_type: 'refresh_token',
         refresh_token: tokenBody.refresh_token,
         client_id: testClientId,
+        client_secret: testClientSecret,
       }),
     });
 
@@ -426,6 +439,7 @@ describe('OAuth 2.0 Provider', () => {
         grant_type: 'refresh_token',
         refresh_token: tokenBody.refresh_token,
         client_id: testClientId,
+        client_secret: testClientSecret,
       }),
     });
     expect(replayRes.status).toBe(400);
@@ -448,6 +462,7 @@ describe('OAuth 2.0 Provider', () => {
         grant_type: 'refresh_token',
         refresh_token: refreshBody.refresh_token,
         client_id: testClientId,
+        client_secret: testClientSecret,
       }),
     });
     expect(afterRevokeRes.status).toBe(400);
@@ -459,7 +474,10 @@ describe('OAuth 2.0 Provider', () => {
 
     const approveRes = await fetch(`${baseUrl}/oauth/authorize`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Cookie: testUserSessionCookie,
+      },
       body: new URLSearchParams({
         action: 'approve',
         client_id: testClientId,
@@ -498,7 +516,10 @@ describe('OAuth 2.0 Provider', () => {
 
     const approveRes = await fetch(`${baseUrl}/oauth/authorize`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Cookie: testUserSessionCookie,
+      },
       body: new URLSearchParams({
         action: 'approve',
         client_id: testClientId,
@@ -592,7 +613,10 @@ describe('OAuth 2.0 Provider', () => {
   it('POST /oauth/authorize with action=deny redirects with error', async () => {
     const res = await fetch(`${baseUrl}/oauth/authorize`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Cookie: testUserSessionCookie,
+      },
       body: new URLSearchParams({
         action: 'deny',
         client_id: testClientId,
