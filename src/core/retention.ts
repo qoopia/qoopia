@@ -73,6 +73,7 @@ export function runMaintenance(): void {
 }
 
 let maintenanceInterval: ReturnType<typeof setInterval> | null = null;
+let maintenanceTimeout: ReturnType<typeof setTimeout> | null = null;
 
 // Schedule daily maintenance (runs every 24h, first run 1h after startup)
 export function startMaintenanceSchedule(): void {
@@ -80,7 +81,8 @@ export function startMaintenanceSchedule(): void {
   const firstRunDelay = 60 * 60 * 1000; // 1 hour
   const dailyInterval = 24 * 60 * 60 * 1000; // 24 hours
 
-  setTimeout(() => {
+  maintenanceTimeout = setTimeout(() => {
+    maintenanceTimeout = null;
     runMaintenance();
     maintenanceInterval = setInterval(runMaintenance, dailyInterval);
   }, firstRunDelay);
@@ -89,6 +91,11 @@ export function startMaintenanceSchedule(): void {
 }
 
 export function stopMaintenanceSchedule(): void {
+  if (maintenanceTimeout) {
+    clearTimeout(maintenanceTimeout);
+    maintenanceTimeout = null;
+  }
+
   if (maintenanceInterval) {
     clearInterval(maintenanceInterval);
     maintenanceInterval = null;

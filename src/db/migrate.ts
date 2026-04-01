@@ -3,7 +3,7 @@ import { ulid } from 'ulid';
 import { rawDb } from './connection.js';
 import { logger } from '../core/logger.js';
 
-const CURRENT_VERSION = 5;
+const CURRENT_VERSION = 6;
 
 export function runMigrations() {
   const currentVersion = rawDb.prepare(
@@ -65,6 +65,16 @@ export function runMigrations() {
         'Add type column to notes (rule/memory/knowledge/context) with backfill and index'
       );
       logger.info('Migration 005 applied');
+    }
+
+    if (latest.v < 6) {
+      logger.info('Running migration 006: notes embedding index...');
+      rawDb.exec(MIGRATION_006);
+      rawDb.prepare('INSERT INTO schema_versions (version, description) VALUES (?, ?)').run(
+        6,
+        'Add partial index for embedded notes by workspace (HIGH #3)'
+      );
+      logger.info('Migration 006 applied');
     }
 
     if (latest.v >= CURRENT_VERSION) {
@@ -552,4 +562,11 @@ END;
 const MIGRATION_004 = `
 -- HIGH #6: Add server-side session expiry for bearer tokens
 ALTER TABLE users ADD COLUMN session_expires_at TEXT;
+`;
+
+const MIGRATION_006 = `
+-- HIGH #3: Speed up semantic search for embedded notes
+CREATE INDEX IF NOT EXISTS idx_notes_workspace_embedded
+ON notes(workspace_id)
+WHERE embedding IS NOT NULL;
 `;

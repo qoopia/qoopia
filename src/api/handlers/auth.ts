@@ -9,6 +9,10 @@ const app = new Hono();
 const MAGIC_LINK_EXPIRY_MIN = 15;
 const SESSION_EXPIRY_DAYS = 30;
 
+function isLocalhostHost(hostname: string): boolean {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
+}
+
 // POST /api/v1/auth/magic-link — request a magic link
 app.post('/magic-link', async (c) => {
   const body = await c.req.json().catch(() => null);
@@ -85,7 +89,10 @@ app.post('/magic-link', async (c) => {
     }
   } else {
     // Dev mode: log the link
-    logger.info({ email, verify_url: verifyUrl }, 'Magic link (dev mode — no RESEND_API_KEY)');
+    logger.info({
+      email,
+      verify_url: `${baseUrl}/api/v1/auth/verify?token=${rawToken.slice(0, 8)}***`,
+    }, 'Magic link (dev mode — no RESEND_API_KEY)');
   }
 
   return c.json({
@@ -144,7 +151,9 @@ app.get('/verify', (c) => {
   logger.info({ user_id: link.user_id, email: link.email }, 'Magic link verified, session created');
 
   // Set session cookie
-  const cookieValue = `qp_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_EXPIRY_DAYS * 86400}`;
+  const requestUrl = new URL(c.req.url);
+  const secureAttr = isLocalhostHost(requestUrl.hostname) ? '' : '; Secure';
+  const cookieValue = `qp_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax${secureAttr}; Max-Age=${SESSION_EXPIRY_DAYS * 86400}`;
   c.header('Set-Cookie', cookieValue);
 
   return c.json({
@@ -154,7 +163,6 @@ app.get('/verify', (c) => {
       email: link.email,
       role: link.role,
       workspace_id: link.workspace_id,
-      session_token: sessionToken,
       expires_at: sessionExpires,
     },
     message: 'Authenticated successfully',

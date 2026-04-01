@@ -287,13 +287,10 @@ oauth.get('/oauth/authorize', (c) => {
 // ── 3b. POST /oauth/authorize (form submit) ─────────────────
 
 oauth.post('/oauth/authorize', async (c) => {
-  // Single-user MCP server: auto-approve without auth check
-  // Owner identity is implicit (only one workspace)
-  let auth = c.get('auth');
+  const auth = c.get('auth');
   if (!auth) {
-    // Get the first (and only) workspace for auto-approve
-    const ws = rawDb.prepare('SELECT id FROM workspaces LIMIT 1').get() as { id: string } | undefined;
-    auth = { type: 'user' as const, id: 'owner', workspace_id: ws?.id || 'default', name: 'owner' };
+    const { body, status } = oauthError('access_denied', 'Authentication required to authorize this client', 401);
+    return c.json(body, status);
   }
 
   const contentType = c.req.header('content-type') || '';

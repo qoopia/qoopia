@@ -44,22 +44,43 @@ function extractKeywords(text: string): string[] {
 function matchEntitiesFromText(text: string, workspaceId: string): Array<{ type: string; id: string; name: string }> {
   const matched: Array<{ type: string; id: string; name: string }> = [];
   const seen = new Set<string>();
-  const keywords = extractKeywords(text);
+  const likePatterns = [...new Set(extractKeywords(text))].map(keyword => `%${keyword}%`);
 
-  for (const kw of keywords) {
-    const likePattern = `%${kw}%`;
-    const tasks = rawDb.prepare('SELECT id, title FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL AND LOWER(title) LIKE ? LIMIT 3').all(workspaceId, likePattern) as Array<{ id: string; title: string }>;
-    for (const t of tasks) {
-      if (!seen.has(t.id)) { seen.add(t.id); matched.push({ type: 'task', id: t.id, name: t.title }); }
-    }
-    const deals = rawDb.prepare('SELECT id, name FROM deals WHERE workspace_id = ? AND deleted_at IS NULL AND LOWER(name) LIKE ? LIMIT 3').all(workspaceId, likePattern) as Array<{ id: string; name: string }>;
-    for (const d of deals) {
-      if (!seen.has(d.id)) { seen.add(d.id); matched.push({ type: 'deal', id: d.id, name: d.name }); }
-    }
-    const contacts = rawDb.prepare('SELECT id, name FROM contacts WHERE workspace_id = ? AND deleted_at IS NULL AND LOWER(name) LIKE ? LIMIT 3').all(workspaceId, likePattern) as Array<{ id: string; name: string }>;
-    for (const ct of contacts) {
-      if (!seen.has(ct.id)) { seen.add(ct.id); matched.push({ type: 'contact', id: ct.id, name: ct.name }); }
-    }
+  if (likePatterns.length === 0) {
+    return matched;
+  }
+
+  const likeClause = likePatterns.map(() => 'LOWER(name) LIKE ?').join(' OR ');
+  const rows = rawDb.prepare(
+    `SELECT entity_type, id, name
+     FROM (
+       SELECT 'task' AS entity_type, id, title AS name
+       FROM tasks
+       WHERE workspace_id = ? AND deleted_at IS NULL AND (${likeClause.replaceAll('name', 'title')})
+       UNION ALL
+       SELECT 'deal' AS entity_type, id, name
+       FROM deals
+       WHERE workspace_id = ? AND deleted_at IS NULL AND (${likeClause})
+       UNION ALL
+       SELECT 'contact' AS entity_type, id, name
+       FROM contacts
+       WHERE workspace_id = ? AND deleted_at IS NULL AND (${likeClause})
+     )
+     LIMIT 20`
+  ).all(
+    workspaceId,
+    ...likePatterns,
+    workspaceId,
+    ...likePatterns,
+    workspaceId,
+    ...likePatterns,
+  ) as Array<{ entity_type: string; id: string; name: string }>;
+
+  for (const row of rows) {
+    const key = `${row.entity_type}:${row.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    matched.push({ type: row.entity_type, id: row.id, name: row.name });
   }
 
   return matched.slice(0, 20);

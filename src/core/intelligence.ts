@@ -5,6 +5,7 @@
  */
 
 import { rawDb } from '../db/connection.js';
+import { logger } from './logger.js';
 
 // ── Interfaces ──
 
@@ -43,6 +44,86 @@ export function getCapabilities(): { llm: boolean; embeddings: boolean } {
   };
 }
 
+const API_RETRY_DELAYS_MS = [1000, 2000, 4000];
+const API_RATE_LIMIT_INTERVAL_MS = 250;
+const apiRateLimitChains = new Map<string, Promise<void>>();
+const apiRateLimitLastRun = new Map<string, number>();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseRetryAfterMs(retryAfter: string | null): number | null {
+  if (!retryAfter) return null;
+
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.ceil(seconds * 1000);
+  }
+
+  const retryAt = Date.parse(retryAfter);
+  if (Number.isNaN(retryAt)) return null;
+
+  return Math.max(0, retryAt - Date.now());
+}
+
+async function runRateLimited<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = apiRateLimitChains.get(key) ?? Promise.resolve();
+
+  const current = previous
+    .catch(() => {})
+    .then(async () => {
+      const waitMs = Math.max(0, (apiRateLimitLastRun.get(key) ?? 0) + API_RATE_LIMIT_INTERVAL_MS - Date.now());
+      if (waitMs > 0) {
+        await sleep(waitMs);
+      }
+      apiRateLimitLastRun.set(key, Date.now());
+      return operation();
+    });
+
+  apiRateLimitChains.set(key, current.then(() => undefined, () => undefined));
+  return current;
+}
+
+async function fetchWithRetry(
+  name: 'anthropic-haiku' | 'voyage-embeddings',
+  input: string,
+  init: RequestInit,
+): Promise<Response> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= API_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const response = await runRateLimited(name, () => fetch(input, init));
+      if (response.ok) {
+        return response;
+      }
+
+      if (attempt === API_RETRY_DELAYS_MS.length) {
+        throw new Error(`${name} request failed with status ${response.status}`);
+      }
+
+      const retryAfterMs = response.status === 429
+        ? parseRetryAfterMs(response.headers.get('Retry-After'))
+        : null;
+      const delayMs = retryAfterMs ?? API_RETRY_DELAYS_MS[attempt];
+      logger.warn({ provider: name, attempt: attempt + 1, retry_in_ms: delayMs, status: response.status }, 'Retrying external API request');
+      await sleep(delayMs);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (attempt === API_RETRY_DELAYS_MS.length) {
+        break;
+      }
+
+      const delayMs = API_RETRY_DELAYS_MS[attempt];
+      logger.warn({ provider: name, attempt: attempt + 1, retry_in_ms: delayMs, error: lastError.message }, 'Retrying external API request');
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError ?? new Error(`${name} request failed`);
+}
+
 // ── Status patterns ──
 
 const STATUS_PATTERNS: Array<{ pattern: RegExp; status: string }> = [
@@ -74,12 +155,16 @@ function extractKeywords(text: string): string[] {
     .map(w => w.toLowerCase());
 }
 
+function buildKeywordPatterns(text: string): string[] {
+  return [...new Set(extractKeywords(text))].map(keyword => `%${keyword}%`);
+}
+
 // ── Layer 2: Keyword-based entity matching ──
 
 function keywordMatch(text: string, workspaceId: string): MatchResult {
   const matched: MatchedEntity[] = [];
   const seen = new Set<string>();
-  const keywords = extractKeywords(text);
+  const likePatterns = buildKeywordPatterns(text);
 
   // Detect status intent
   let detectedStatus: string | undefined;
@@ -90,45 +175,53 @@ function keywordMatch(text: string, workspaceId: string): MatchResult {
     }
   }
 
-  for (const kw of keywords) {
-    const likePattern = `%${kw}%`;
+  if (likePatterns.length === 0) {
+    return { matched_entities: matched, method: 'keyword' };
+  }
 
-    const tasks = rawDb.prepare(
-      'SELECT id, title, status FROM tasks WHERE workspace_id = ? AND deleted_at IS NULL AND LOWER(title) LIKE ? LIMIT 3'
-    ).all(workspaceId, likePattern) as Array<{ id: string; title: string; status: string }>;
-    for (const t of tasks) {
-      if (seen.has(t.id)) continue;
-      seen.add(t.id);
-      const entity: MatchedEntity = { type: 'task', id: t.id, name: t.title, confidence: 'medium' };
-      if (detectedStatus && t.status !== detectedStatus) {
-        entity.previous_status = t.status;
-        entity.new_status = detectedStatus;
-      }
-      matched.push(entity);
+  const likeClause = likePatterns.map(() => 'LOWER(name) LIKE ?').join(' OR ');
+  const rows = rawDb.prepare(
+    `SELECT entity_type, id, name, status
+     FROM (
+       SELECT 'task' AS entity_type, id, title AS name, status
+       FROM tasks
+       WHERE workspace_id = ? AND deleted_at IS NULL AND (${likeClause.replaceAll('name', 'title')})
+       UNION ALL
+       SELECT 'deal' AS entity_type, id, name, status
+       FROM deals
+       WHERE workspace_id = ? AND deleted_at IS NULL AND (${likeClause})
+       UNION ALL
+       SELECT 'contact' AS entity_type, id, name, NULL AS status
+       FROM contacts
+       WHERE workspace_id = ? AND deleted_at IS NULL AND (${likeClause})
+     )
+     LIMIT 20`
+  ).all(
+    workspaceId,
+    ...likePatterns,
+    workspaceId,
+    ...likePatterns,
+    workspaceId,
+    ...likePatterns,
+  ) as Array<{ entity_type: 'task' | 'deal' | 'contact'; id: string; name: string; status: string | null }>;
+
+  for (const row of rows) {
+    if (seen.has(`${row.entity_type}:${row.id}`)) continue;
+    seen.add(`${row.entity_type}:${row.id}`);
+
+    const entity: MatchedEntity = {
+      type: row.entity_type,
+      id: row.id,
+      name: row.name,
+      confidence: 'medium',
+    };
+
+    if (detectedStatus && row.status && row.status !== detectedStatus) {
+      entity.previous_status = row.status;
+      entity.new_status = detectedStatus;
     }
 
-    const deals = rawDb.prepare(
-      'SELECT id, name, status FROM deals WHERE workspace_id = ? AND deleted_at IS NULL AND LOWER(name) LIKE ? LIMIT 3'
-    ).all(workspaceId, likePattern) as Array<{ id: string; name: string; status: string }>;
-    for (const d of deals) {
-      if (seen.has(d.id)) continue;
-      seen.add(d.id);
-      const entity: MatchedEntity = { type: 'deal', id: d.id, name: d.name, confidence: 'medium' };
-      if (detectedStatus && d.status !== detectedStatus) {
-        entity.previous_status = d.status;
-        entity.new_status = detectedStatus;
-      }
-      matched.push(entity);
-    }
-
-    const contacts = rawDb.prepare(
-      'SELECT id, name FROM contacts WHERE workspace_id = ? AND deleted_at IS NULL AND LOWER(name) LIKE ? LIMIT 3'
-    ).all(workspaceId, likePattern) as Array<{ id: string; name: string }>;
-    for (const ct of contacts) {
-      if (seen.has(ct.id)) continue;
-      seen.add(ct.id);
-      matched.push({ type: 'contact', id: ct.id, name: ct.name, confidence: 'medium' });
-    }
+    matched.push(entity);
   }
 
   return { matched_entities: matched.slice(0, 20), method: 'keyword' };
@@ -149,7 +242,7 @@ async function llmMatch(text: string, workspaceId: string): Promise<MatchResult 
   if (!apiKey) return null;
 
   try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    const resp = await fetchWithRetry('anthropic-haiku', 'https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -163,8 +256,6 @@ async function llmMatch(text: string, workspaceId: string): Promise<MatchResult 
         messages: [{ role: 'user', content: text }],
       }),
     });
-
-    if (!resp.ok) return null;
 
     const data = await resp.json() as { content: Array<{ type: string; text: string }> };
     const responseText = data.content?.[0]?.text || '';
@@ -233,7 +324,8 @@ async function llmMatch(text: string, workspaceId: string): Promise<MatchResult 
 
     if (matched.length === 0) return null;
     return { matched_entities: matched.slice(0, 20), method: 'llm' };
-  } catch {
+  } catch (error) {
+    logger.warn({ error }, 'Anthropic Haiku matching failed after retries');
     return null; // Fall through to Layer 2
   }
 }
@@ -256,7 +348,7 @@ async function getEmbedding(text: string): Promise<Float32Array | null> {
   if (!apiKey) return null;
 
   try {
-    const resp = await fetch('https://api.voyageai.com/v1/embeddings', {
+    const resp = await fetchWithRetry('voyage-embeddings', 'https://api.voyageai.com/v1/embeddings', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -268,14 +360,13 @@ async function getEmbedding(text: string): Promise<Float32Array | null> {
       }),
     });
 
-    if (!resp.ok) return null;
-
     const data = await resp.json() as { data: Array<{ embedding: number[] }> };
     const embedding = data.data?.[0]?.embedding;
     if (!embedding) return null;
 
     return new Float32Array(embedding);
-  } catch {
+  } catch (error) {
+    logger.warn({ error }, 'Voyage embeddings request failed after retries');
     return null;
   }
 }
