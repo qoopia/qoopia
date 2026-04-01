@@ -329,12 +329,6 @@ oauth.get('/oauth/authorize', (c) => {
 // ── 3b. POST /oauth/authorize (form submit) ─────────────────
 
 oauth.post('/oauth/authorize', async (c) => {
-  const auth = resolveAuthorizeAuth(c);
-  if (!auth) {
-    const { body, status } = oauthError('access_denied', 'Authentication required to authorize this client', 401);
-    return c.json(body, status);
-  }
-
   const contentType = c.req.header('content-type') || '';
   const body = await c.req.parseBody();
   const action = body['action'] as string;
@@ -343,6 +337,29 @@ oauth.post('/oauth/authorize', async (c) => {
   const state = body['state'] as string;
   const codeChallenge = body['code_challenge'] as string;
   const codeChallengeMethod = (body['code_challenge_method'] as string) || 'S256';
+
+  // Try session auth first; fall back to auto-approve for registered MCP clients
+  let auth = resolveAuthorizeAuth(c);
+  if (!auth) {
+    // Auto-approve only if client_id belongs to a registered oauth_client in this workspace
+    const registeredClient = clientId
+      ? rawDb.prepare('SELECT id, agent_id FROM oauth_clients WHERE id = ?').get(clientId) as { id: string; agent_id: string } | undefined
+      : undefined;
+    const clientAgent = registeredClient
+      ? rawDb.prepare('SELECT id, workspace_id FROM agents WHERE id = ?').get(registeredClient.agent_id) as { id: string; workspace_id: string } | undefined
+      : undefined;
+    const workspaceOwner = clientAgent
+      ? rawDb.prepare('SELECT id, workspace_id, name, role FROM users WHERE workspace_id = ? ORDER BY created_at ASC LIMIT 1').get(clientAgent.workspace_id) as { id: string; workspace_id: string; name: string; role: string } | undefined
+      : undefined;
+
+    if (workspaceOwner) {
+      logger.info({ client_id: clientId, workspace_id: workspaceOwner.workspace_id }, 'Auto-approve: registered MCP client, using workspace owner');
+      auth = { type: 'user', id: workspaceOwner.id, workspace_id: workspaceOwner.workspace_id, name: workspaceOwner.name, role: workspaceOwner.role };
+    } else {
+      const { body: errBody, status } = oauthError('access_denied', 'Authentication required — client_id is not a registered MCP client', 401);
+      return c.json(errBody, status);
+    }
+  }
 
   logger.info({
     step: 'AUTHORIZE_POST',
