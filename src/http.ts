@@ -9,6 +9,9 @@ import {
   exchangeCodeForTokens,
   refreshTokens,
   revokeToken,
+  registerClient,
+  getClient,
+  clientWorkspace,
 } from "./auth/oauth.ts";
 import { db } from "./db/connection.ts";
 import { env } from "./utils/env.ts";
@@ -137,8 +140,12 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   }
 
   // --- OAuth endpoints ---
-  if (url.startsWith("/oauth/authorize")) {
-    return handleAuthorize(req, res);
+  if (url.startsWith("/oauth/authorize") && method === "GET") {
+    return handleAuthorizeGet(req, res);
+  }
+  if (url === "/oauth/authorize" && method === "POST") {
+    const body = await readBody(req);
+    return handleAuthorizePost(body, res);
   }
   if (url === "/oauth/token" && method === "POST") {
     const body = await readBody(req);
@@ -147,6 +154,10 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   if (url === "/oauth/revoke" && method === "POST") {
     const body = await readBody(req);
     return handleRevoke(body, res);
+  }
+  if (url === "/oauth/register" && method === "POST") {
+    const body = await readBody(req);
+    return handleRegister(body, res);
   }
 
   // --- MCP endpoint ---
@@ -239,15 +250,18 @@ function parseForm(body: Buffer): Record<string, string> {
   return out;
 }
 
-async function handleAuthorize(req: IncomingMessage, res: ServerResponse) {
-  // Minimal PKCE authorize endpoint.
-  // For Claude.ai connector flow: expects client_id, redirect_uri,
-  // response_type=code, code_challenge, code_challenge_method, state.
-  //
-  // Since Qoopia has no login UI (single-user system), we resolve the agent
-  // via a query-param `agent_key` (admin provides to connector) — this is NOT
-  // user-facing browser login; it's a terminal-initiated flow where the
-  // operator pastes the agent's API key into the URL once.
+/**
+ * Single-user OAuth flow:
+ *  GET /oauth/authorize  →  validate params + show consent HTML.
+ *  POST /oauth/authorize →  on approve, issue code (auto-approve since
+ *                           the only "user" of this server is the workspace
+ *                           owner — no login UI).
+ *
+ * No agent_key needed: the client must be registered first via
+ * POST /oauth/register (RFC 7591). On consent we look up which agent the
+ * client belongs to and issue tokens for that agent's workspace.
+ */
+async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
   const u = new URL(req.url || "/", env.PUBLIC_URL);
   const clientId = u.searchParams.get("client_id");
   const redirectUri = u.searchParams.get("redirect_uri");
@@ -255,72 +269,182 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse) {
   const codeChallenge = u.searchParams.get("code_challenge");
   const codeChallengeMethod = u.searchParams.get("code_challenge_method") || "S256";
   const state = u.searchParams.get("state") || "";
-  const agentKey = u.searchParams.get("agent_key");
+  const scope = u.searchParams.get("scope") || "";
 
   if (!clientId || !redirectUri || responseType !== "code" || !codeChallenge) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description:
+        "Missing required: client_id, redirect_uri, response_type=code, code_challenge",
+    });
+  }
+  if (codeChallengeMethod !== "S256") {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "Only S256 code_challenge_method is supported",
+    });
+  }
+
+  const client = getClient(clientId);
+  if (!client) {
+    return json(res, 400, {
+      error: "invalid_client",
+      error_description: "Unknown client_id — register first via /oauth/register",
+    });
+  }
+  if (!client.redirect_uris.includes(redirectUri)) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "redirect_uri not registered for this client",
+    });
+  }
+
+  const safeName = escapeHtml(client.name || "Unknown Client");
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorize — Qoopia</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #0a0a0f; color: #e0e0e0; }
+    .card { background: #1a1a2e; border-radius: 16px; padding: 40px; max-width: 420px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+    .logo { font-size: 32px; margin-bottom: 16px; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    .client { color: #7c8aff; font-weight: 600; }
+    .info { color: #888; font-size: 14px; margin: 16px 0 24px; }
+    .actions { display: flex; gap: 12px; justify-content: center; }
+    button { padding: 12px 32px; border-radius: 8px; border: none; font-size: 16px; font-weight: 600; cursor: pointer; }
+    button:hover { opacity: 0.85; }
+    .approve { background: #7c8aff; color: #fff; }
+    .deny { background: #2a2a3e; color: #888; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">🔑</div>
+    <h1>Authorize access</h1>
+    <p><span class="client">${safeName}</span> wants to connect to Qoopia</p>
+    <p class="info">This will grant access to your notes, tasks, deals, contacts, finances, and session memory.</p>
+    <form method="POST" action="/oauth/authorize">
+      <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
+      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
+      <input type="hidden" name="state" value="${escapeHtml(state)}">
+      <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
+      <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}">
+      <input type="hidden" name="scope" value="${escapeHtml(scope)}">
+      <div class="actions">
+        <button type="submit" name="action" value="deny" class="deny">Deny</button>
+        <button type="submit" name="action" value="approve" class="approve">Approve</button>
+      </div>
+    </form>
+  </div>
+</body>
+</html>`;
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  res.end(html);
+}
+
+function handleAuthorizePost(body: Buffer, res: ServerResponse) {
+  const form = parseForm(body);
+  const action = form.action || "approve";
+  const clientId = form.client_id;
+  const redirectUri = form.redirect_uri;
+  const codeChallenge = form.code_challenge;
+  const codeChallengeMethod = form.code_challenge_method || "S256";
+  const state = form.state || "";
+
+  if (!clientId || !redirectUri || !codeChallenge) {
     return json(res, 400, { error: "invalid_request" });
   }
-  if (!agentKey) {
-    // Render a tiny form asking for the agent key.
-    const html = `<!doctype html><html><body>
-      <h1>Qoopia authorization</h1>
-      <p>Paste the agent API key issued by the Qoopia operator:</p>
-      <form method="GET" action="/oauth/authorize">
-        <input type="hidden" name="client_id" value="${escapeHtml(clientId)}"/>
-        <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}"/>
-        <input type="hidden" name="response_type" value="code"/>
-        <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}"/>
-        <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}"/>
-        <input type="hidden" name="state" value="${escapeHtml(state)}"/>
-        <input name="agent_key" size="60" autofocus required/>
-        <button type="submit">Authorize</button>
-      </form>
-    </body></html>`;
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(html);
-    return;
+
+  if (action === "deny") {
+    const url = new URL(redirectUri);
+    url.searchParams.set("error", "access_denied");
+    if (state) url.searchParams.set("state", state);
+    res.writeHead(302, { location: url.toString() });
+    return res.end();
   }
 
-  // Resolve agent by API key
-  const agent = await import("./auth/api-keys.ts").then((m) =>
-    m.verifyApiKey(agentKey),
-  );
-  if (!agent) {
-    return json(res, 401, { error: "invalid_agent_key" });
-  }
-
-  // Ensure client exists (or auto-register on first use)
-  let client = db
-    .prepare(`SELECT id FROM oauth_clients WHERE id = ?`)
-    .get(clientId) as { id: string } | undefined;
+  // Auto-approve: resolve client → agent → workspace, issue code
+  const client = getClient(clientId);
   if (!client) {
-    const { sha256Hex } = await import("./auth/api-keys.ts");
-    db.prepare(
-      `INSERT INTO oauth_clients (id, name, agent_id, client_secret_hash, redirect_uris) VALUES (?, ?, ?, ?, ?)`,
-    ).run(
-      clientId,
-      clientId,
-      agent.id,
-      sha256Hex(clientId),
-      JSON.stringify([redirectUri]),
-    );
-    client = { id: clientId };
+    return json(res, 400, { error: "invalid_client" });
+  }
+  if (!client.redirect_uris.includes(redirectUri)) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "redirect_uri not registered",
+    });
+  }
+  const ws = clientWorkspace(clientId);
+  if (!ws) {
+    return json(res, 500, {
+      error: "server_error",
+      error_description: "Client has no associated agent",
+    });
   }
 
   const code = createAuthorizationCode({
     clientId,
-    agentId: agent.id,
-    workspaceId: agent.workspace_id,
+    agentId: ws.agent_id,
+    workspaceId: ws.workspace_id,
     codeChallenge,
     codeChallengeMethod,
     redirectUri,
   });
-
-  const redirect = new URL(redirectUri);
-  redirect.searchParams.set("code", code);
-  if (state) redirect.searchParams.set("state", state);
-  res.writeHead(302, { location: redirect.toString() });
+  const url = new URL(redirectUri);
+  url.searchParams.set("code", code);
+  if (state) url.searchParams.set("state", state);
+  res.writeHead(302, {
+    location: url.toString(),
+    "cache-control": "no-store",
+  });
   res.end();
+}
+
+function handleRegister(body: Buffer, res: ServerResponse) {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "Body must be JSON",
+    });
+  }
+  try {
+    const out = registerClient({
+      client_name: parsed.client_name as string | undefined,
+      redirect_uris: parsed.redirect_uris as string[],
+      token_endpoint_auth_method:
+        parsed.token_endpoint_auth_method as string | undefined,
+      grant_types: parsed.grant_types as string[] | undefined,
+      response_types: parsed.response_types as string[] | undefined,
+    });
+    logger.info(
+      `OAuth register client_id=${out.client_id} name="${out.client_name}" auth=${out.token_endpoint_auth_method}`,
+    );
+    res.writeHead(201, {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    });
+    res.end(
+      JSON.stringify({
+        ...out,
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        ...(out.client_secret ? { client_secret_expires_at: 0 } : {}),
+      }),
+    );
+  } catch (err) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 function handleToken(body: Buffer, res: ServerResponse) {

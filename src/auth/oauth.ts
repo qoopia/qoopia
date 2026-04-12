@@ -197,12 +197,132 @@ export function revokeToken(token: string): boolean {
   return info.changes > 0;
 }
 
+/**
+ * RFC 7591 dynamic client registration.
+ * Single-user assumption: associates new client with the first active agent
+ * (workspace owner). Public clients (token_endpoint_auth_method='none') get
+ * no client_secret. Confidential clients get a generated client_secret.
+ */
+export function registerClient(input: {
+  client_name?: string;
+  redirect_uris: string[];
+  token_endpoint_auth_method?: string;
+  grant_types?: string[];
+  response_types?: string[];
+}): {
+  client_id: string;
+  client_secret?: string;
+  client_name: string;
+  redirect_uris: string[];
+  grant_types: string[];
+  response_types: string[];
+  token_endpoint_auth_method: string;
+} {
+  if (!Array.isArray(input.redirect_uris) || input.redirect_uris.length === 0) {
+    throw new Error("redirect_uris must be a non-empty array");
+  }
+  // Prefer a claude-privileged agent (cross-workspace read capability for
+  // Claude.ai connector); fall back to first active agent.
+  const agent = (db
+    .prepare(
+      `SELECT id, workspace_id FROM agents
+       WHERE active = 1
+       ORDER BY (type = 'claude-privileged') DESC, created_at ASC
+       LIMIT 1`,
+    )
+    .get() as { id: string; workspace_id: string } | undefined);
+  if (!agent) throw new Error("No active agent available");
+
+  const authMethod = input.token_endpoint_auth_method || "none";
+  if (authMethod !== "none" && authMethod !== "client_secret_post") {
+    throw new Error("token_endpoint_auth_method must be 'none' or 'client_secret_post'");
+  }
+  const isPublic = authMethod === "none";
+
+  const client_id = `qc_${crypto.randomBytes(16).toString("base64url")}`;
+  let client_secret: string | undefined;
+  let secretHash = "";
+  if (!isPublic) {
+    client_secret = crypto.randomBytes(32).toString("base64url");
+    secretHash = sha256Hex(client_secret);
+  }
+
+  db.prepare(
+    `INSERT INTO oauth_clients (id, name, agent_id, client_secret_hash, redirect_uris, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    client_id,
+    input.client_name || "Unnamed Client",
+    agent.id,
+    secretHash,
+    JSON.stringify(input.redirect_uris),
+    nowIso(),
+  );
+
+  return {
+    client_id,
+    ...(client_secret ? { client_secret } : {}),
+    client_name: input.client_name || "Unnamed Client",
+    redirect_uris: input.redirect_uris,
+    grant_types: input.grant_types || ["authorization_code", "refresh_token"],
+    response_types: input.response_types || ["code"],
+    token_endpoint_auth_method: authMethod,
+  };
+}
+
+/**
+ * Look up a registered client by id. Returns the row or null.
+ */
+export function getClient(client_id: string): {
+  id: string;
+  name: string;
+  agent_id: string;
+  client_secret_hash: string;
+  redirect_uris: string[];
+} | null {
+  const row = db
+    .prepare(`SELECT * FROM oauth_clients WHERE id = ?`)
+    .get(client_id) as
+    | {
+        id: string;
+        name: string;
+        agent_id: string;
+        client_secret_hash: string;
+        redirect_uris: string;
+      }
+    | undefined;
+  if (!row) return null;
+  let uris: string[] = [];
+  try {
+    uris = JSON.parse(row.redirect_uris);
+  } catch {}
+  return { ...row, redirect_uris: uris };
+}
+
+/**
+ * Resolve a client to its associated agent + workspace (single-user
+ * auto-approve path). Returns null if client unknown or agent gone.
+ */
+export function clientWorkspace(client_id: string): {
+  agent_id: string;
+  workspace_id: string;
+} | null {
+  const c = getClient(client_id);
+  if (!c) return null;
+  const a = db
+    .prepare(`SELECT id, workspace_id FROM agents WHERE id = ?`)
+    .get(c.agent_id) as { id: string; workspace_id: string } | undefined;
+  if (!a) return null;
+  return { agent_id: a.id, workspace_id: a.workspace_id };
+}
+
 export function wellKnownAuthorizationServer() {
   return {
     issuer: env.OAUTH_ISSUER,
     authorization_endpoint: `${env.PUBLIC_URL}/oauth/authorize`,
     token_endpoint: `${env.PUBLIC_URL}/oauth/token`,
     revocation_endpoint: `${env.PUBLIC_URL}/oauth/revoke`,
+    registration_endpoint: `${env.PUBLIC_URL}/oauth/register`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
