@@ -101,6 +101,7 @@ export async function install() {
     .replace(/{{QOOPIA_PORT}}/g, String(env.PORT))
     .replace(/{{LOG_DIR}}/g, env.LOG_DIR)
     .replace(/{{BACKUP_DIR}}/g, env.BACKUP_DIR)
+    .replace(/{{QOOPIA_PUBLIC_URL}}/g, env.PUBLIC_URL)
     .replace(/{{WORKING_DIR}}/g, PROJECT_ROOT);
 
   const plistDir = path.join(os.homedir(), "Library/LaunchAgents");

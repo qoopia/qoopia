@@ -22,6 +22,8 @@
         <string>{{LOG_DIR}}</string>
         <key>QOOPIA_BACKUP_DIR</key>
         <string>{{BACKUP_DIR}}</string>
+        <key>QOOPIA_PUBLIC_URL</key>
+        <string>{{QOOPIA_PUBLIC_URL}}</string>
     </dict>
     <key>KeepAlive</key>
     <true/>
