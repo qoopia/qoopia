@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
@@ -16,6 +17,39 @@ import {
 import { db } from "./db/connection.ts";
 import { env } from "./utils/env.ts";
 import { logger } from "./utils/logger.ts";
+import { apiLimiter, authLimiter } from "./utils/rate-limit.ts";
+
+// --- CORS allowlist ---
+const ALLOWED_ORIGINS = new Set([
+  "https://claude.ai",
+  "https://www.claude.ai",
+  "https://console.anthropic.com",
+]);
+
+function getAllowedOrigin(req: IncomingMessage): string {
+  const origin = req.headers.origin;
+  if (!origin) return "";
+  if (ALLOWED_ORIGINS.has(origin)) return origin;
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return origin;
+  return "";
+}
+
+// --- Auth context per-request (no module-level variable, no race condition) ---
+const authStorage = new AsyncLocalStorage<AuthContext>();
+
+export function getCurrentAuth(): AuthContext | null {
+  return authStorage.getStore() ?? null;
+}
+
+// --- Client IP extraction ---
+function getClientIp(req: IncomingMessage): string {
+  return (
+    (req.headers["cf-connecting-ip"] as string) ||
+    (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+    req.socket?.remoteAddress ||
+    "unknown"
+  );
+}
 
 /**
  * Single Node http server hosts:
@@ -44,21 +78,37 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-function json(res: ServerResponse, status: number, body: unknown) {
+function json(res: ServerResponse, status: number, body: unknown, req?: IncomingMessage) {
   const payload = JSON.stringify(body);
-  res.writeHead(status, {
+  const headers: Record<string, string> = {
     "content-type": "application/json",
-    "content-length": Buffer.byteLength(payload),
-    "access-control-allow-origin": "*",
-  });
+    "content-length": String(Buffer.byteLength(payload)),
+    "x-content-type-options": "nosniff",
+  };
+  if (req) {
+    const origin = getAllowedOrigin(req);
+    if (origin) {
+      headers["access-control-allow-origin"] = origin;
+      headers["vary"] = "Origin";
+    }
+  }
+  res.writeHead(status, headers);
   res.end(payload);
 }
 
-function text(res: ServerResponse, status: number, body: string) {
-  res.writeHead(status, {
+function text(res: ServerResponse, status: number, body: string, req?: IncomingMessage) {
+  const headers: Record<string, string> = {
     "content-type": "text/plain; charset=utf-8",
-    "access-control-allow-origin": "*",
-  });
+    "x-content-type-options": "nosniff",
+  };
+  if (req) {
+    const origin = getAllowedOrigin(req);
+    if (origin) {
+      headers["access-control-allow-origin"] = origin;
+      headers["vary"] = "Origin";
+    }
+  }
+  res.writeHead(status, headers);
   res.end(body);
 }
 
@@ -101,16 +151,32 @@ export function startHttpServer() {
 async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   const url = req.url || "/";
   const method = (req.method || "GET").toUpperCase();
+  const clientIp = getClientIp(req);
 
   // CORS preflight
   if (method === "OPTIONS") {
-    res.writeHead(204, {
-      "access-control-allow-origin": "*",
+    const origin = getAllowedOrigin(req);
+    const headers: Record<string, string> = {
       "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
       "access-control-allow-headers": "authorization, content-type, mcp-session-id",
       "access-control-max-age": "86400",
-    });
+    };
+    if (origin) {
+      headers["access-control-allow-origin"] = origin;
+      headers["vary"] = "Origin";
+    }
+    res.writeHead(204, headers);
     res.end();
+    return;
+  }
+
+  // --- Rate limiting (general: 100 req/min per IP) ---
+  if (!apiLimiter.allow(clientIp)) {
+    res.writeHead(429, {
+      "content-type": "application/json",
+      "retry-after": String(apiLimiter.retryAfterSec(clientIp)),
+    });
+    res.end(JSON.stringify({ error: "too_many_requests" }));
     return;
   }
 
@@ -120,7 +186,7 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       status: "ok",
       version: "3.0.0",
       uptime: Math.round(process.uptime()),
-    });
+    }, req);
   }
 
   if (url === "/") {
@@ -128,36 +194,57 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       res,
       200,
       `Qoopia V3.0 MCP server\nMCP endpoint: ${env.PUBLIC_URL}/mcp\nHealth: ${env.PUBLIC_URL}/health\n`,
+      req,
     );
   }
 
   // --- OAuth discovery ---
   if (url === "/.well-known/oauth-authorization-server") {
-    return json(res, 200, wellKnownAuthorizationServer());
+    return json(res, 200, wellKnownAuthorizationServer(), req);
   }
   if (url.startsWith("/.well-known/oauth-protected-resource")) {
-    return json(res, 200, wellKnownProtectedResource());
+    return json(res, 200, wellKnownProtectedResource(), req);
   }
 
-  // --- OAuth endpoints ---
+  // --- OAuth endpoints (stricter: 20 req/min per IP) ---
   if (url.startsWith("/oauth/authorize") && method === "GET") {
+    if (!authLimiter.allow(clientIp)) {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": String(authLimiter.retryAfterSec(clientIp)) });
+      res.end(JSON.stringify({ error: "too_many_requests" }));
+      return;
+    }
     return handleAuthorizeGet(req, res);
   }
   if (url === "/oauth/authorize" && method === "POST") {
+    if (!authLimiter.allow(clientIp)) {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": String(authLimiter.retryAfterSec(clientIp)) });
+      res.end(JSON.stringify({ error: "too_many_requests" }));
+      return;
+    }
     const body = await readBody(req);
     return handleAuthorizePost(body, res);
   }
   if (url === "/oauth/token" && method === "POST") {
+    if (!authLimiter.allow(clientIp)) {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": String(authLimiter.retryAfterSec(clientIp)) });
+      res.end(JSON.stringify({ error: "too_many_requests" }));
+      return;
+    }
     const body = await readBody(req);
     return handleToken(body, res);
+  }
+  if (url === "/oauth/register" && method === "POST") {
+    if (!authLimiter.allow(clientIp)) {
+      res.writeHead(429, { "content-type": "application/json", "retry-after": String(authLimiter.retryAfterSec(clientIp)) });
+      res.end(JSON.stringify({ error: "too_many_requests" }));
+      return;
+    }
+    const body = await readBody(req);
+    return handleRegister(body, res);
   }
   if (url === "/oauth/revoke" && method === "POST") {
     const body = await readBody(req);
     return handleRevoke(body, res);
-  }
-  if (url === "/oauth/register" && method === "POST") {
-    const body = await readBody(req);
-    return handleRegister(body, res);
   }
 
   // --- MCP endpoint ---
@@ -165,16 +252,10 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     return handleMcp(req, res);
   }
 
-  return json(res, 404, { error: "not_found", path: url });
+  return json(res, 404, { error: "not_found" }, req);
 }
 
 // ---------- MCP handler ----------
-
-// We authenticate on the HTTP request, then stash the resolved context in a
-// module-level ref that the tool handlers read back via the authProvider
-// callback registered at tool registration. Because we create a fresh MCP
-// server per request (stateless mode), there's no cross-request leakage.
-let currentAuth: AuthContext | null = null;
 
 async function handleMcp(req: IncomingMessage, res: ServerResponse) {
   const method = (req.method || "GET").toUpperCase();
@@ -192,49 +273,38 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
     return;
   }
 
-  currentAuth = auth;
-
   // Access log: parse JSON-RPC method/tool name from body for debugging.
-  // We don't log args (potentially sensitive), just method and tool name.
   if (body && body.length > 0) {
     try {
       const parsed = JSON.parse(body.toString("utf8"));
-      const method = parsed.method;
+      const rpcMethod = parsed.method;
       let detail = "";
-      if (method === "tools/call" && parsed.params?.name) {
+      if (rpcMethod === "tools/call" && parsed.params?.name) {
         detail = ` tool=${parsed.params.name}`;
       }
       logger.info(
-        `MCP ${method || "?"}${detail} agent=${auth.agent_name} (${auth.source})`,
+        `MCP ${rpcMethod || "?"}${detail} agent=${auth.agent_name} (${auth.source})`,
       );
     } catch {
       // ignore — body may be batched or non-json
     }
   }
 
-  try {
-    // Stateless: new server + transport per request
-    const server = createMcpServer(() => currentAuth);
+  // Run inside AsyncLocalStorage so concurrent requests never share auth context
+  await authStorage.run(auth, async () => {
+    const server = createMcpServer(() => getCurrentAuth());
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
-      // stateless mode: every request stands alone
     });
-    // Clean up transport after request completes
     res.on("close", () => {
-      try {
-        transport.close();
-      } catch {}
-      try {
-        server.close();
-      } catch {}
+      try { transport.close(); } catch {}
+      try { server.close(); } catch {}
     });
 
     await server.connect(transport);
     const parsedBody = body && body.length > 0 ? JSON.parse(body.toString("utf8")) : undefined;
     await transport.handleRequest(req, res, parsedBody);
-  } finally {
-    currentAuth = null;
-  }
+  });
 }
 
 // ---------- OAuth handlers ----------
