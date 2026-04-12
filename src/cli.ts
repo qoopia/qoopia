@@ -10,6 +10,8 @@ import {
   listAgents,
   rotateAgentKey,
   deleteAgent,
+  setAgentType,
+  type AgentType,
 } from "./admin/agents.ts";
 import { createWorkspace, listWorkspaces } from "./admin/workspaces.ts";
 import { env } from "./utils/env.ts";
@@ -30,10 +32,12 @@ Commands:
   backup [--to <path>]                          Manual SQLite backup
   admin create-workspace <name> [--slug <slug>]
   admin list-workspaces
-  admin create-agent <name> --workspace <slug> [--type standard|claude-privileged]
+  admin create-agent <name> --workspace <slug> [--type standard|claude-privileged|steward]
   admin list-agents
   admin rotate-key <name> --workspace <slug>
   admin delete-agent <name> --workspace <slug>
+  admin set-type <name> --workspace <slug> --type <type>
+  admin promote-steward <name> --workspace <slug>
 `);
 }
 
@@ -146,7 +150,7 @@ async function main() {
             const name = argv[2];
             if (!name) return console.error("Missing agent name");
             const workspace = need("workspace", arg("workspace"));
-            const type = (arg("type", "standard") as "standard" | "claude-privileged");
+            const type = (arg("type", "standard") as AgentType);
             const created = createAgent({
               name,
               workspaceSlug: workspace,
@@ -179,6 +183,24 @@ async function main() {
             const workspace = need("workspace", arg("workspace"));
             deleteAgent(name, workspace);
             console.log(`Agent ${name} deactivated.`);
+            return;
+          }
+          case "set-type": {
+            const name = argv[2];
+            if (!name) return console.error("Missing agent name");
+            const workspace = need("workspace", arg("workspace"));
+            const type = need("type", arg("type")) as AgentType;
+            setAgentType(name, workspace, type);
+            console.log(`Agent '${name}' type set to '${type}'.`);
+            return;
+          }
+          case "promote-steward": {
+            const name = argv[2];
+            if (!name) return console.error("Missing agent name");
+            const workspace = need("workspace", arg("workspace", "default"));
+            setAgentType(name, workspace, "steward");
+            console.log(`Agent '${name}' promoted to steward.`);
+            console.log("Admin MCP tools are now available to this agent (no restart needed).");
             return;
           }
           default:

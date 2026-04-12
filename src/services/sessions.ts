@@ -2,6 +2,7 @@ import { ulid } from "ulid";
 import { db } from "../db/connection.ts";
 import { QoopiaError, nowIso, safeJsonParse } from "../utils/errors.ts";
 import { sanitizeFtsQuery } from "./recall.ts";
+import { assertNoSecrets } from "../utils/secret-guard.ts";
 
 const MAX_CONTENT = 100_000;
 const MAX_SUMMARY = 50_000;
@@ -23,6 +24,7 @@ export function saveMessage(input: SessionSaveInput) {
   if (input.content.length > MAX_CONTENT) {
     throw new QoopiaError("SIZE_LIMIT", `content exceeds ${MAX_CONTENT} chars`);
   }
+  assertNoSecrets(input.content, "session_message.content");
 
   const now = nowIso();
   // Upsert session

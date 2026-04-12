@@ -1,6 +1,7 @@
 import { ulid } from "ulid";
 import { db } from "../db/connection.ts";
 import { nowIso } from "../utils/errors.ts";
+import { assertNoSecrets } from "../utils/secret-guard.ts";
 
 export interface ActivityInput {
   workspace_id: string;
@@ -14,6 +15,12 @@ export interface ActivityInput {
 }
 
 export function logActivity(input: ActivityInput): string {
+  // Secret guard: reject if summary or details contain an API key pattern
+  assertNoSecrets(input.summary, "activity.summary");
+  if (input.details) {
+    assertNoSecrets(JSON.stringify(input.details), "activity.details");
+  }
+
   const id = ulid();
   db.prepare(
     `INSERT INTO activity (id, workspace_id, agent_id, action, entity_type, entity_id, project_id, summary, details, created_at)

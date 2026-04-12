@@ -2,6 +2,7 @@ import { ulid } from "ulid";
 import { db } from "../db/connection.ts";
 import { QoopiaError, nowIso, safeJsonParse } from "../utils/errors.ts";
 import { logActivity } from "./activity.ts";
+import { assertNoSecrets } from "../utils/secret-guard.ts";
 
 const MAX_TEXT = 100_000;
 
@@ -79,6 +80,11 @@ export function createNote(input: NoteCreateInput) {
       `text exceeds ${MAX_TEXT} chars — split into multiple notes`,
     );
   }
+  assertNoSecrets(input.text, "note.text");
+  if (input.metadata) {
+    assertNoSecrets(JSON.stringify(input.metadata), "note.metadata");
+  }
+
   const type = input.type || "note";
 
   // Validate project_id references an existing project note
@@ -281,6 +287,15 @@ export function updateNote(input: NoteUpdateInput) {
   }
   if (input.text !== undefined && input.text.length > MAX_TEXT) {
     throw new QoopiaError("SIZE_LIMIT", `text exceeds ${MAX_TEXT} chars`);
+  }
+  if (input.text !== undefined) {
+    assertNoSecrets(input.text, "note.text");
+  }
+  if (input.metadata) {
+    assertNoSecrets(JSON.stringify(input.metadata), "note.metadata");
+  }
+  if (input.metadata_replace) {
+    assertNoSecrets(JSON.stringify(input.metadata_replace), "note.metadata");
   }
 
   const fields: string[] = [];

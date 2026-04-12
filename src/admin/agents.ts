@@ -3,10 +3,12 @@ import { db } from "../db/connection.ts";
 import { generateApiKey, sha256Hex } from "../auth/api-keys.ts";
 import { QoopiaError, nowIso } from "../utils/errors.ts";
 
+export type AgentType = "standard" | "claude-privileged" | "steward";
+
 export function createAgent(opts: {
   name: string;
   workspaceSlug: string;
-  type?: "standard" | "claude-privileged";
+  type?: AgentType;
 }): { id: string; name: string; api_key: string; workspace_id: string } {
   const ws = db
     .prepare(`SELECT id FROM workspaces WHERE slug = ?`)
@@ -56,6 +58,25 @@ export function rotateAgentKey(name: string, workspaceSlug: string): string {
     a.id,
   );
   return newKey;
+}
+
+export function setAgentType(
+  name: string,
+  workspaceSlug: string,
+  type: AgentType,
+): { name: string; type: string } {
+  const ws = db
+    .prepare(`SELECT id FROM workspaces WHERE slug = ?`)
+    .get(workspaceSlug) as { id: string } | undefined;
+  if (!ws) throw new QoopiaError("NOT_FOUND", `workspace ${workspaceSlug} not found`);
+  const info = db
+    .prepare(
+      `UPDATE agents SET type = ? WHERE name = ? AND workspace_id = ? AND active = 1`,
+    )
+    .run(type, name, ws.id);
+  if (info.changes === 0)
+    throw new QoopiaError("NOT_FOUND", `active agent '${name}' not found in workspace ${workspaceSlug}`);
+  return { name, type };
 }
 
 export function deleteAgent(name: string, workspaceSlug: string) {
