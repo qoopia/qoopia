@@ -37,8 +37,8 @@ qoopia-v3/
 | 1. Principles | Зачем Qoopia, для кого, что "хорошо" | ✅ done (после Simplicity Pass) |
 | 1.5. Simplicity Pass | Аудит принципов на over-engineering после lcm-mcp ревью | ✅ done |
 | 2. AS-IS | Как устроено сегодня | ✅ done — 9 документов в `docs/10-as-is/` |
-| 3. TO-BE | Целевая архитектура | ⚪ pending — **следующая** |
-| 4. Migration | План переезда | ⚪ pending |
+| 3. TO-BE | Целевая архитектура | ✅ done — 5 документов в `docs/20-to-be/` + 3 ADR |
+| 4. Migration | План переезда | ⚪ pending — **следующая** |
 | 5. Execute | Реализация | ⚪ pending |
 
 **Правило**: каждая фаза заканчивается явным "да, идём дальше" от владельца. Не проскакиваем.
@@ -82,4 +82,5 @@ cd ~/qoopia-v3 && claude
 - 2026-04-11: Фаза 1 (Principles) пройдена — 5 документов написаны и подписаны.
 - 2026-04-11: Фаза 1.5 (Simplicity Pass) проведена после изучения peer implementation lcm-mcp от Нияза Ирсалиева. Вырезано over-engineering по 8 областям. V3.0 scope радикально упрощён: FTS5 only, no semantic, no auto-compaction, no large file handling, one workspace mode, one notes table.
 - 2026-04-11: Фаза 1 закрыта финально. 6 ADR зафиксированы.
-- 2026-04-11: Фаза 2 (AS-IS audit) завершена. 9 документов в `docs/10-as-is/`. Финальная карта миграции: V2 9379 LoC → V3.0 ~1787 LoC (−81%), 20 таблиц → 10, 2 внешних API deps → 0, `intelligence.ts` (657 LoC) → DROP. 300-char truncation bug pinpointed at `memory.ts:218`. Следующий шаг — Фаза 3 (TO-BE).
+- 2026-04-11: Фаза 2 (AS-IS audit) завершена. 9 документов в `docs/10-as-is/`. Финальная карта миграции: V2 9379 LoC → V3.0 ~1787 LoC (−81%), 20 таблиц → 10, 2 внешних API deps → 0, `intelligence.ts` (657 LoC) → DROP. 300-char truncation bug pinpointed at `memory.ts:218`.
+- 2026-04-11: Фаза 3 (TO-BE) завершена. 5 документов в `docs/20-to-be/` + 4 ADR. Bootstrap решения: Runtime = Bun (ADR-007), Transport = MCP SDK (ADR-008), Auth = opaque tokens (ADR-009). Executable DDL готов, 13 MCP tools specs готовы, 6 system prompt templates готовы, `qoopia install` flow готов. Target: ~1725 LoC core, 3 deps. Phase 3 accepted via ADR-010. Следующий шаг — Фаза 4 (Migration planning).
