@@ -1,8 +1,19 @@
 # Project: Qoopia V3 Redesign
 
-Эта папка — рабочая мастерская для редизайна Qoopia. Прод-Qoopia живёт в `~/.openclaw/qoopia/` и для этой работы **read-only**.
+Эта папка — рабочая мастерская для редизайна Qoopia. Прод-Qoopia живёт в `~/.openclaw/qoopia/` и для этой работы **read-only** (кроме шага migration start в Phase 5).
 
-## Когда ты заходишь сюда первый раз в новой сессии
+## 🚨 STATE: 5 из 6 фаз закрыто (2026-04-11) — только Phase 5 Execute осталась
+
+**Первый шаг в новой сессии**: прочитай `docs/HANDOFF-PHASE-5.md` — там полный runbook для Phase 5 (код + миграция + cutover).
+
+**После HANDOFF-PHASE-5.md**:
+1. `recall("QOOPIA V3 PHASE")` в Qoopia MCP — 5 checkpoint notes (по одному на фазу)
+2. `git log --oneline -15` — увидишь commits сессии 1
+3. `ls docs/` — структура: `00-principles/`, `10-as-is/`, `20-to-be/`, `30-migration/`, `decisions/`, `HANDOFF-PHASE-5.md`
+
+**НЕ читай** старые Phase 1-4 документы подряд. Они — reference. Читай только тот doc, который нужен для конкретного шага Phase 5.
+
+## Когда ты заходишь сюда первый раз (historical onboarding — до Phase 5)
 
 **Выполни эти шаги по порядку, прежде чем отвечать на первый вопрос Асхата:**
 
@@ -31,11 +42,12 @@
 | Фаза | Что | Статус |
 |---|---|---|
 | 0. Setup | Workspace, git, ADRs | ✅ done |
-| 1. Principles | 5 документов о назначении и критериях | 🟡 in progress (`01-why.md` v2 принят) |
-| 2. AS-IS | Реальный аудит прод-Qoopia | ⚪ pending |
-| 3. TO-BE | Целевая архитектура | ⚪ pending |
-| 4. Migration | План переезда | ⚪ pending |
-| 5. Execute | Реализация | ⚪ pending |
+| 1. Principles | 5 документов о назначении и критериях | ✅ done |
+| 1.5. Simplicity Pass | Аудит over-engineering после lcm-mcp review | ✅ done |
+| 2. AS-IS | Аудит прод-Qoopia (9 документов) | ✅ done |
+| 3. TO-BE | Целевая архитектура (5 документов + 4 ADR) | ✅ done |
+| 4. Migration | План переезда (4 документа + ADR-011) | ✅ done |
+| 5. Execute | Реализация + cutover | ⚪ **next — см. `docs/HANDOFF-PHASE-5.md`** |
 
 **Правило**: не проскакивай фазы. Каждая закрывается явным "да" Асхата. Если предыдущая не закрыта — нельзя писать код или менять прод.
 
