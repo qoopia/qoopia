@@ -292,7 +292,9 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
 
   // Run inside AsyncLocalStorage so concurrent requests never share auth context
   await authStorage.run(auth, async () => {
-    const server = createMcpServer(() => getCurrentAuth());
+    const server = createMcpServer(() => getCurrentAuth(), "full", {
+      isSteward: auth.type === "steward",
+    });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
     });

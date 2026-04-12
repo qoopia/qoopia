@@ -21,6 +21,7 @@ import {
 } from "../services/sessions.ts";
 import { listActivity } from "../services/activity.ts";
 import { registerCompatTools } from "./compat.ts";
+import { adminTools } from "./admin-tools.ts";
 
 export type ToolProfile = "memory" | "full";
 
@@ -361,6 +362,7 @@ export function registerTools(
   server: McpServer,
   authProvider: () => AuthContext | null,
   profile: ToolProfile = "full",
+  opts?: { isSteward?: boolean },
 ) {
   for (const tool of tools) {
     if (profile === "memory" && !MEMORY_TOOLS.has(tool.name)) continue;
@@ -385,6 +387,33 @@ export function registerTools(
       },
     );
   }
+
+  // Admin tools: only registered for steward agents
+  if (opts?.isSteward) {
+    for (const tool of adminTools) {
+      server.tool(
+        tool.name,
+        tool.description,
+        tool.rawSchema,
+        async (args: unknown) => {
+          try {
+            const auth = authProvider();
+            if (!auth) {
+              return fail(new QoopiaError("UNAUTHORIZED", "No auth context"));
+            }
+            const result = tool.handler(
+              (args as Record<string, unknown>) || {},
+              auth,
+            );
+            return ok(result);
+          } catch (err) {
+            return fail(err);
+          }
+        },
+      );
+    }
+  }
+
   // V2 backward-compatibility aliases (always on, both profiles)
   registerCompatTools(server, authProvider);
 }
