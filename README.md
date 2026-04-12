@@ -36,8 +36,8 @@ qoopia-v3/
 | 0. Setup | Workspace, git, tracking | ✅ done |
 | 1. Principles | Зачем Qoopia, для кого, что "хорошо" | ✅ done (после Simplicity Pass) |
 | 1.5. Simplicity Pass | Аудит принципов на over-engineering после lcm-mcp ревью | ✅ done |
-| 2. AS-IS | Как устроено сегодня | ⚪ pending — **следующая** |
-| 3. TO-BE | Целевая архитектура | ⚪ pending |
+| 2. AS-IS | Как устроено сегодня | ✅ done — 9 документов в `docs/10-as-is/` |
+| 3. TO-BE | Целевая архитектура | ⚪ pending — **следующая** |
 | 4. Migration | План переезда | ⚪ pending |
 | 5. Execute | Реализация | ⚪ pending |
 
@@ -81,4 +81,5 @@ cd ~/qoopia-v3 && claude
 - 2026-04-11: Фаза 0 завершена. Workspace создан.
 - 2026-04-11: Фаза 1 (Principles) пройдена — 5 документов написаны и подписаны.
 - 2026-04-11: Фаза 1.5 (Simplicity Pass) проведена после изучения peer implementation lcm-mcp от Нияза Ирсалиева. Вырезано over-engineering по 8 областям. V3.0 scope радикально упрощён: FTS5 only, no semantic, no auto-compaction, no large file handling, one workspace mode, one notes table.
-- 2026-04-11: Фаза 1 закрыта финально. 6 ADR зафиксированы. Следующий шаг — Фаза 2 (AS-IS audit прод-Qoopia).
+- 2026-04-11: Фаза 1 закрыта финально. 6 ADR зафиксированы.
+- 2026-04-11: Фаза 2 (AS-IS audit) завершена. 9 документов в `docs/10-as-is/`. Финальная карта миграции: V2 9379 LoC → V3.0 ~1787 LoC (−81%), 20 таблиц → 10, 2 внешних API deps → 0, `intelligence.ts` (657 LoC) → DROP. 300-char truncation bug pinpointed at `memory.ts:218`. Следующий шаг — Фаза 3 (TO-BE).
