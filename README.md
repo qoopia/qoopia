@@ -34,7 +34,8 @@ qoopia-v3/
 | Фаза | Что | Статус |
 |---|---|---|
 | 0. Setup | Workspace, git, tracking | ✅ done |
-| 1. Principles | Зачем Qoopia, для кого, что "хорошо" | 🟡 in progress |
+| 1. Principles | Зачем Qoopia, для кого, что "хорошо" | 🟡 4/5 документов подписаны, 05-non-goals ждёт Фазы 1.5 |
+| 1.5. Simplicity Pass | Аудит принципов на over-engineering после lcm-mcp ревью | 🟡 in progress |
 | 2. AS-IS | Как устроено сегодня | ⚪ pending |
 | 3. TO-BE | Целевая архитектура | ⚪ pending |
 | 4. Migration | План переезда | ⚪ pending |
