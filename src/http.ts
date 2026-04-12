@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
@@ -13,6 +14,42 @@ import {
 import { db } from "./db/connection.ts";
 import { env } from "./utils/env.ts";
 import { logger } from "./utils/logger.ts";
+import { apiLimiter, authLimiter } from "./utils/rate-limit.ts";
+
+// --- CORS allowlist ---
+const ALLOWED_ORIGINS = new Set([
+  "https://claude.ai",
+  "https://www.claude.ai",
+  "https://console.anthropic.com",
+]);
+
+function getAllowedOrigin(req: IncomingMessage): string {
+  const origin = req.headers.origin;
+  if (!origin) return "";
+  // Allow exact match
+  if (ALLOWED_ORIGINS.has(origin)) return origin;
+  // Allow localhost for dev
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return origin;
+  return "";
+}
+
+// --- Auth context per-request (no module-level variable, no race condition) ---
+const authStorage = new AsyncLocalStorage<AuthContext>();
+
+export function getCurrentAuth(): AuthContext | null {
+  return authStorage.getStore() ?? null;
+}
+
+// --- Client IP extraction ---
+function getClientIp(req: IncomingMessage): string {
+  // Cloudflare sets CF-Connecting-IP; fallback to X-Forwarded-For, then socket
+  return (
+    (req.headers["cf-connecting-ip"] as string) ||
+    (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+    req.socket?.remoteAddress ||
+    "unknown"
+  );
+}
 
 /**
  * Single Node http server hosts:
@@ -41,21 +78,37 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-function json(res: ServerResponse, status: number, body: unknown) {
+function json(res: ServerResponse, status: number, body: unknown, req?: IncomingMessage) {
   const payload = JSON.stringify(body);
-  res.writeHead(status, {
+  const headers: Record<string, string> = {
     "content-type": "application/json",
-    "content-length": Buffer.byteLength(payload),
-    "access-control-allow-origin": "*",
-  });
+    "content-length": String(Buffer.byteLength(payload)),
+    "x-content-type-options": "nosniff",
+  };
+  if (req) {
+    const origin = getAllowedOrigin(req);
+    if (origin) {
+      headers["access-control-allow-origin"] = origin;
+      headers["vary"] = "Origin";
+    }
+  }
+  res.writeHead(status, headers);
   res.end(payload);
 }
 
-function text(res: ServerResponse, status: number, body: string) {
-  res.writeHead(status, {
+function text(res: ServerResponse, status: number, body: string, req?: IncomingMessage) {
+  const headers: Record<string, string> = {
     "content-type": "text/plain; charset=utf-8",
-    "access-control-allow-origin": "*",
-  });
+    "x-content-type-options": "nosniff",
+  };
+  if (req) {
+    const origin = getAllowedOrigin(req);
+    if (origin) {
+      headers["access-control-allow-origin"] = origin;
+      headers["vary"] = "Origin";
+    }
+  }
+  res.writeHead(status, headers);
   res.end(body);
 }
 
@@ -99,15 +152,32 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   const url = req.url || "/";
   const method = (req.method || "GET").toUpperCase();
 
+  const clientIp = getClientIp(req);
+
   // CORS preflight
   if (method === "OPTIONS") {
-    res.writeHead(204, {
-      "access-control-allow-origin": "*",
+    const origin = getAllowedOrigin(req);
+    const headers: Record<string, string> = {
       "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
       "access-control-allow-headers": "authorization, content-type, mcp-session-id",
       "access-control-max-age": "86400",
-    });
+    };
+    if (origin) {
+      headers["access-control-allow-origin"] = origin;
+      headers["vary"] = "Origin";
+    }
+    res.writeHead(204, headers);
     res.end();
+    return;
+  }
+
+  // --- Rate limiting (general) ---
+  if (!apiLimiter.allow(clientIp)) {
+    res.writeHead(429, {
+      "content-type": "application/json",
+      "retry-after": String(apiLimiter.retryAfterSec(clientIp)),
+    });
+    res.end(JSON.stringify({ error: "too_many_requests" }));
     return;
   }
 
@@ -117,7 +187,7 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       status: "ok",
       version: "3.0.0",
       uptime: Math.round(process.uptime()),
-    });
+    }, req);
   }
 
   if (url === "/") {
@@ -125,22 +195,39 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       res,
       200,
       `Qoopia V3.0 MCP server\nMCP endpoint: ${env.PUBLIC_URL}/mcp\nHealth: ${env.PUBLIC_URL}/health\n`,
+      req,
     );
   }
 
   // --- OAuth discovery ---
   if (url === "/.well-known/oauth-authorization-server") {
-    return json(res, 200, wellKnownAuthorizationServer());
+    return json(res, 200, wellKnownAuthorizationServer(), req);
   }
   if (url.startsWith("/.well-known/oauth-protected-resource")) {
-    return json(res, 200, wellKnownProtectedResource());
+    return json(res, 200, wellKnownProtectedResource(), req);
   }
 
-  // --- OAuth endpoints ---
-  if (url.startsWith("/oauth/authorize")) {
+  // --- OAuth endpoints (stricter rate limit) ---
+  if (url.startsWith("/oauth/authorize") && (method === "GET" || method === "POST")) {
+    if (!authLimiter.allow(clientIp)) {
+      res.writeHead(429, {
+        "content-type": "application/json",
+        "retry-after": String(authLimiter.retryAfterSec(clientIp)),
+      });
+      res.end(JSON.stringify({ error: "too_many_requests" }));
+      return;
+    }
     return handleAuthorize(req, res);
   }
   if (url === "/oauth/token" && method === "POST") {
+    if (!authLimiter.allow(clientIp)) {
+      res.writeHead(429, {
+        "content-type": "application/json",
+        "retry-after": String(authLimiter.retryAfterSec(clientIp)),
+      });
+      res.end(JSON.stringify({ error: "too_many_requests" }));
+      return;
+    }
     const body = await readBody(req);
     return handleToken(body, res);
   }
@@ -154,16 +241,10 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     return handleMcp(req, res);
   }
 
-  return json(res, 404, { error: "not_found", path: url });
+  return json(res, 404, { error: "not_found" }, req);
 }
 
 // ---------- MCP handler ----------
-
-// We authenticate on the HTTP request, then stash the resolved context in a
-// module-level ref that the tool handlers read back via the authProvider
-// callback registered at tool registration. Because we create a fresh MCP
-// server per request (stateless mode), there's no cross-request leakage.
-let currentAuth: AuthContext | null = null;
 
 async function handleMcp(req: IncomingMessage, res: ServerResponse) {
   const method = (req.method || "GET").toUpperCase();
@@ -181,11 +262,10 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
     return;
   }
 
-  currentAuth = auth;
-
-  try {
+  // Run inside AsyncLocalStorage so concurrent requests never share auth context
+  await authStorage.run(auth, async () => {
     // Stateless: new server + transport per request
-    const server = createMcpServer(() => currentAuth);
+    const server = createMcpServer(() => getCurrentAuth());
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       // stateless mode: every request stands alone
@@ -203,9 +283,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
     await server.connect(transport);
     const parsedBody = body && body.length > 0 ? JSON.parse(body.toString("utf8")) : undefined;
     await transport.handleRequest(req, res, parsedBody);
-  } finally {
-    currentAuth = null;
-  }
+  });
 }
 
 // ---------- OAuth handlers ----------
@@ -227,34 +305,44 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse) {
   // response_type=code, code_challenge, code_challenge_method, state.
   //
   // Since Qoopia has no login UI (single-user system), we resolve the agent
-  // via a query-param `agent_key` (admin provides to connector) — this is NOT
+  // via `agent_key` (admin provides to connector) — this is NOT
   // user-facing browser login; it's a terminal-initiated flow where the
-  // operator pastes the agent's API key into the URL once.
+  // operator pastes the agent's API key into the form once.
+  //
+  // Params come from query string (initial GET) or POST body (form submission).
   const u = new URL(req.url || "/", env.PUBLIC_URL);
-  const clientId = u.searchParams.get("client_id");
-  const redirectUri = u.searchParams.get("redirect_uri");
-  const responseType = u.searchParams.get("response_type");
-  const codeChallenge = u.searchParams.get("code_challenge");
-  const codeChallengeMethod = u.searchParams.get("code_challenge_method") || "S256";
-  const state = u.searchParams.get("state") || "";
-  const agentKey = u.searchParams.get("agent_key");
+  let formParams: Record<string, string> = {};
+  if ((req.method || "GET").toUpperCase() === "POST") {
+    const body = await readBody(req);
+    formParams = parseForm(body);
+  }
+  const param = (name: string) => formParams[name] || u.searchParams.get(name) || "";
+
+  const clientId = param("client_id") || null;
+  const redirectUri = param("redirect_uri") || null;
+  const responseType = param("response_type") || null;
+  const codeChallenge = param("code_challenge") || null;
+  const codeChallengeMethod = param("code_challenge_method") || "S256";
+  const state = param("state") || "";
+  const agentKey = param("agent_key") || null;
 
   if (!clientId || !redirectUri || responseType !== "code" || !codeChallenge) {
     return json(res, 400, { error: "invalid_request" });
   }
   if (!agentKey) {
     // Render a tiny form asking for the agent key.
+    // Uses POST so agent_key never appears in URL/logs/referrer.
     const html = `<!doctype html><html><body>
       <h1>Qoopia authorization</h1>
       <p>Paste the agent API key issued by the Qoopia operator:</p>
-      <form method="GET" action="/oauth/authorize">
+      <form method="POST" action="/oauth/authorize">
         <input type="hidden" name="client_id" value="${escapeHtml(clientId)}"/>
         <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}"/>
         <input type="hidden" name="response_type" value="code"/>
         <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}"/>
         <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}"/>
         <input type="hidden" name="state" value="${escapeHtml(state)}"/>
-        <input name="agent_key" size="60" autofocus required/>
+        <input name="agent_key" type="password" size="60" autofocus required placeholder="q_..."/>
         <button type="submit">Authorize</button>
       </form>
     </body></html>`;
@@ -273,8 +361,8 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse) {
 
   // Ensure client exists (or auto-register on first use)
   let client = db
-    .prepare(`SELECT id FROM oauth_clients WHERE id = ?`)
-    .get(clientId) as { id: string } | undefined;
+    .prepare(`SELECT id, redirect_uris FROM oauth_clients WHERE id = ?`)
+    .get(clientId) as { id: string; redirect_uris: string } | undefined;
   if (!client) {
     const { sha256Hex } = await import("./auth/api-keys.ts");
     db.prepare(
@@ -286,7 +374,16 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse) {
       sha256Hex(clientId),
       JSON.stringify([redirectUri]),
     );
-    client = { id: clientId };
+    client = { id: clientId, redirect_uris: JSON.stringify([redirectUri]) };
+  } else {
+    // Validate redirect_uri against registered redirect URIs
+    let registeredUris: string[] = [];
+    try {
+      registeredUris = JSON.parse(client.redirect_uris || "[]");
+    } catch {}
+    if (!registeredUris.includes(redirectUri)) {
+      return json(res, 400, { error: "invalid_redirect_uri" }, req);
+    }
   }
 
   const code = createAuthorizationCode({
