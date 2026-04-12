@@ -1,0 +1,26 @@
+{
+  "name": "qoopia",
+  "version": "3.0.0",
+  "description": "Memory and truth layer for AI agents",
+  "type": "module",
+  "bin": {
+    "qoopia": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts",
+    "install-service": "bun run src/admin/install.ts",
+    "migrate-from-v2": "bun run scripts/migrate-from-v2.ts",
+    "verify-migration": "bun run scripts/verify-migration.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0",
+    "ulid": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}

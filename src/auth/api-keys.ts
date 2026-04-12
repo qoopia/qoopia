@@ -1,0 +1,46 @@
+import crypto from "node:crypto";
+import { db } from "../db/connection.ts";
+import { nowIso } from "../utils/errors.ts";
+
+export function sha256Hex(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+export function generateApiKey(): string {
+  // 32 random bytes, base64url, prefixed with "q_"
+  const raw = crypto.randomBytes(32);
+  const b64 = raw.toString("base64url");
+  return `q_${b64}`;
+}
+
+export interface AgentRecord {
+  id: string;
+  workspace_id: string;
+  name: string;
+  type: "standard" | "claude-privileged" | string;
+  api_key_hash: string;
+  active: number;
+  last_seen: string | null;
+  metadata: string;
+  created_at: string;
+}
+
+export function verifyApiKey(token: string): AgentRecord | null {
+  const hash = sha256Hex(token);
+  const row = db
+    .prepare(
+      `SELECT * FROM agents WHERE api_key_hash = ? AND active = 1 LIMIT 1`,
+    )
+    .get(hash) as AgentRecord | undefined;
+  if (!row) return null;
+
+  // Update last_seen (best effort)
+  try {
+    db.prepare(`UPDATE agents SET last_seen = ? WHERE id = ?`).run(
+      nowIso(),
+      row.id,
+    );
+  } catch {}
+
+  return row;
+}
