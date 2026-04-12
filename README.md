@@ -34,9 +34,9 @@ qoopia-v3/
 | Фаза | Что | Статус |
 |---|---|---|
 | 0. Setup | Workspace, git, tracking | ✅ done |
-| 1. Principles | Зачем Qoopia, для кого, что "хорошо" | 🟡 4/5 документов подписаны, 05-non-goals ждёт Фазы 1.5 |
-| 1.5. Simplicity Pass | Аудит принципов на over-engineering после lcm-mcp ревью | 🟡 in progress |
-| 2. AS-IS | Как устроено сегодня | ⚪ pending |
+| 1. Principles | Зачем Qoopia, для кого, что "хорошо" | ✅ done (после Simplicity Pass) |
+| 1.5. Simplicity Pass | Аудит принципов на over-engineering после lcm-mcp ревью | ✅ done |
+| 2. AS-IS | Как устроено сегодня | ⚪ pending — **следующая** |
 | 3. TO-BE | Целевая архитектура | ⚪ pending |
 | 4. Migration | План переезда | ⚪ pending |
 | 5. Execute | Реализация | ⚪ pending |
@@ -78,4 +78,7 @@ cd ~/qoopia-v3 && claude
 
 ## Прогресс
 
-- 2026-04-11: Фаза 0 завершена. Workspace создан. Начата Фаза 1 (Principles). `01-why.md` v2 написан, ждёт sign-off.
+- 2026-04-11: Фаза 0 завершена. Workspace создан.
+- 2026-04-11: Фаза 1 (Principles) пройдена — 5 документов написаны и подписаны.
+- 2026-04-11: Фаза 1.5 (Simplicity Pass) проведена после изучения peer implementation lcm-mcp от Нияза Ирсалиева. Вырезано over-engineering по 8 областям. V3.0 scope радикально упрощён: FTS5 only, no semantic, no auto-compaction, no large file handling, one workspace mode, one notes table.
+- 2026-04-11: Фаза 1 закрыта финально. 6 ADR зафиксированы. Следующий шаг — Фаза 2 (AS-IS audit прод-Qoopia).
