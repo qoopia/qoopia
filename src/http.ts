@@ -183,6 +183,24 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
 
   currentAuth = auth;
 
+  // Access log: parse JSON-RPC method/tool name from body for debugging.
+  // We don't log args (potentially sensitive), just method and tool name.
+  if (body && body.length > 0) {
+    try {
+      const parsed = JSON.parse(body.toString("utf8"));
+      const method = parsed.method;
+      let detail = "";
+      if (method === "tools/call" && parsed.params?.name) {
+        detail = ` tool=${parsed.params.name}`;
+      }
+      logger.info(
+        `MCP ${method || "?"}${detail} agent=${auth.agent_name} (${auth.source})`,
+      );
+    } catch {
+      // ignore — body may be batched or non-json
+    }
+  }
+
   try {
     // Stateless: new server + transport per request
     const server = createMcpServer(() => currentAuth);

@@ -1,0 +1,550 @@
+/**
+ * V2 backward-compatibility layer.
+ *
+ * Existing clients (Aidan via OpenClaw, Claude.ai connector, Alan/Aizek
+ * via Claude Code) call Qoopia with V2 tool names and V2 argument shapes.
+ * V3 renamed/restructured tools (note_create, note_get, etc.). This module
+ * registers the 8 V2 tool names as adapters that translate V2 args into
+ * V3 service calls without changing data semantics.
+ *
+ * Tools registered here:
+ *   note    — memory note (was V2 's note' with auto-magic; we drop the magic)
+ *   recall  — same as V3 recall, but accepts V2 'entities' string
+ *   brief   — same as V3 brief, but accepts V2 'agent_name' alias
+ *   list    — generic list with `entity` discriminator → V3 listNotes / listActivity
+ *   get     — generic get with `entity` discriminator → V3 getNote
+ *   create  — generic create with `entity` discriminator → V3 createNote / logActivity
+ *   update  — generic update with `entity` discriminator → V3 updateNote
+ *   delete  — generic delete with `entity` discriminator → V3 deleteNote
+ *
+ * Backward compatibility is important for: Aidan (active prod agent), the
+ * claude.ai QOOPIA OAuth connector (with migrated tokens), and any other
+ * client that hasn't been updated to V3-style tool names.
+ */
+import { z } from "zod";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { AuthContext } from "../auth/middleware.ts";
+import { QoopiaError } from "../utils/errors.ts";
+import {
+  createNote,
+  getNote,
+  listNotes,
+  updateNote,
+  deleteNote,
+} from "../services/notes.ts";
+import { recall as recallService } from "../services/recall.ts";
+import { brief as briefService } from "../services/brief.ts";
+import { logActivity, listActivity } from "../services/activity.ts";
+
+// V2 plural entity → V3 singular type
+const ENTITY_TO_TYPE: Record<string, string> = {
+  tasks: "task",
+  deals: "deal",
+  contacts: "contact",
+  finances: "finance",
+  projects: "project",
+};
+
+function ok(data: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
+}
+
+function fail(err: unknown) {
+  let msg: string;
+  if (err instanceof QoopiaError) msg = `${err.code}: ${err.message}`;
+  else if (err instanceof Error) msg = `INTERNAL: ${err.message}`;
+  else msg = `INTERNAL: ${String(err)}`;
+  return { isError: true, content: [{ type: "text" as const, text: msg }] };
+}
+
+function wrap(
+  fn: (args: Record<string, unknown>, auth: AuthContext) => unknown,
+  authProvider: () => AuthContext | null,
+) {
+  return async (args: unknown) => {
+    try {
+      const auth = authProvider();
+      if (!auth) return fail(new QoopiaError("UNAUTHORIZED", "No auth context"));
+      return ok(fn((args as Record<string, unknown>) || {}, auth));
+    } catch (err) {
+      return fail(err);
+    }
+  };
+}
+
+// ---- field composition helpers ----
+
+function composeTaskText(title: unknown, description: unknown): string {
+  const t = String(title || "").trim();
+  const d = String(description || "").trim();
+  if (!t) throw new QoopiaError("INVALID_INPUT", "title required");
+  return d ? `${t}\n\n${d}` : t;
+}
+
+function buildTaskMetadata(args: Record<string, unknown>) {
+  return {
+    status: args.status ?? "todo",
+    priority: args.priority ?? "medium",
+    assignee: args.assignee ?? null,
+    due_date: args.due_date ?? null,
+    inline_notes: args.notes ?? null,
+  };
+}
+
+function buildDealMetadata(args: Record<string, unknown>) {
+  return {
+    status: args.status ?? "active",
+    address: args.address ?? null,
+    asking_price: args.asking_price ?? null,
+    target_price: args.target_price ?? null,
+    monthly_rent: args.monthly_rent ?? null,
+    inline_notes: args.notes ?? null,
+    metadata: args.metadata ?? {},
+    timeline: args.timeline ?? [],
+  };
+}
+
+function buildContactMetadata(args: Record<string, unknown>) {
+  return {
+    role: args.role ?? null,
+    company: args.company ?? null,
+    email: args.email ?? null,
+    phone: args.phone ?? null,
+    telegram_id: args.telegram_id ?? null,
+    language: args.language ?? "EN",
+    timezone: args.timezone ?? null,
+    category: args.category ?? null,
+    inline_notes: args.notes ?? null,
+  };
+}
+
+function buildFinanceMetadata(args: Record<string, unknown>) {
+  return {
+    finance_type: args.type ?? null,
+    amount: args.amount ?? 0,
+    currency: args.currency ?? "USD",
+    recurring: args.recurring ?? "none",
+    status: args.status ?? "active",
+    inline_notes: args.notes ?? null,
+  };
+}
+
+function buildProjectMetadata(args: Record<string, unknown>) {
+  return {
+    description: args.description ?? null,
+    status: args.status ?? "active",
+    color: args.color ?? null,
+  };
+}
+
+// Build V2-style "create" → routes by entity discriminator
+function v2Create(args: Record<string, unknown>, auth: AuthContext) {
+  const entity = String(args.entity || "");
+  switch (entity) {
+    case "tasks": {
+      return createNote({
+        workspace_id: auth.workspace_id,
+        agent_id: auth.agent_id,
+        text: composeTaskText(args.title, args.description),
+        type: "task",
+        metadata: buildTaskMetadata(args),
+        project_id: (args.project_id as string) || null,
+        tags: (args.tags as string[]) || [],
+      });
+    }
+    case "deals": {
+      const name = String(args.name || "").trim();
+      if (!name) throw new QoopiaError("INVALID_INPUT", "name required");
+      return createNote({
+        workspace_id: auth.workspace_id,
+        agent_id: auth.agent_id,
+        text: name,
+        type: "deal",
+        metadata: buildDealMetadata(args),
+        project_id: (args.project_id as string) || null,
+        tags: (args.tags as string[]) || [],
+      });
+    }
+    case "contacts": {
+      const name = String(args.name || "").trim();
+      if (!name) throw new QoopiaError("INVALID_INPUT", "name required");
+      return createNote({
+        workspace_id: auth.workspace_id,
+        agent_id: auth.agent_id,
+        text: name,
+        type: "contact",
+        metadata: buildContactMetadata(args),
+        tags: (args.tags as string[]) || [],
+      });
+    }
+    case "finances": {
+      const name = String(args.name || "").trim();
+      if (!name) throw new QoopiaError("INVALID_INPUT", "name required");
+      return createNote({
+        workspace_id: auth.workspace_id,
+        agent_id: auth.agent_id,
+        text: name,
+        type: "finance",
+        metadata: buildFinanceMetadata(args),
+        project_id: (args.project_id as string) || null,
+        tags: (args.tags as string[]) || [],
+      });
+    }
+    case "activity": {
+      const id = logActivity({
+        workspace_id: auth.workspace_id,
+        agent_id: auth.agent_id,
+        action: String(args.action || "logged"),
+        entity_type: String(args.entity_type || "note"),
+        entity_id: (args.entity_id as string) || null,
+        project_id: (args.project_id as string) || null,
+        summary: String(args.summary || ""),
+        details: (args.details as Record<string, unknown>) || {},
+      });
+      return { created: true, id };
+    }
+    default:
+      throw new QoopiaError(
+        "INVALID_INPUT",
+        `unsupported entity for create: ${entity}`,
+      );
+  }
+}
+
+function v2Update(args: Record<string, unknown>, auth: AuthContext) {
+  const entity = String(args.entity || "");
+  const id = String(args.id || "");
+  if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
+
+  // Build a metadata patch from known typed fields. Anything that maps to
+  // V2 metadata for the relevant entity is included; missing fields stay
+  // untouched (V3 updateNote does a shallow merge).
+  let textOverride: string | undefined;
+  let metadata: Record<string, unknown> = {};
+
+  switch (entity) {
+    case "tasks": {
+      // If title or description supplied, recompose text. To do this we need
+      // existing description if title alone given (and vice versa). Read note.
+      if (args.title !== undefined || args.description !== undefined) {
+        const existing = getNote(auth.workspace_id, id);
+        const oldText = existing.text || "";
+        const split = oldText.split("\n\n");
+        const oldTitle = split[0] || "";
+        const oldDesc = split.slice(1).join("\n\n");
+        const newTitle = args.title !== undefined ? String(args.title) : oldTitle;
+        const newDesc =
+          args.description !== undefined ? String(args.description) : oldDesc;
+        textOverride = newDesc ? `${newTitle}\n\n${newDesc}` : newTitle;
+      }
+      for (const k of ["status", "priority", "assignee", "due_date"]) {
+        if (args[k] !== undefined) metadata[k] = args[k];
+      }
+      if (args.notes !== undefined) metadata.inline_notes = args.notes;
+      break;
+    }
+    case "deals": {
+      if (args.name !== undefined) textOverride = String(args.name);
+      for (const k of [
+        "status",
+        "address",
+        "asking_price",
+        "target_price",
+        "monthly_rent",
+      ]) {
+        if (args[k] !== undefined) metadata[k] = args[k];
+      }
+      if (args.notes !== undefined) metadata.inline_notes = args.notes;
+      if (args.metadata !== undefined) metadata.metadata = args.metadata;
+      if (args.timeline !== undefined) metadata.timeline = args.timeline;
+      break;
+    }
+    case "contacts": {
+      if (args.name !== undefined) textOverride = String(args.name);
+      for (const k of [
+        "role",
+        "company",
+        "email",
+        "phone",
+        "telegram_id",
+        "language",
+        "timezone",
+        "category",
+      ]) {
+        if (args[k] !== undefined) metadata[k] = args[k];
+      }
+      if (args.notes !== undefined) metadata.inline_notes = args.notes;
+      break;
+    }
+    case "finances": {
+      if (args.name !== undefined) textOverride = String(args.name);
+      if (args.type !== undefined) metadata.finance_type = args.type;
+      for (const k of ["amount", "currency", "recurring", "status"]) {
+        if (args[k] !== undefined) metadata[k] = args[k];
+      }
+      if (args.notes !== undefined) metadata.inline_notes = args.notes;
+      break;
+    }
+    case "projects": {
+      // For projects: name → text, others → metadata
+      if (args.name !== undefined) textOverride = String(args.name);
+      for (const k of ["description", "status", "color"]) {
+        if (args[k] !== undefined) metadata[k] = args[k];
+      }
+      break;
+    }
+    default:
+      throw new QoopiaError(
+        "INVALID_INPUT",
+        `unsupported entity for update: ${entity}`,
+      );
+  }
+
+  return updateNote({
+    workspace_id: auth.workspace_id,
+    agent_id: auth.agent_id,
+    id,
+    text: textOverride,
+    metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+    tags: (args.tags as string[]) || undefined,
+  });
+}
+
+function v2List(args: Record<string, unknown>, auth: AuthContext) {
+  const entity = String(args.entity || "");
+  const limit = (args.limit as number) || 50;
+
+  if (entity === "activity") {
+    return listActivity({
+      workspace_id: auth.workspace_id,
+      entity_type: args.entity_type as string | undefined,
+      project_id: args.project_id as string | undefined,
+      limit,
+    });
+  }
+  const type = ENTITY_TO_TYPE[entity];
+  if (!type) {
+    throw new QoopiaError(
+      "INVALID_INPUT",
+      `unsupported entity for list: ${entity}`,
+    );
+  }
+  return listNotes({
+    workspace_id: auth.workspace_id,
+    type,
+    project_id: args.project_id as string | undefined,
+    status: args.status as string | undefined,
+    limit,
+  });
+}
+
+function v2Get(args: Record<string, unknown>, auth: AuthContext) {
+  const id = String(args.id || "");
+  if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
+  return getNote(auth.workspace_id, id);
+}
+
+function v2Delete(args: Record<string, unknown>, auth: AuthContext) {
+  const id = String(args.id || "");
+  if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
+  return deleteNote(auth.workspace_id, auth.agent_id, id);
+}
+
+function v2Note(args: Record<string, unknown>, auth: AuthContext) {
+  const text = String(args.text || "").trim();
+  if (!text) throw new QoopiaError("INVALID_INPUT", "text required");
+  const v2type = (args.type as string) || "memory";
+  // V2 valid types: rule, memory, knowledge, context. All map 1:1 in V3.
+  return createNote({
+    workspace_id: auth.workspace_id,
+    agent_id: auth.agent_id,
+    text,
+    type: v2type,
+    metadata: {
+      v2_compat: true,
+      v2_session_id: args.session_id ?? null,
+      v2_agent_name: args.agent_name ?? null,
+      v2_entities_hint: args.entities_hint ?? [],
+    },
+    session_id: (args.session_id as string) || null,
+  });
+}
+
+function v2Recall(args: Record<string, unknown>, auth: AuthContext) {
+  const privileged = auth.type === "claude-privileged";
+  // V2 'entities' is comma-separated string ("tasks,deals"). V3 has type filter.
+  // We only honour single-type filter — if V2 passes multiple entities, drop the filter.
+  let typeFilter: string | undefined;
+  const ent = args.entities;
+  if (typeof ent === "string") {
+    const parts = ent.split(",").map((s) => s.trim()).filter(Boolean);
+    if (parts.length === 1) typeFilter = ENTITY_TO_TYPE[parts[0]!] || parts[0];
+  }
+  return recallService({
+    workspace_id: auth.workspace_id,
+    query: String(args.query || ""),
+    limit: args.limit as number | undefined,
+    type: (args.type as string) || typeFilter,
+    privileged,
+  });
+}
+
+function v2Brief(args: Record<string, unknown>, auth: AuthContext) {
+  // V2 had agent_name (the calling agent's name) and agent (filter). V3 only has agent.
+  return briefService({
+    workspace_id: auth.workspace_id,
+    project: args.project as string | undefined,
+    agent: (args.agent as string) || (args.agent_name as string) || undefined,
+  });
+}
+
+// ---- registration ----
+
+export function registerCompatTools(
+  server: McpServer,
+  authProvider: () => AuthContext | null,
+) {
+  // Generic CRUD with `entity` discriminator
+  server.tool(
+    "create",
+    "[V2 compat] Create entity by type. entity ∈ tasks|deals|contacts|finances|activity. Use note_create for V3-native API.",
+    {
+      entity: z.enum(["tasks", "deals", "contacts", "finances", "activity"]),
+      title: z.string().optional(),
+      description: z.string().optional(),
+      name: z.string().optional(),
+      project_id: z.string().optional(),
+      status: z.string().optional(),
+      priority: z.string().optional(),
+      assignee: z.string().optional(),
+      due_date: z.string().optional(),
+      address: z.string().optional(),
+      asking_price: z.number().optional(),
+      target_price: z.number().optional(),
+      monthly_rent: z.number().optional(),
+      role: z.string().optional(),
+      company: z.string().optional(),
+      email: z.string().optional(),
+      phone: z.string().optional(),
+      telegram_id: z.string().optional(),
+      language: z.string().optional(),
+      timezone: z.string().optional(),
+      category: z.string().optional(),
+      type: z.string().optional(),
+      amount: z.number().optional(),
+      currency: z.string().optional(),
+      recurring: z.string().optional(),
+      entity_type: z.string().optional(),
+      entity_id: z.string().optional(),
+      action: z.string().optional(),
+      summary: z.string().optional(),
+      details: z.record(z.unknown()).optional(),
+      metadata: z.record(z.unknown()).optional(),
+      timeline: z.array(z.unknown()).optional(),
+      notes: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+    },
+    wrap(v2Create, authProvider),
+  );
+
+  server.tool(
+    "update",
+    "[V2 compat] Update entity by id. Provide entity + id + fields to change.",
+    {
+      entity: z.enum(["tasks", "deals", "contacts", "finances", "projects"]),
+      id: z.string(),
+      title: z.string().optional(),
+      description: z.string().optional(),
+      name: z.string().optional(),
+      status: z.string().optional(),
+      priority: z.string().optional(),
+      assignee: z.string().optional(),
+      due_date: z.string().optional(),
+      address: z.string().optional(),
+      asking_price: z.number().optional(),
+      target_price: z.number().optional(),
+      monthly_rent: z.number().optional(),
+      metadata: z.record(z.unknown()).optional(),
+      timeline: z.array(z.unknown()).optional(),
+      role: z.string().optional(),
+      company: z.string().optional(),
+      email: z.string().optional(),
+      phone: z.string().optional(),
+      telegram_id: z.string().optional(),
+      language: z.string().optional(),
+      timezone: z.string().optional(),
+      category: z.string().optional(),
+      type: z.string().optional(),
+      amount: z.number().optional(),
+      currency: z.string().optional(),
+      recurring: z.string().optional(),
+      color: z.string().optional(),
+      notes: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+    },
+    wrap(v2Update, authProvider),
+  );
+
+  server.tool(
+    "delete",
+    "[V2 compat] Soft-delete an entity. entity ∈ tasks|deals|contacts|finances|projects.",
+    {
+      entity: z.enum(["tasks", "deals", "contacts", "finances", "projects"]),
+      id: z.string(),
+    },
+    wrap(v2Delete, authProvider),
+  );
+
+  server.tool(
+    "list",
+    "[V2 compat] List entities by type.",
+    {
+      entity: z.enum([
+        "tasks",
+        "deals",
+        "contacts",
+        "finances",
+        "projects",
+        "activity",
+      ]),
+      project_id: z.string().optional(),
+      status: z.string().optional(),
+      assignee: z.string().optional(),
+      category: z.string().optional(),
+      type: z.string().optional(),
+      entity_type: z.string().optional(),
+      limit: z.number().int().optional(),
+    },
+    wrap(v2List, authProvider),
+  );
+
+  server.tool(
+    "get",
+    "[V2 compat] Get a single entity by id.",
+    {
+      entity: z.string(),
+      id: z.string(),
+    },
+    wrap(v2Get, authProvider),
+  );
+
+  server.tool(
+    "note",
+    "[V2 compat] Record a memory note. Maps to note_create with type=memory by default.",
+    {
+      text: z.string().min(1).max(100_000),
+      project: z.string().optional(),
+      agent_name: z.string().optional(),
+      session_id: z.string().optional(),
+      entities_hint: z.array(z.string()).optional(),
+      type: z.enum(["rule", "memory", "knowledge", "context"]).optional(),
+    },
+    wrap(v2Note, authProvider),
+  );
+
+  // recall and brief already exist in V3 with the same name. We DON'T re-register
+  // them — the V3 versions already accept the V2 args (V2 'entities' is ignored,
+  // V2 'agent_name' is ignored). Aidan's existing recall/brief calls work as-is.
+  // If we want to be strict about V2 'entities' string, we could override here,
+  // but it's not needed for current clients.
+}

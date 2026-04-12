@@ -20,6 +20,7 @@ import {
   sessionExpand,
 } from "../services/sessions.ts";
 import { listActivity } from "../services/activity.ts";
+import { registerCompatTools } from "./compat.ts";
 
 export type ToolProfile = "memory" | "full";
 
@@ -384,6 +385,8 @@ export function registerTools(
       },
     );
   }
+  // V2 backward-compatibility aliases (always on, both profiles)
+  registerCompatTools(server, authProvider);
 }
 
 export function toolNames(profile: ToolProfile = "full"): string[] {
