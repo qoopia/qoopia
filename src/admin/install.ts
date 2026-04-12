@@ -3,11 +3,15 @@ import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline";
 import { runMigrations } from "../db/migrate.ts";
 import { db } from "../db/connection.ts";
 import { createWorkspace } from "./workspaces.ts";
 import { createAgent } from "./agents.ts";
 import { env } from "../utils/env.ts";
+import { getRolePreset, ROLE_PRESET_NAMES, listRolePresets } from "./templates.ts";
+import { ulid } from "ulid";
+import { nowIso } from "../utils/errors.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -39,7 +43,49 @@ function findBun(): string {
   }
 }
 
-export async function install() {
+// ---- Interactive prompt helpers ----
+
+function isInteractive(): boolean {
+  return process.stdin.isTTY === true;
+}
+
+async function ask(question: string, defaultValue?: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const suffix = defaultValue ? ` [${defaultValue}]` : "";
+  return new Promise((resolve) => {
+    rl.question(`  ${question}${suffix}: `, (answer) => {
+      rl.close();
+      resolve(answer.trim() || defaultValue || "");
+    });
+  });
+}
+
+async function choose(question: string, options: string[]): Promise<string> {
+  console.log(`\n  ${question}`);
+  for (let i = 0; i < options.length; i++) {
+    console.log(`    (${i + 1}) ${options[i]}`);
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question("  Choice: ", (answer) => {
+      rl.close();
+      const idx = parseInt(answer, 10) - 1;
+      if (idx >= 0 && idx < options.length) {
+        resolve(options[idx]!);
+      } else {
+        resolve(options[0]!); // default to first
+      }
+    });
+  });
+}
+
+export interface InstallOpts {
+  stewardName?: string;
+  stewardRole?: string;
+  yes?: boolean;
+}
+
+export async function install(opts: InstallOpts = {}) {
   const start = Date.now();
   banner("Qoopia V3.0 installer");
 
@@ -68,23 +114,84 @@ export async function install() {
     step(`Workspace already exists: ${workspaceSlug}`);
   }
 
-  // 4. Admin agent
-  let adminKey: string | null = null;
-  const adminExists = db
-    .prepare(
-      `SELECT id FROM agents WHERE name = 'admin' AND workspace_id = (SELECT id FROM workspaces WHERE slug = ?)`,
-    )
-    .get(workspaceSlug);
-  if (!adminExists) {
-    const created = createAgent({
-      name: "admin",
-      workspaceSlug,
-      type: "standard",
-    });
-    adminKey = created.api_key;
-    step("Admin agent created");
+  // 4. Steward setup (interactive or via flags)
+  let stewardName = opts.stewardName;
+  let stewardRole = opts.stewardRole;
+
+  if (!stewardName && isInteractive() && !opts.yes) {
+    console.log("\n  ─── Steward Agent Setup ───\n");
+    console.log("  The steward manages Qoopia through chat (create agents, onboard, etc.).\n");
+    stewardName = await ask("Primary agent name (will become steward)", "Alan");
+    const presets = listRolePresets();
+    stewardRole = await choose(
+      "Select steward's role preset:",
+      presets.map((p) => `${p.name} — ${p.displayName}`),
+    );
+    // Extract preset name from "name — displayName" format
+    stewardRole = stewardRole.split(" — ")[0]!;
+  }
+
+  // Create steward agent (or fallback admin agent)
+  let agentKey: string | null = null;
+  let agentName: string;
+  let agentType: string;
+  let bootstrapCount = 0;
+  let systemPrompt: string | null = null;
+
+  if (stewardName) {
+    agentName = stewardName;
+    agentType = "steward";
   } else {
-    step("Admin agent already exists (use `qoopia admin rotate-key admin` to get a new key)");
+    agentName = "admin";
+    agentType = "standard";
+  }
+
+  const agentExists = db
+    .prepare(
+      `SELECT id FROM agents WHERE name = ? AND workspace_id = (SELECT id FROM workspaces WHERE slug = ?)`,
+    )
+    .get(agentName, workspaceSlug);
+
+  if (!agentExists) {
+    const created = createAgent({
+      name: agentName,
+      workspaceSlug,
+      type: agentType as "standard" | "claude-privileged" | "steward",
+    });
+    agentKey = created.api_key;
+
+    // Bootstrap notes from role preset (if steward with role)
+    if (agentType === "steward" && stewardRole) {
+      try {
+        const preset = getRolePreset(stewardRole);
+        const now = nowIso();
+        for (const note of preset.bootstrapNotes) {
+          const noteId = ulid();
+          db.prepare(
+            `INSERT INTO notes (id, workspace_id, agent_id, type, text, metadata, tags, source, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, '{}', ?, 'installer', ?, ?)`,
+          ).run(
+            noteId,
+            created.workspace_id,
+            created.id,
+            note.type,
+            note.text,
+            JSON.stringify(note.tags),
+            now,
+            now,
+          );
+          bootstrapCount++;
+        }
+        systemPrompt = preset.systemPrompt;
+        step(`Steward '${agentName}' created with role '${stewardRole}' (${bootstrapCount} bootstrap notes)`);
+      } catch (e) {
+        step(`Steward '${agentName}' created (role preset '${stewardRole}' failed: ${e})`);
+      }
+    } else {
+      step(`Agent '${agentName}' created (type: ${agentType})`);
+    }
+  } else {
+    step(`Agent '${agentName}' already exists (use \`qoopia admin rotate-key ${agentName}\` to get a new key)`);
   }
 
   // 5. launchd plist
@@ -142,27 +249,44 @@ export async function install() {
       `⚠ Server not reachable after 15s. Check logs at ${env.LOG_DIR}/qoopia.stderr.log`,
     );
 
-  // 8. Banner
+  // 8. Summary
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("\n━━━━━━━━━━━━━━━��━━━━━━━━━━━━━��━━━━━━━━━━━━━━━");
   console.log(`  INSTALLATION COMPLETE — ${elapsed} seconds`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
   console.log(`  MCP URL:   http://localhost:${env.PORT}/mcp`);
-  if (adminKey) {
-    console.log(`  Admin API key:  ${adminKey}`);
-    console.log("\n  Save this API key — it won't be shown again.");
-    console.log("\n  Add to your MCP client config:\n");
+  if (agentKey) {
+    console.log(`\n  ${agentType === "steward" ? "Steward" : "Admin"} API key:  ${agentKey}`);
+    console.log("\n  ⚠ Save this API key — it won't be shown again.\n");
+    console.log("  MCP config (copy to ~/.claude.json or your MCP client):\n");
     console.log("  {");
     console.log('    "qoopia": {');
     console.log('      "type": "streamable-http",');
     console.log(`      "url": "http://localhost:${env.PORT}/mcp",`);
-    console.log(`      "headers": {"Authorization": "Bearer ${adminKey}"}`);
+    console.log(`      "headers": {"Authorization": "Bearer ${agentKey}"}`);
     console.log("    }");
-    console.log("  }");
+    console.log("  }\n");
+    console.log(`  Claude Code CLI:`);
+    console.log(`  claude mcp add qoopia --transport streamable-http \\`);
+    console.log(`    --url http://localhost:${env.PORT}/mcp \\`);
+    console.log(`    --header "Authorization: Bearer ${agentKey}"\n`);
   }
-  console.log("\n  Next steps:");
-  console.log("    qoopia admin create-workspace <name>");
-  console.log("    qoopia admin create-agent <name> --workspace <slug>");
-  console.log("    qoopia status");
-  console.log("    qoopia logs\n");
+  if (systemPrompt) {
+    console.log("  ─── System Prompt (copy to agent config) ───\n");
+    console.log(systemPrompt);
+    console.log("  ─── End System Prompt ───\n");
+  }
+  if (agentType === "steward") {
+    console.log("  Next steps:");
+    console.log("    1. Copy the API key to your password manager");
+    console.log("    2. Add the MCP config to your agent's settings");
+    console.log("    3. Copy the system prompt to your agent's config");
+    console.log(`    4. Start a chat with ${agentName} — it can now manage Qoopia`);
+    console.log(`    5. Try: "show all agents in Qoopia"\n`);
+  } else {
+    console.log("  Next steps:");
+    console.log("    qoopia admin create-agent <name> --workspace default [--type steward]");
+    console.log("    qoopia status");
+    console.log("    qoopia logs\n");
+  }
 }

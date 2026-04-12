@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
-import { install } from "./admin/install.ts";
+import { install, type InstallOpts } from "./admin/install.ts";
 import { runMigrations } from "./db/migrate.ts";
 import {
   createAgent,
@@ -24,7 +24,7 @@ function usage() {
   console.log(`Usage: qoopia <command> [args]
 
 Commands:
-  install                                       Run first-time installer
+  install [--steward-name N --steward-role R]    Run first-time installer (interactive or flags)
   uninstall                                     Stop service + unload plist
   status                                        Health check
   logs [--follow]                               Tail server log
@@ -109,7 +109,11 @@ async function main() {
         return;
       }
       case "install":
-        await install();
+        await install({
+          stewardName: arg("steward-name"),
+          stewardRole: arg("steward-role"),
+          yes: argv.includes("--yes"),
+        });
         return;
       case "uninstall": {
         const plistPath = path.join(
