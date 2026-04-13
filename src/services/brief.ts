@@ -155,7 +155,7 @@ export function brief(p: BriefParams) {
     .prepare(
       `SELECT a.id, a.name, a.last_seen,
          (SELECT COUNT(*) FROM notes n WHERE n.agent_id = a.id AND n.workspace_id = a.workspace_id
-           AND n.deleted_at IS NULL AND n.created_at >= datetime('now', '-1 day')) as notes_today
+           AND n.deleted_at IS NULL AND datetime(n.created_at) >= datetime('now', '-1 day')) as notes_today
        FROM agents a WHERE ${agentActivityWhere.join(" AND ")}
        ORDER BY a.last_seen DESC`,
     )

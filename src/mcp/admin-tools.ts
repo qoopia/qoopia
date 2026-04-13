@@ -19,7 +19,7 @@ import { z } from "zod";
 import { db } from "../db/connection.ts";
 import type { AuthContext } from "../auth/middleware.ts";
 import { QoopiaError, nowIso } from "../utils/errors.ts";
-import { createAgent, listAgents } from "../admin/agents.ts";
+import { createAgent } from "../admin/agents.ts";
 import { logActivity } from "../services/activity.ts";
 import { getRolePreset, ROLE_PRESET_NAMES } from "../admin/templates.ts";
 import { ulid } from "ulid";
@@ -149,8 +149,15 @@ export const adminTools: AdminToolDef[] = [
     rawSchema: {},
     handler(_args, auth) {
       assertSteward(auth);
-      // listAgents returns all agents across workspaces (admin view)
-      const all = listAgents() as Array<{
+      // Scope to steward's workspace only
+      const all = db
+        .prepare(
+          `SELECT a.id, a.name, a.type, a.active, a.last_seen, a.created_at, w.slug as workspace_slug
+           FROM agents a JOIN workspaces w ON w.id = a.workspace_id
+           WHERE a.workspace_id = ?
+           ORDER BY a.name`,
+        )
+        .all(auth.workspace_id) as Array<{
         id: string;
         name: string;
         type: string;
@@ -201,31 +208,46 @@ export const adminTools: AdminToolDef[] = [
       if (!ws)
         throw new QoopiaError("NOT_FOUND", "workspace not found");
 
-      const info = db
-        .prepare(
-          `UPDATE agents SET active = 0 WHERE name = ? AND workspace_id = ? AND active = 1`,
-        )
-        .run(targetName, auth.workspace_id);
+      // Deactivate agent + revoke all OAuth tokens in one transaction
+      const txn = db.transaction(() => {
+        const agent = db
+          .prepare(
+            `SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1`,
+          )
+          .get(targetName, auth.workspace_id) as { id: string } | undefined;
 
-      if (info.changes === 0) {
-        throw new QoopiaError(
-          "NOT_FOUND",
-          `Active agent '${targetName}' not found in workspace`,
-        );
-      }
+        if (!agent) {
+          throw new QoopiaError(
+            "NOT_FOUND",
+            `Active agent '${targetName}' not found in workspace`,
+          );
+        }
+
+        db.prepare(`UPDATE agents SET active = 0 WHERE id = ?`).run(agent.id);
+
+        // Revoke all OAuth tokens for this agent
+        const revoked = db
+          .prepare(
+            `UPDATE oauth_tokens SET revoked = 1 WHERE agent_id = ? AND revoked = 0`,
+          )
+          .run(agent.id);
+
+        return { agent_id: agent.id, tokens_revoked: revoked.changes };
+      });
+      const result = txn();
 
       logActivity({
         workspace_id: auth.workspace_id,
         agent_id: auth.agent_id,
         action: "agent_deactivated",
         entity_type: "agent",
-        entity_id: null,
+        entity_id: result.agent_id,
         project_id: null,
-        summary: `Steward deactivated agent '${targetName}'`,
-        details: { agent_name: targetName },
+        summary: `Steward deactivated agent '${targetName}' (${result.tokens_revoked} OAuth tokens revoked)`,
+        details: { agent_name: targetName, tokens_revoked: result.tokens_revoked },
       });
 
-      return { deactivated: true, agent_name: targetName };
+      return { deactivated: true, agent_name: targetName, tokens_revoked: result.tokens_revoked };
     },
   },
 ];

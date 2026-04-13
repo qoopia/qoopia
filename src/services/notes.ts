@@ -113,37 +113,44 @@ export function createNote(input: NoteCreateInput) {
 
   const id = ulid();
   const now = nowIso();
-  db.prepare(
-    `INSERT INTO notes
-      (id, workspace_id, agent_id, type, text, metadata, project_id, task_bound_id, session_id, source, tags, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    input.workspace_id,
-    input.agent_id,
-    type,
-    input.text,
-    JSON.stringify(input.metadata || {}),
-    input.project_id || null,
-    input.task_bound_id || null,
-    input.session_id || null,
-    input.source || "mcp",
-    JSON.stringify(input.tags || []),
-    now,
-    now,
-  );
 
-  logActivity({
-    workspace_id: input.workspace_id,
-    agent_id: input.agent_id,
-    action: "created",
-    entity_type: "note",
-    entity_id: id,
-    project_id: input.project_id || null,
-    summary: `Created ${type}: ${input.text.slice(0, 80)}`,
-  });
+  // H6 fix: wrap insert + logActivity in a single transaction so partial failure
+  // never leaves the note created without an audit entry or vice versa.
+  const result = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO notes
+        (id, workspace_id, agent_id, type, text, metadata, project_id, task_bound_id, session_id, source, tags, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      input.workspace_id,
+      input.agent_id,
+      type,
+      input.text,
+      JSON.stringify(input.metadata || {}),
+      input.project_id || null,
+      input.task_bound_id || null,
+      input.session_id || null,
+      input.source || "mcp",
+      JSON.stringify(input.tags || []),
+      now,
+      now,
+    );
 
-  return { created: true, id, type, workspace_id: input.workspace_id, created_at: now };
+    logActivity({
+      workspace_id: input.workspace_id,
+      agent_id: input.agent_id,
+      action: "created",
+      entity_type: "note",
+      entity_id: id,
+      project_id: input.project_id || null,
+      summary: `Created ${type}: ${input.text.slice(0, 80)}`,
+    });
+
+    return { created: true, id, type, workspace_id: input.workspace_id, created_at: now };
+  })();
+
+  return result;
 }
 
 export function getNote(workspace_id: string, id: string) {
@@ -370,22 +377,27 @@ export function updateNote(input: NoteUpdateInput) {
   fields.push(`updated_at = ?`);
   values.push(now);
 
-  db.prepare(
-    `UPDATE notes SET ${fields.join(", ")} WHERE id = ? AND workspace_id = ?`,
-  ).run(...values, input.id, input.workspace_id);
+  // H6 fix: wrap update + logActivity atomically
+  const result = db.transaction(() => {
+    db.prepare(
+      `UPDATE notes SET ${fields.join(", ")} WHERE id = ? AND workspace_id = ?`,
+    ).run(...values, input.id, input.workspace_id);
 
-  logActivity({
-    workspace_id: input.workspace_id,
-    agent_id: input.agent_id,
-    action: "updated",
-    entity_type: "note",
-    entity_id: input.id,
-    project_id: existing.project_id,
-    summary: `Updated ${existing.type}: ${updated.join(", ")}`,
-    details: { fields_updated: updated },
-  });
+    logActivity({
+      workspace_id: input.workspace_id,
+      agent_id: input.agent_id,
+      action: "updated",
+      entity_type: "note",
+      entity_id: input.id,
+      project_id: existing.project_id,
+      summary: `Updated ${existing.type}: ${updated.join(", ")}`,
+      details: { fields_updated: updated },
+    });
 
-  return { updated: true, id: input.id, fields_updated: updated, updated_at: now };
+    return { updated: true, id: input.id, fields_updated: updated, updated_at: now };
+  })();
+
+  return result;
 }
 
 export function deleteNote(workspace_id: string, agent_id: string, id: string) {
@@ -399,19 +411,31 @@ export function deleteNote(workspace_id: string, agent_id: string, id: string) {
   if (!existing) throw new QoopiaError("NOT_FOUND", `note ${id} not found`);
 
   const now = nowIso();
-  db.prepare(
-    `UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND workspace_id = ?`,
-  ).run(now, now, id, workspace_id);
 
-  logActivity({
-    workspace_id,
-    agent_id,
-    action: "deleted",
-    entity_type: "note",
-    entity_id: id,
-    project_id: existing.project_id,
-    summary: `Deleted ${existing.type} ${id}`,
-  });
+  // H6 fix: wrap soft-delete + logActivity atomically
+  // M12 fix: remove from FTS index on soft-delete to prevent monotonic index growth
+  const result = db.transaction(() => {
+    db.prepare(
+      `UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND workspace_id = ?`,
+    ).run(now, now, id, workspace_id);
 
-  return { deleted: true, id };
+    // Remove from FTS index — find rowid via the notes row we just soft-deleted
+    db.prepare(
+      `DELETE FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?)`,
+    ).run(id);
+
+    logActivity({
+      workspace_id,
+      agent_id,
+      action: "deleted",
+      entity_type: "note",
+      entity_id: id,
+      project_id: existing.project_id,
+      summary: `Deleted ${existing.type} ${id}`,
+    });
+
+    return { deleted: true, id };
+  })();
+
+  return result;
 }

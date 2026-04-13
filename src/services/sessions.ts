@@ -25,9 +25,21 @@ export function saveMessage(input: SessionSaveInput) {
     throw new QoopiaError("SIZE_LIMIT", `content exceeds ${MAX_CONTENT} chars`);
   }
   assertNoSecrets(input.content, "session_message.content");
+  // C3 fix: check metadata for secrets before persisting
+  assertNoSecrets(JSON.stringify(input.metadata ?? {}), "session_message.metadata");
 
   const now = nowIso();
-  // Upsert session — H1 fix: on conflict only update last_active,
+
+  // H5 fix: check ownership BEFORE touching last_active.
+  // If the session already exists, verify it belongs to this agent.
+  const existing = db
+    .prepare(`SELECT agent_id FROM sessions WHERE id = ? AND workspace_id = ?`)
+    .get(input.session_id, input.workspace_id) as { agent_id: string } | undefined;
+  if (existing && existing.agent_id !== input.agent_id) {
+    throw new QoopiaError("FORBIDDEN", `session ${input.session_id} belongs to another agent`);
+  }
+
+  // Upsert session — on conflict only update last_active,
   // preserve original agent_id (prevents cross-agent session hijack)
   db.prepare(
     `INSERT INTO sessions (id, workspace_id, agent_id, created_at, last_active)
@@ -35,14 +47,6 @@ export function saveMessage(input: SessionSaveInput) {
      ON CONFLICT(id) DO UPDATE SET last_active = excluded.last_active
        WHERE workspace_id = excluded.workspace_id`,
   ).run(input.session_id, input.workspace_id, input.agent_id, now, now);
-
-  // H1 fix: verify session belongs to this agent (reject cross-agent writes)
-  const sess = db
-    .prepare(`SELECT agent_id FROM sessions WHERE id = ? AND workspace_id = ?`)
-    .get(input.session_id, input.workspace_id) as { agent_id: string } | undefined;
-  if (sess && sess.agent_id !== input.agent_id) {
-    throw new QoopiaError("FORBIDDEN", `session ${input.session_id} belongs to another agent`);
-  }
 
   const info = db
     .prepare(
@@ -206,11 +210,14 @@ export function sessionSearch(p: SessionSearchParams) {
   const params: any[] = [sanitized];
 
   if (scope === "all" && p.privileged) {
-    // no workspace filter
+    // no workspace filter — steward cross-workspace search
   } else {
     where.push(`sm.workspace_id = ?`);
     params.push(p.workspace_id);
-    if (scope === "own_agent") {
+    if (scope === "own_agent" || (scope === "workspace" && !p.privileged)) {
+      // H4 fix: standard agents can only search their own sessions.
+      // scope="workspace" for non-privileged is silently treated as "own_agent"
+      // to prevent cross-agent transcript exposure.
       where.push(`sm.agent_id = ?`);
       params.push(p.agent_id);
     }

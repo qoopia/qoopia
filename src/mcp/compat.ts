@@ -356,7 +356,19 @@ function v2List(args: Record<string, unknown>, auth: AuthContext) {
 function v2Get(args: Record<string, unknown>, auth: AuthContext) {
   const id = String(args.id || "");
   if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
-  return getNote(auth.workspace_id, id);
+  const note = getNote(auth.workspace_id, id);
+  // M11 fix: verify the fetched note type matches the requested entity discriminator
+  const entity = String(args.entity || "");
+  if (entity) {
+    const expectedType = ENTITY_TO_TYPE[entity] || entity;
+    if (note.type !== expectedType) {
+      throw new QoopiaError(
+        "NOT_FOUND",
+        `Entity ${id} is type '${note.type}', not '${entity}'`,
+      );
+    }
+  }
+  return note;
 }
 
 function v2Delete(args: Record<string, unknown>, auth: AuthContext) {
@@ -512,7 +524,7 @@ export function registerCompatTools(
 
   server.tool(
     "list",
-    "[V2 compat] List entities by type.",
+    "[V2 compat] List entities by type. Supported filters: project_id, status, entity_type (for activity), limit.",
     {
       entity: z.enum([
         "tasks",
@@ -524,9 +536,6 @@ export function registerCompatTools(
       ]),
       project_id: z.string().optional(),
       status: z.string().optional(),
-      assignee: z.string().optional(),
-      category: z.string().optional(),
-      type: z.string().optional(),
       entity_type: z.string().optional(),
       limit: z.number().int().optional(),
     },

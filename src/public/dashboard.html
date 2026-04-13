@@ -1045,7 +1045,7 @@ body {
     }
 
     el.innerHTML = notes.slice(0, 20).map((n, i) => {
-      const type = n.metadata?.type || 'note';
+      const type = n.type || 'note';
       const tc = NOTE_TYPE_COLORS[type] || NOTE_TYPE_COLORS.note;
       const time = fmtTime(n.created_at);
       const text = n.text || '';
@@ -1078,24 +1078,33 @@ body {
   }
 
   // ---- Agent ID resolution ----
+  // brief() returns agent_activity keyed by agent name, not ID.
+  // Build a reverse map: agent_name → agentId is not available, but we
+  // can display the name for known patterns by checking if agentId matches
+  // any agent_id stored in the agentActivity cache when available.
+  // For now, we match by returning the first name whose key is a substring
+  // of agentId (e.g. names often appear in log prefixes).
   function resolveAgent(agentId) {
     if (!agentId || !briefData?.agent_activity) return null;
-    // agent_activity keys are agent names, but we have agent_id
-    // We need to match — for now, check if agentId ends or starts with known agent names
-    // This is a workaround since brief doesn't return agent IDs
     const agents = briefData.agent_activity;
-    for (const [name, info] of Object.entries(agents)) {
-      // Can't resolve perfectly without an ID map, so we return based on known patterns
+    // Exact key match (if the log uses agent name as ID)
+    if (agents[agentId]) return agentId;
+    // Partial match: if agent name appears in the ID string
+    for (const name of Object.keys(agents)) {
+      if (agentId.toLowerCase().includes(name.toLowerCase())) return name;
     }
     return null;
   }
 
   // ---- Polling ----
+  let pollCycle = 0;
   function startPolling() {
     // Guard against double-timer (e.g. called after login when already polling)
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(async () => {
       try {
+        pollCycle++;
+        // Refresh activity every cycle; refresh full brief every 4 cycles (~2 min)
         const act = await mcp('activity_list', { limit: 10 });
         const newItems = (act.items || []);
         if (newItems.length) {
@@ -1105,6 +1114,15 @@ body {
             activityData = [...fresh, ...activityData];
             renderActivity();
           }
+        }
+        if (pollCycle % 4 === 0) {
+          // Refresh stats, tasks, deals from brief
+          const fresh = await mcp('brief', {});
+          briefData = fresh;
+          renderStats();
+          renderTasks();
+          renderDeals();
+          renderNotes();
         }
         setConn(true);
       } catch {

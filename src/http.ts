@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AsyncLocalStorage } from "node:async_hooks";
+import crypto from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
@@ -13,6 +14,7 @@ import {
   exchangeCodeForTokens,
   refreshTokens,
   revokeToken,
+  revokeTokenForClient,
   registerClient,
   getClient,
   clientWorkspace,
@@ -21,6 +23,28 @@ import { db } from "./db/connection.ts";
 import { env } from "./utils/env.ts";
 import { logger } from "./utils/logger.ts";
 import { apiLimiter, authLimiter } from "./utils/rate-limit.ts";
+
+// --- OAuth consent nonces ---
+// Server-generated one-time nonces for the consent form POST.
+// Keyed by nonce string, value holds the pending authorization parameters.
+interface ConsentNonce {
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  codeChallengeMethod: string;
+  state: string;
+  scope: string;
+  expires: number; // unix ms
+}
+const consentNonces = new Map<string, ConsentNonce>();
+const NONCE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function pruneNonces() {
+  const now = Date.now();
+  for (const [k, v] of consentNonces) {
+    if (v.expires < now) consentNonces.delete(k);
+  }
+}
 
 // --- CORS allowlist ---
 const ALLOWED_ORIGINS = new Set([
@@ -250,10 +274,6 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       res.end(JSON.stringify({ error: "too_many_requests" }));
       return;
     }
-    // Require admin secret for POST consent (prevents anonymous code issuance)
-    if (!checkAdminSecret(req)) {
-      return json(res, 401, { error: "unauthorized", error_description: "Admin secret required for consent approval" });
-    }
     const body = await readBody(req);
     return handleAuthorizePost(body, res);
   }
@@ -455,6 +475,20 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
     });
   }
 
+  // Generate a one-time nonce that authenticates the consent POST without
+  // requiring the admin secret in the browser form (fix for audit issue #1).
+  pruneNonces();
+  const nonce = crypto.randomUUID();
+  consentNonces.set(nonce, {
+    clientId,
+    redirectUri,
+    codeChallenge,
+    codeChallengeMethod,
+    state,
+    scope,
+    expires: Date.now() + NONCE_TTL_MS,
+  });
+
   const safeName = escapeHtml(client.name || "Unknown Client");
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -483,12 +517,7 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
     <p><span class="client">${safeName}</span> wants to connect to Qoopia</p>
     <p class="info">This will grant access to your notes, tasks, deals, contacts, finances, and session memory.</p>
     <form method="POST" action="/oauth/authorize">
-      <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
-      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
-      <input type="hidden" name="state" value="${escapeHtml(state)}">
-      <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
-      <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}">
-      <input type="hidden" name="scope" value="${escapeHtml(scope)}">
+      <input type="hidden" name="nonce" value="${escapeHtml(nonce)}">
       <div class="actions">
         <button type="submit" name="action" value="deny" class="deny">Deny</button>
         <button type="submit" name="action" value="approve" class="approve">Approve</button>
@@ -507,15 +536,22 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
 function handleAuthorizePost(body: Buffer, res: ServerResponse) {
   const form = parseForm(body);
   const action = form.action || "approve";
-  const clientId = form.client_id;
-  const redirectUri = form.redirect_uri;
-  const codeChallenge = form.code_challenge;
-  const codeChallengeMethod = form.code_challenge_method || "S256";
-  const state = form.state || "";
+  const nonce = form.nonce;
 
-  if (!clientId || !redirectUri || !codeChallenge) {
-    return json(res, 400, { error: "invalid_request" });
+  // Validate one-time nonce — this authenticates the consent POST without
+  // requiring the admin secret header from the browser form.
+  if (!nonce) {
+    return json(res, 400, { error: "invalid_request", error_description: "Missing nonce" });
   }
+  pruneNonces();
+  const pending = consentNonces.get(nonce);
+  if (!pending) {
+    return json(res, 400, { error: "invalid_request", error_description: "Invalid or expired nonce" });
+  }
+  // Consume nonce immediately (one-time use)
+  consentNonces.delete(nonce);
+
+  const { clientId, redirectUri, codeChallenge, codeChallengeMethod, state } = pending;
 
   if (action === "deny") {
     const url = new URL(redirectUri);
@@ -529,12 +565,6 @@ function handleAuthorizePost(body: Buffer, res: ServerResponse) {
   const client = getClient(clientId);
   if (!client) {
     return json(res, 400, { error: "invalid_client" });
-  }
-  if (!client.redirect_uris.includes(redirectUri)) {
-    return json(res, 400, {
-      error: "invalid_request",
-      error_description: "redirect_uri not registered",
-    });
   }
   const ws = clientWorkspace(clientId);
   if (!ws) {
@@ -603,13 +633,25 @@ function handleRegister(body: Buffer, res: ServerResponse) {
   }
 }
 
+function jsonToken(res: ServerResponse, status: number, body: unknown) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": String(Buffer.byteLength(payload)),
+    "cache-control": "no-store",
+    "pragma": "no-cache",
+    "x-content-type-options": "nosniff",
+  });
+  res.end(payload);
+}
+
 function handleToken(body: Buffer, res: ServerResponse) {
   const form = parseForm(body);
   const grantType = form.grant_type;
   try {
     if (grantType === "authorization_code") {
       if (!form.code || !form.code_verifier || !form.redirect_uri || !form.client_id) {
-        return json(res, 400, { error: "invalid_request" });
+        return jsonToken(res, 400, { error: "invalid_request" });
       }
       const out = exchangeCodeForTokens({
         code: form.code,
@@ -618,7 +660,7 @@ function handleToken(body: Buffer, res: ServerResponse) {
         clientId: form.client_id,
         clientSecret: form.client_secret,
       });
-      return json(res, 200, {
+      return jsonToken(res, 200, {
         access_token: out.access,
         refresh_token: out.refresh,
         token_type: "Bearer",
@@ -627,32 +669,37 @@ function handleToken(body: Buffer, res: ServerResponse) {
     }
     if (grantType === "refresh_token") {
       if (!form.refresh_token || !form.client_id) {
-        return json(res, 400, { error: "invalid_request" });
+        return jsonToken(res, 400, { error: "invalid_request" });
       }
       const out = refreshTokens({
         refreshToken: form.refresh_token,
         clientId: form.client_id,
         clientSecret: form.client_secret,
       });
-      return json(res, 200, {
+      return jsonToken(res, 200, {
         access_token: out.access,
         refresh_token: out.refresh,
         token_type: "Bearer",
         expires_in: out.expiresInSec,
       });
     }
-    return json(res, 400, { error: "unsupported_grant_type" });
+    return jsonToken(res, 400, { error: "unsupported_grant_type" });
   } catch (err) {
-    return json(res, 400, { error: (err as Error).message || "invalid_grant" });
+    return jsonToken(res, 400, { error: (err as Error).message || "invalid_grant" });
   }
 }
 
 function handleRevoke(body: Buffer, res: ServerResponse) {
   const form = parseForm(body);
   const token = form.token;
-  if (!token) return json(res, 400, { error: "invalid_request" });
-  revokeToken(token);
-  return json(res, 200, { revoked: true });
+  const clientId = form.client_id;
+  if (!token) return json(res, 400, { error: "invalid_request", error_description: "token is required" });
+  if (!clientId) return json(res, 400, { error: "invalid_request", error_description: "client_id is required" });
+  // Per RFC 7009: verify the token belongs to the requesting client before revoking.
+  // revokeTokenForClient returns false if token not found or belongs to another client.
+  const revoked = revokeTokenForClient(token, clientId);
+  // RFC 7009 §2.2: always return 200 even if token was not found (avoid enumeration)
+  return json(res, 200, { revoked });
 }
 
 function escapeHtml(s: string): string {

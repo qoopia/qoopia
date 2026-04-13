@@ -90,14 +90,7 @@ export function exchangeCodeForTokens(opts: {
   clientId: string;
   clientSecret?: string;
 }): { access: string; refresh: string; expiresInSec: number } {
-  const codeRow = findActiveToken(opts.code);
-  if (!codeRow || codeRow.token_type !== "code") {
-    throw new Error("invalid_grant");
-  }
-  if (codeRow.client_id !== opts.clientId) throw new Error("invalid_client");
-  if (codeRow.redirect_uri !== opts.redirectUri) throw new Error("invalid_grant");
-
-  // Validate client_secret for confidential clients
+  // Validate client_secret before entering the transaction (read-only check)
   const clientRow = getClient(opts.clientId);
   if (clientRow && clientRow.client_secret_hash) {
     if (!opts.clientSecret) throw new Error("invalid_client");
@@ -106,54 +99,68 @@ export function exchangeCodeForTokens(opts: {
     }
   }
 
-  // PKCE verify
-  const method = (codeRow.code_challenge_method || "S256").toUpperCase();
-  let computed: string;
-  if (method === "S256") {
-    computed = crypto
-      .createHash("sha256")
-      .update(opts.codeVerifier)
-      .digest("base64url");
-  } else {
-    computed = opts.codeVerifier;
-  }
-  if (computed !== codeRow.code_challenge) {
-    throw new Error("invalid_grant");
-  }
+  return db.transaction(() => {
+    const codeHash = sha256Hex(opts.code);
+    // Atomically revoke the code — only succeeds if it exists and is still active
+    const revokeInfo = db.prepare(
+      `UPDATE oauth_tokens SET revoked = 1
+       WHERE token_hash = ? AND revoked = 0 AND token_type = 'code'
+         AND expires_at > ? AND client_id = ?`,
+    ).run(codeHash, nowIso(), opts.clientId);
 
-  // Burn code
-  db.prepare(
-    `UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ?`,
-  ).run(codeRow.token_hash);
+    if (revokeInfo.changes !== 1) throw new Error("invalid_grant");
 
-  // Issue tokens
-  const access = genOpaque("qa");
-  const refresh = genOpaque("qr");
-  const now = nowIso();
-  const stmt = db.prepare(
-    `INSERT INTO oauth_tokens
-      (token_hash, client_id, agent_id, workspace_id, token_type, expires_at, revoked, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
-  );
-  stmt.run(
-    sha256Hex(access),
-    codeRow.client_id,
-    codeRow.agent_id,
-    codeRow.workspace_id,
-    "access",
-    plusSec(ACCESS_TTL_SEC),
-    now,
-  );
-  stmt.run(
-    sha256Hex(refresh),
-    codeRow.client_id,
-    codeRow.agent_id,
-    codeRow.workspace_id,
-    "refresh",
-    plusSec(REFRESH_TTL_SEC),
-    now,
-  );
-  return { access, refresh, expiresInSec: ACCESS_TTL_SEC };
+    // Fetch the code row we just revoked (for PKCE & redirect verification)
+    const codeRow = db.prepare(
+      `SELECT * FROM oauth_tokens WHERE token_hash = ?`,
+    ).get(codeHash) as OAuthTokenRecord | undefined;
+    if (!codeRow) throw new Error("invalid_grant");
+    if (codeRow.redirect_uri !== opts.redirectUri) throw new Error("invalid_grant");
+
+    // PKCE verify
+    const method = (codeRow.code_challenge_method || "S256").toUpperCase();
+    let computed: string;
+    if (method === "S256") {
+      computed = crypto
+        .createHash("sha256")
+        .update(opts.codeVerifier)
+        .digest("base64url");
+    } else {
+      computed = opts.codeVerifier;
+    }
+    if (computed !== codeRow.code_challenge) {
+      throw new Error("invalid_grant");
+    }
+
+    // Issue tokens
+    const access = genOpaque("qa");
+    const refresh = genOpaque("qr");
+    const now = nowIso();
+    const stmt = db.prepare(
+      `INSERT INTO oauth_tokens
+        (token_hash, client_id, agent_id, workspace_id, token_type, expires_at, revoked, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+    );
+    stmt.run(
+      sha256Hex(access),
+      codeRow.client_id,
+      codeRow.agent_id,
+      codeRow.workspace_id,
+      "access",
+      plusSec(ACCESS_TTL_SEC),
+      now,
+    );
+    stmt.run(
+      sha256Hex(refresh),
+      codeRow.client_id,
+      codeRow.agent_id,
+      codeRow.workspace_id,
+      "refresh",
+      plusSec(REFRESH_TTL_SEC),
+      now,
+    );
+    return { access, refresh, expiresInSec: ACCESS_TTL_SEC };
+  })();
 }
 
 export function refreshTokens(opts: {
@@ -161,11 +168,7 @@ export function refreshTokens(opts: {
   clientId: string;
   clientSecret?: string;
 }): { access: string; refresh: string; expiresInSec: number } {
-  const row = findActiveToken(opts.refreshToken);
-  if (!row || row.token_type !== "refresh") throw new Error("invalid_grant");
-  if (row.client_id !== opts.clientId) throw new Error("invalid_client");
-
-  // Validate client_secret for confidential clients
+  // Validate client_secret before entering the transaction (read-only check)
   const clientRow = getClient(opts.clientId);
   if (clientRow && clientRow.client_secret_hash) {
     if (!opts.clientSecret) throw new Error("invalid_client");
@@ -174,39 +177,51 @@ export function refreshTokens(opts: {
     }
   }
 
-  // Issue a fresh access token; reuse refresh (simpler) OR rotate it.
-  // We rotate for security — revoke old refresh.
-  db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ?`).run(
-    row.token_hash,
-  );
+  return db.transaction(() => {
+    const refreshHash = sha256Hex(opts.refreshToken);
+    // Atomically revoke the refresh token — only succeeds once
+    const revokeInfo = db.prepare(
+      `UPDATE oauth_tokens SET revoked = 1
+       WHERE token_hash = ? AND revoked = 0 AND token_type = 'refresh'
+         AND expires_at > ? AND client_id = ?`,
+    ).run(refreshHash, nowIso(), opts.clientId);
 
-  const access = genOpaque("qa");
-  const refresh = genOpaque("qr");
-  const now = nowIso();
-  const stmt = db.prepare(
-    `INSERT INTO oauth_tokens
-      (token_hash, client_id, agent_id, workspace_id, token_type, expires_at, revoked, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
-  );
-  stmt.run(
-    sha256Hex(access),
-    row.client_id,
-    row.agent_id,
-    row.workspace_id,
-    "access",
-    plusSec(ACCESS_TTL_SEC),
-    now,
-  );
-  stmt.run(
-    sha256Hex(refresh),
-    row.client_id,
-    row.agent_id,
-    row.workspace_id,
-    "refresh",
-    plusSec(REFRESH_TTL_SEC),
-    now,
-  );
-  return { access, refresh, expiresInSec: ACCESS_TTL_SEC };
+    if (revokeInfo.changes !== 1) throw new Error("invalid_grant");
+
+    // Fetch row for agent/workspace
+    const row = db.prepare(
+      `SELECT * FROM oauth_tokens WHERE token_hash = ?`,
+    ).get(refreshHash) as OAuthTokenRecord | undefined;
+    if (!row) throw new Error("invalid_grant");
+
+    const access = genOpaque("qa");
+    const refresh = genOpaque("qr");
+    const now = nowIso();
+    const stmt = db.prepare(
+      `INSERT INTO oauth_tokens
+        (token_hash, client_id, agent_id, workspace_id, token_type, expires_at, revoked, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+    );
+    stmt.run(
+      sha256Hex(access),
+      row.client_id,
+      row.agent_id,
+      row.workspace_id,
+      "access",
+      plusSec(ACCESS_TTL_SEC),
+      now,
+    );
+    stmt.run(
+      sha256Hex(refresh),
+      row.client_id,
+      row.agent_id,
+      row.workspace_id,
+      "refresh",
+      plusSec(REFRESH_TTL_SEC),
+      now,
+    );
+    return { access, refresh, expiresInSec: ACCESS_TTL_SEC };
+  })();
 }
 
 export function revokeToken(token: string): boolean {
@@ -214,6 +229,18 @@ export function revokeToken(token: string): boolean {
   const info = db
     .prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ?`)
     .run(hash);
+  return info.changes > 0;
+}
+
+/**
+ * Revoke a token only if it belongs to the specified client.
+ * Per RFC 7009: client must prove ownership before revocation.
+ */
+export function revokeTokenForClient(token: string, clientId: string): boolean {
+  const hash = sha256Hex(token);
+  const info = db
+    .prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ? AND client_id = ?`)
+    .run(hash, clientId);
   return info.changes > 0;
 }
 
