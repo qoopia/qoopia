@@ -62,7 +62,7 @@ export function brief(p: BriefParams) {
   }
   if (p.agent) {
     extra.push(
-      `agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ?)`,
+      `agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1)`,
     );
     extraParams.push(p.agent, p.workspace_id);
   }
@@ -150,17 +150,22 @@ export function brief(p: BriefParams) {
     .get(p.workspace_id, ...extraParams) as { c: number };
 
   // Agent activity — M3 fix: apply agent filter consistently when specified
+  // When project filter is active, notes_today is scoped to that project for consistency.
   const agentActivityWhere: string[] = [`a.workspace_id = ?`, `a.active = 1`];
   const agentActivityParams: any[] = [p.workspace_id];
   if (p.agent) {
     agentActivityWhere.push(`a.name = ?`);
     agentActivityParams.push(p.agent);
   }
+  const notesTodayProjectFilter = projectId
+    ? `AND n.project_id = '${projectId.replace(/'/g, "''")}'`
+    : "";
   const agents = db
     .prepare(
       `SELECT a.id, a.name, a.last_seen,
          (SELECT COUNT(*) FROM notes n WHERE n.agent_id = a.id AND n.workspace_id = a.workspace_id
-           AND n.deleted_at IS NULL AND datetime(n.created_at) >= datetime('now', '-1 day')) as notes_today
+           AND n.deleted_at IS NULL AND datetime(n.created_at) >= datetime('now', '-1 day')
+           ${notesTodayProjectFilter}) as notes_today
        FROM agents a WHERE ${agentActivityWhere.join(" AND ")}
        ORDER BY a.last_seen DESC`,
     )

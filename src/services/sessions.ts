@@ -30,67 +30,70 @@ export function saveMessage(input: SessionSaveInput) {
 
   const now = nowIso();
 
-  // H5 fix: check ownership BEFORE touching last_active.
-  // If the session already exists, verify it belongs to this agent.
-  const existing = db
-    .prepare(`SELECT agent_id FROM sessions WHERE id = ? AND workspace_id = ?`)
-    .get(input.session_id, input.workspace_id) as { agent_id: string } | undefined;
-  if (existing && existing.agent_id !== input.agent_id) {
-    throw new QoopiaError("FORBIDDEN", `session ${input.session_id} belongs to another agent`);
-  }
+  // Wrap all operations in a transaction so partial failure is impossible.
+  return db.transaction(() => {
+    // H5 fix: check ownership BEFORE touching last_active.
+    // If the session already exists, verify it belongs to this agent.
+    const existing = db
+      .prepare(`SELECT agent_id FROM sessions WHERE id = ? AND workspace_id = ?`)
+      .get(input.session_id, input.workspace_id) as { agent_id: string } | undefined;
+    if (existing && existing.agent_id !== input.agent_id) {
+      throw new QoopiaError("FORBIDDEN", `session ${input.session_id} belongs to another agent`);
+    }
 
-  // Upsert session — on conflict only update last_active,
-  // preserve original agent_id (prevents cross-agent session hijack)
-  db.prepare(
-    `INSERT INTO sessions (id, workspace_id, agent_id, created_at, last_active)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET last_active = excluded.last_active
-       WHERE workspace_id = excluded.workspace_id`,
-  ).run(input.session_id, input.workspace_id, input.agent_id, now, now);
+    // Upsert session — on conflict only update last_active,
+    // preserve original agent_id (prevents cross-agent session hijack)
+    db.prepare(
+      `INSERT INTO sessions (id, workspace_id, agent_id, created_at, last_active)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET last_active = excluded.last_active
+         WHERE workspace_id = excluded.workspace_id`,
+    ).run(input.session_id, input.workspace_id, input.agent_id, now, now);
 
-  // CRITICAL: Defensive cross-workspace check.
-  // If session_id exists in the DB but belongs to a different workspace (ON CONFLICT DO NOTHING
-  // silently skipped the insert), session_messages would still insert via FK on sessions.id only.
-  // This check catches that and prevents cross-workspace corruption.
-  const ownerRow = db
-    .prepare(`SELECT workspace_id FROM sessions WHERE id = ?`)
-    .get(input.session_id) as { workspace_id: string } | undefined;
-  if (!ownerRow) {
-    throw new QoopiaError("INTERNAL", "session upsert failed unexpectedly");
-  }
-  if (ownerRow.workspace_id !== input.workspace_id) {
-    throw new QoopiaError(
-      "FORBIDDEN",
-      `session_id collision: owned by another workspace`,
-    );
-  }
+    // CRITICAL: Defensive cross-workspace check.
+    // If session_id exists in the DB but belongs to a different workspace (ON CONFLICT DO NOTHING
+    // silently skipped the insert), session_messages would still insert via FK on sessions.id only.
+    // This check catches that and prevents cross-workspace corruption.
+    const ownerRow = db
+      .prepare(`SELECT workspace_id FROM sessions WHERE id = ?`)
+      .get(input.session_id) as { workspace_id: string } | undefined;
+    if (!ownerRow) {
+      throw new QoopiaError("INTERNAL", "session upsert failed unexpectedly");
+    }
+    if (ownerRow.workspace_id !== input.workspace_id) {
+      throw new QoopiaError(
+        "FORBIDDEN",
+        `session_id collision: owned by another workspace`,
+      );
+    }
 
-  const info = db
-    .prepare(
-      `INSERT INTO session_messages
-        (workspace_id, session_id, agent_id, role, content, metadata, token_count, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      input.workspace_id,
-      input.session_id,
-      input.agent_id,
-      input.role,
-      input.content,
-      JSON.stringify(input.metadata || {}),
-      input.token_count ?? null,
-      now,
-    );
+    const info = db
+      .prepare(
+        `INSERT INTO session_messages
+          (workspace_id, session_id, agent_id, role, content, metadata, token_count, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.workspace_id,
+        input.session_id,
+        input.agent_id,
+        input.role,
+        input.content,
+        JSON.stringify(input.metadata || {}),
+        input.token_count ?? null,
+        now,
+      );
 
-  const id = Number(info.lastInsertRowid);
+    const id = Number(info.lastInsertRowid);
 
-  const seqRow = db
-    .prepare(
-      `SELECT COUNT(*) as c FROM session_messages WHERE session_id = ? AND workspace_id = ?`,
-    )
-    .get(input.session_id, input.workspace_id) as { c: number };
+    const seqRow = db
+      .prepare(
+        `SELECT COUNT(*) as c FROM session_messages WHERE session_id = ? AND workspace_id = ?`,
+      )
+      .get(input.session_id, input.workspace_id) as { c: number };
 
-  return { saved: true, id, session_id: input.session_id, seq: seqRow.c };
+    return { saved: true, id, session_id: input.session_id, seq: seqRow.c };
+  })();
 }
 
 export interface SessionRecentParams {

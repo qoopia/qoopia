@@ -203,7 +203,7 @@ export function listNotes(p: NoteListParams) {
   }
   if (p.agent) {
     where.push(
-      `agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ?)`,
+      `agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1)`,
     );
     params.push(p.agent, p.workspace_id);
   }
@@ -383,13 +383,16 @@ export function updateNote(input: NoteUpdateInput) {
       `UPDATE notes SET ${fields.join(", ")} WHERE id = ? AND workspace_id = ?`,
     ).run(...values, input.id, input.workspace_id);
 
+    // Use the new project_id if it was changed, otherwise keep the existing one
+    const effectiveProjectId =
+      input.project_id !== undefined ? input.project_id : existing.project_id;
     logActivity({
       workspace_id: input.workspace_id,
       agent_id: input.agent_id,
       action: "updated",
       entity_type: "note",
       entity_id: input.id,
-      project_id: existing.project_id,
+      project_id: effectiveProjectId,
       summary: `Updated ${existing.type}: ${updated.join(", ")}`,
       details: { fields_updated: updated },
     });

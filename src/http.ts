@@ -405,13 +405,20 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
  */
 function checkAdminSecret(req: IncomingMessage): boolean {
   if (!env.ADMIN_SECRET) return false;
+  const expected = Buffer.from(env.ADMIN_SECRET);
   const authHeader = req.headers["authorization"] as string | undefined;
   if (authHeader) {
     const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    if (bearer && bearer === env.ADMIN_SECRET) return true;
+    if (bearer) {
+      const provided = Buffer.from(bearer);
+      if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return true;
+    }
   }
   const xSecret = req.headers["x-admin-secret"] as string | undefined;
-  if (xSecret && xSecret === env.ADMIN_SECRET) return true;
+  if (xSecret) {
+    const provided = Buffer.from(xSecret);
+    if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return true;
+  }
   return false;
 }
 

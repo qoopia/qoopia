@@ -74,7 +74,7 @@ export function listActivity(p: ActivityListParams) {
   }
   if (p.agent) {
     where.push(
-      `a.agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ?)`,
+      `a.agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1)`,
     );
     params.push(p.agent, p.workspace_id);
   }

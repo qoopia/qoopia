@@ -287,6 +287,20 @@ export function registerClient(input: {
   if (!Array.isArray(input.redirect_uris) || input.redirect_uris.length === 0) {
     throw new Error("redirect_uris must be a non-empty array");
   }
+  for (const uri of input.redirect_uris) {
+    if (typeof uri !== "string") {
+      throw new Error(`Invalid redirect URI: must be a string`);
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(uri);
+    } catch {
+      throw new Error(`Invalid redirect URI: ${uri}`);
+    }
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      throw new Error(`Invalid redirect URI scheme: ${uri} (only http/https allowed)`);
+    }
+  }
   // Guard: if multiple workspaces exist, explicit workspace binding is required.
   // This prevents implicit binding to the wrong workspace in multi-workspace deployments.
   const wsCount = (db
@@ -325,7 +339,7 @@ export function registerClient(input: {
   let client_secret: string | undefined;
   let secretHash = "";
   if (!isPublic) {
-    client_secret = crypto.randomBytes(32).toString("base64url");
+    client_secret = `qcs_${crypto.randomBytes(32).toString("base64url")}`;
     secretHash = sha256Hex(client_secret);
   }
 

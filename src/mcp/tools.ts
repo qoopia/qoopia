@@ -52,8 +52,10 @@ function fail(err: unknown) {
   } else if (err instanceof Error) {
     // M4 fix: log internal errors server-side, return stable generic message
     const raw = err.message;
-    // Translate known SQLite constraint errors to domain errors
-    if (raw.includes("UNIQUE constraint failed") && raw.includes("steward")) {
+    // Translate SQLite busy/lock errors into retryable domain error
+    if (raw.includes("SQLITE_BUSY") || raw.includes("database is locked")) {
+      msg = "BUSY: Database busy, please retry";
+    } else if (raw.includes("UNIQUE constraint failed") && raw.includes("steward")) {
       msg = "CONFLICT: active steward already exists";
     } else if (raw.includes("UNIQUE constraint failed")) {
       msg = "CONFLICT: a record with the same identifier already exists";
@@ -431,8 +433,11 @@ export function registerTools(
     }
   }
 
-  // V2 backward-compatibility aliases (always on, both profiles)
-  registerCompatTools(server, authProvider);
+  // V2 backward-compatibility aliases: skip for memory-only profile to avoid
+  // re-exposing CRUD operations that memory profile is supposed to restrict.
+  if (profile !== "memory") {
+    registerCompatTools(server, authProvider);
+  }
 }
 
 export function toolNames(profile: ToolProfile = "full"): string[] {

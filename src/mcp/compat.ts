@@ -34,8 +34,6 @@ import {
   updateNote,
   deleteNote,
 } from "../services/notes.ts";
-import { recall as recallService } from "../services/recall.ts";
-import { brief as briefService } from "../services/brief.ts";
 import { logActivity, listActivity } from "../services/activity.ts";
 
 // V2 plural entity → V3 singular type
@@ -58,7 +56,10 @@ function fail(err: unknown) {
   } else if (err instanceof Error) {
     // M4 fix: log internal errors server-side, return stable generic message
     const raw = err.message;
-    if (raw.includes("UNIQUE constraint failed") && raw.includes("steward")) {
+    // Translate SQLite busy/lock errors into retryable domain error
+    if (raw.includes("SQLITE_BUSY") || raw.includes("database is locked")) {
+      msg = "BUSY: Database busy, please retry";
+    } else if (raw.includes("UNIQUE constraint failed") && raw.includes("steward")) {
       msg = "CONFLICT: active steward already exists";
     } else if (raw.includes("UNIQUE constraint failed")) {
       msg = "CONFLICT: a record with the same identifier already exists";
@@ -244,6 +245,16 @@ function v2Update(args: Record<string, unknown>, auth: AuthContext) {
   const id = String(args.id || "");
   if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
 
+  // Entity type check: verify the note's type matches what caller expects
+  const existingForCheck = getNote(auth.workspace_id, id);
+  const expectedType = ENTITY_TO_TYPE[entity] || entity;
+  if (existingForCheck.type !== expectedType) {
+    throw new QoopiaError(
+      "INVALID_INPUT",
+      `Entity type mismatch: note ${id} is '${existingForCheck.type}', not '${entity}'`,
+    );
+  }
+
   // Build a metadata patch from known typed fields. Anything that maps to
   // V2 metadata for the relevant entity is included; missing fields stay
   // untouched (V3 updateNote does a shallow merge).
@@ -387,6 +398,20 @@ function v2Get(args: Record<string, unknown>, auth: AuthContext) {
 function v2Delete(args: Record<string, unknown>, auth: AuthContext) {
   const id = String(args.id || "");
   if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
+
+  // Entity type check: verify the note's type matches what caller expects
+  const entity = String(args.entity || "");
+  if (entity) {
+    const note = getNote(auth.workspace_id, id);
+    const expectedType = ENTITY_TO_TYPE[entity] || entity;
+    if (note.type !== expectedType) {
+      throw new QoopiaError(
+        "INVALID_INPUT",
+        `Entity type mismatch: note ${id} is '${note.type}', not '${entity}'`,
+      );
+    }
+  }
+
   return deleteNote(auth.workspace_id, auth.agent_id, id);
 }
 
@@ -432,34 +457,6 @@ function v2Note(args: Record<string, unknown>, auth: AuthContext) {
     },
     session_id: (args.session_id as string) || null,
     project_id: projectId,
-  });
-}
-
-function v2Recall(args: Record<string, unknown>, auth: AuthContext) {
-  const privileged = auth.type === "claude-privileged";
-  // V2 'entities' is comma-separated string ("tasks,deals"). V3 has type filter.
-  // We only honour single-type filter — if V2 passes multiple entities, drop the filter.
-  let typeFilter: string | undefined;
-  const ent = args.entities;
-  if (typeof ent === "string") {
-    const parts = ent.split(",").map((s) => s.trim()).filter(Boolean);
-    if (parts.length === 1) typeFilter = ENTITY_TO_TYPE[parts[0]!] || parts[0];
-  }
-  return recallService({
-    workspace_id: auth.workspace_id,
-    query: String(args.query || ""),
-    limit: args.limit as number | undefined,
-    type: (args.type as string) || typeFilter,
-    privileged,
-  });
-}
-
-function v2Brief(args: Record<string, unknown>, auth: AuthContext) {
-  // V2 had agent_name (the calling agent's name) and agent (filter). V3 only has agent.
-  return briefService({
-    workspace_id: auth.workspace_id,
-    project: args.project as string | undefined,
-    agent: (args.agent as string) || (args.agent_name as string) || undefined,
   });
 }
 

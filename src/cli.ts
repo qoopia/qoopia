@@ -130,7 +130,12 @@ async function main() {
       }
       case "backup": {
         const to = arg("to", path.join(env.BACKUP_DIR, `qoopia-manual-${Date.now()}.db`));
-        db.exec(`VACUUM INTO '${to!.replace(/'/g, "''")}'`);
+        // Validate path to avoid dynamic SQL injection — only allow safe characters
+        if (!/^[a-zA-Z0-9/_.\-~]+$/.test(to!)) {
+          console.error(`Backup path contains unsafe characters: ${to}`);
+          process.exit(1);
+        }
+        db.prepare("VACUUM INTO ?").run(to as string);
         console.log(`Backup written to ${to}`);
         return;
       }

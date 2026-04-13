@@ -5,13 +5,14 @@
  */
 import { QoopiaError } from "./errors.ts";
 
-const API_KEY_RE = /q_[A-Za-z0-9_\-]{32,}/;
+// Matches: q_ (API keys), qa_ (access tokens), qr_ (refresh tokens), qc_ (auth codes/client IDs), qcs_ (OAuth client secrets)
+const SECRET_RE = /(?:q_|qa_|qr_|qc_|qcs_)[A-Za-z0-9_\-]{16,}/;
 
 export function assertNoSecrets(text: string, context: string): void {
-  if (API_KEY_RE.test(text)) {
+  if (SECRET_RE.test(text)) {
     throw new QoopiaError(
       "INVALID_INPUT",
-      `API key pattern detected in ${context} — refused. Never store plaintext keys in Qoopia.`,
+      `Secret pattern detected in ${context} — refused. Never store plaintext keys/tokens in Qoopia.`,
     );
   }
 }

@@ -67,7 +67,7 @@ export function rotateAgentKey(name: string, workspaceSlug: string): string {
     .get(workspaceSlug) as { id: string } | undefined;
   if (!ws) throw new QoopiaError("NOT_FOUND", `workspace ${workspaceSlug} not found`);
   const a = db
-    .prepare(`SELECT id FROM agents WHERE name = ? AND workspace_id = ?`)
+    .prepare(`SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1`)
     .get(name, ws.id) as { id: string } | undefined;
   if (!a) throw new QoopiaError("NOT_FOUND", `agent ${name} not found`);
   const newKey = generateApiKey();
@@ -103,7 +103,7 @@ export function deleteAgent(name: string, workspaceSlug: string) {
     .get(workspaceSlug) as { id: string } | undefined;
   if (!ws) throw new QoopiaError("NOT_FOUND", `workspace ${workspaceSlug} not found`);
   const agent = db
-    .prepare(`SELECT id FROM agents WHERE name = ? AND workspace_id = ?`)
+    .prepare(`SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1`)
     .get(name, ws.id) as { id: string } | undefined;
   if (!agent) throw new QoopiaError("NOT_FOUND", `agent ${name} not found`);
 
