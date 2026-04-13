@@ -144,16 +144,22 @@ export function brief(p: BriefParams) {
     )
     .get(p.workspace_id, ...extraParams) as { c: number };
 
-  // Agent activity
+  // Agent activity — M3 fix: apply agent filter consistently when specified
+  const agentActivityWhere: string[] = [`a.workspace_id = ?`, `a.active = 1`];
+  const agentActivityParams: any[] = [p.workspace_id];
+  if (p.agent) {
+    agentActivityWhere.push(`a.name = ?`);
+    agentActivityParams.push(p.agent);
+  }
   const agents = db
     .prepare(
       `SELECT a.id, a.name, a.last_seen,
          (SELECT COUNT(*) FROM notes n WHERE n.agent_id = a.id AND n.workspace_id = a.workspace_id
            AND n.deleted_at IS NULL AND n.created_at >= datetime('now', '-1 day')) as notes_today
-       FROM agents a WHERE a.workspace_id = ? AND a.active = 1
+       FROM agents a WHERE ${agentActivityWhere.join(" AND ")}
        ORDER BY a.last_seen DESC`,
     )
-    .all(p.workspace_id) as Array<{
+    .all(...agentActivityParams) as Array<{
     id: string;
     name: string;
     last_seen: string | null;

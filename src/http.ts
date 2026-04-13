@@ -1,4 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server.ts";
@@ -42,13 +45,21 @@ export function getCurrentAuth(): AuthContext | null {
 }
 
 // --- Client IP extraction ---
+// Only trust cf-connecting-ip from actual Cloudflare (remote is loopback or private).
+// On a direct connection, use socket address to prevent header spoofing.
 function getClientIp(req: IncomingMessage): string {
-  return (
-    (req.headers["cf-connecting-ip"] as string) ||
-    (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
-    req.socket?.remoteAddress ||
-    "unknown"
-  );
+  const remote = req.socket?.remoteAddress || "unknown";
+  const isLocal = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+  if (isLocal) {
+    // Traffic via Cloudflare tunnel (cloudflared connects locally)
+    return (
+      (req.headers["cf-connecting-ip"] as string) ||
+      (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+      remote
+    );
+  }
+  // Direct connection — don't trust proxy headers
+  return remote;
 }
 
 /**
@@ -70,9 +81,17 @@ interface NodeReqWithBody extends IncomingMessage {
   _body?: Buffer;
 }
 
+const MAX_BODY_BYTES = 1_048_576; // 1 MB
+
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
+    total += (chunk as Buffer).length;
+    if (total > MAX_BODY_BYTES) {
+      req.destroy();
+      throw new Error("payload_too_large");
+    }
     chunks.push(chunk as Buffer);
   }
   return Buffer.concat(chunks);
@@ -134,9 +153,14 @@ export function startHttpServer() {
     try {
       await handleRequest(req as NodeReqWithBody, res);
     } catch (err) {
-      logger.error("Request handler failed", { error: String(err) });
+      const msg = (err as Error).message || "";
       if (!res.headersSent) {
-        json(res, 500, { error: "internal_error" });
+        if (msg === "payload_too_large") {
+          json(res, 413, { error: "payload_too_large", max_bytes: MAX_BODY_BYTES });
+        } else {
+          logger.error("Request handler failed", { error: String(err) });
+          json(res, 500, { error: "internal_error" });
+        }
       }
     }
   });
@@ -193,9 +217,14 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     return text(
       res,
       200,
-      `Qoopia V3.0 MCP server\nMCP endpoint: ${env.PUBLIC_URL}/mcp\nHealth: ${env.PUBLIC_URL}/health\n`,
+      `Qoopia V3.0 MCP server\nMCP endpoint: ${env.PUBLIC_URL}/mcp\nHealth: ${env.PUBLIC_URL}/health\nDashboard: ${env.PUBLIC_URL}/dashboard\n`,
       req,
     );
+  }
+
+  // --- Dashboard ---
+  if (url === "/dashboard") {
+    return serveDashboard(res);
   }
 
   // --- OAuth discovery ---
@@ -221,6 +250,10 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       res.end(JSON.stringify({ error: "too_many_requests" }));
       return;
     }
+    // Require admin secret for POST consent (prevents anonymous code issuance)
+    if (!checkAdminSecret(req)) {
+      return json(res, 401, { error: "unauthorized", error_description: "Admin secret required for consent approval" });
+    }
     const body = await readBody(req);
     return handleAuthorizePost(body, res);
   }
@@ -239,6 +272,10 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       res.end(JSON.stringify({ error: "too_many_requests" }));
       return;
     }
+    // Require admin secret for client registration (prevents anonymous self-service)
+    if (!checkAdminSecret(req)) {
+      return json(res, 401, { error: "unauthorized", error_description: "Admin secret required for client registration" });
+    }
     const body = await readBody(req);
     return handleRegister(body, res);
   }
@@ -253,6 +290,30 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   }
 
   return json(res, 404, { error: "not_found" }, req);
+}
+
+// ---------- Dashboard ----------
+
+let dashboardHtml: string | null = null;
+
+function serveDashboard(res: ServerResponse) {
+  if (!dashboardHtml) {
+    try {
+      const thisDir = typeof __dirname !== "undefined"
+        ? __dirname
+        : dirname(fileURLToPath(import.meta.url));
+      dashboardHtml = readFileSync(join(thisDir, "public", "dashboard.html"), "utf8");
+    } catch {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("Dashboard not found");
+      return;
+    }
+  }
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-cache",
+  });
+  res.end(dashboardHtml);
 }
 
 // ---------- MCP handler ----------
@@ -304,12 +365,35 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
     });
 
     await server.connect(transport);
-    const parsedBody = body && body.length > 0 ? JSON.parse(body.toString("utf8")) : undefined;
+    let parsedBody: unknown;
+    if (body && body.length > 0) {
+      try {
+        parsedBody = JSON.parse(body.toString("utf8"));
+      } catch {
+        return json(res, 400, { error: "invalid_json", message: "Request body is not valid JSON" }, req);
+      }
+    }
     await transport.handleRequest(req, res, parsedBody);
   });
 }
 
 // ---------- OAuth handlers ----------
+
+/**
+ * Check that the request carries the admin secret (Bearer or X-Admin-Secret header).
+ * If ADMIN_SECRET is not configured, returns false (deny-by-default).
+ */
+function checkAdminSecret(req: IncomingMessage): boolean {
+  if (!env.ADMIN_SECRET) return false;
+  const authHeader = req.headers["authorization"] as string | undefined;
+  if (authHeader) {
+    const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (bearer && bearer === env.ADMIN_SECRET) return true;
+  }
+  const xSecret = req.headers["x-admin-secret"] as string | undefined;
+  if (xSecret && xSecret === env.ADMIN_SECRET) return true;
+  return false;
+}
 
 function parseForm(body: Buffer): Record<string, string> {
   const out: Record<string, string> = {};
@@ -532,6 +616,7 @@ function handleToken(body: Buffer, res: ServerResponse) {
         codeVerifier: form.code_verifier,
         redirectUri: form.redirect_uri,
         clientId: form.client_id,
+        clientSecret: form.client_secret,
       });
       return json(res, 200, {
         access_token: out.access,
@@ -547,6 +632,7 @@ function handleToken(body: Buffer, res: ServerResponse) {
       const out = refreshTokens({
         refreshToken: form.refresh_token,
         clientId: form.client_id,
+        clientSecret: form.client_secret,
       });
       return json(res, 200, {
         access_token: out.access,

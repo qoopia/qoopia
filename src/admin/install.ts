@@ -251,9 +251,9 @@ export async function install(opts: InstallOpts = {}) {
 
   // 8. Summary
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-  console.log("\n━━━━━━━━━━━━━━━��━━━━━━━━━━━━━��━━━━━━━━━━━━━━━");
-  console.log(`  INSTALLATION COMPLETE — ${elapsed} seconds`);
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+  console.log("\n---------------------------------------------");
+  console.log(`  INSTALLATION COMPLETE -- ${elapsed} seconds`);
+  console.log("---------------------------------------------\n");
   console.log(`  MCP URL:   http://localhost:${env.PORT}/mcp`);
   if (agentKey) {
     console.log(`\n  ${agentType === "steward" ? "Steward" : "Admin"} API key:  ${agentKey}`);

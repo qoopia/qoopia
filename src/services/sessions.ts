@@ -27,12 +27,22 @@ export function saveMessage(input: SessionSaveInput) {
   assertNoSecrets(input.content, "session_message.content");
 
   const now = nowIso();
-  // Upsert session
+  // Upsert session — H1 fix: on conflict only update last_active,
+  // preserve original agent_id (prevents cross-agent session hijack)
   db.prepare(
     `INSERT INTO sessions (id, workspace_id, agent_id, created_at, last_active)
      VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET last_active = excluded.last_active`,
+     ON CONFLICT(id) DO UPDATE SET last_active = excluded.last_active
+       WHERE workspace_id = excluded.workspace_id`,
   ).run(input.session_id, input.workspace_id, input.agent_id, now, now);
+
+  // H1 fix: verify session belongs to this agent (reject cross-agent writes)
+  const sess = db
+    .prepare(`SELECT agent_id FROM sessions WHERE id = ? AND workspace_id = ?`)
+    .get(input.session_id, input.workspace_id) as { agent_id: string } | undefined;
+  if (sess && sess.agent_id !== input.agent_id) {
+    throw new QoopiaError("FORBIDDEN", `session ${input.session_id} belongs to another agent`);
+  }
 
   const info = db
     .prepare(
@@ -99,13 +109,17 @@ export function sessionRecent(p: SessionRecentParams) {
 
   const sess = db
     .prepare(
-      `SELECT id, created_at, last_active FROM sessions WHERE id = ? AND workspace_id = ?`,
+      `SELECT id, agent_id, created_at, last_active FROM sessions WHERE id = ? AND workspace_id = ?`,
     )
     .get(sessionId, p.workspace_id) as
-    | { id: string; created_at: string; last_active: string }
+    | { id: string; agent_id: string; created_at: string; last_active: string }
     | undefined;
   if (!sess) {
     throw new QoopiaError("NOT_FOUND", `session ${sessionId} not found`);
+  }
+  // C3 fix: enforce agent ownership — agents cannot read each other's transcripts
+  if (sess.agent_id !== p.agent_id) {
+    throw new QoopiaError("FORBIDDEN", `session ${sessionId} belongs to another agent`);
   }
 
   const rows = db
@@ -275,13 +289,33 @@ export function sessionSummarize(input: SessionSummarizeInput) {
     throw new QoopiaError("INVALID_INPUT", "level must be between 1 and 10");
   }
 
+  assertNoSecrets(input.content, "summary.content");
+
   const sess = db
     .prepare(
-      `SELECT id FROM sessions WHERE id = ? AND workspace_id = ?`,
+      `SELECT id, agent_id FROM sessions WHERE id = ? AND workspace_id = ?`,
     )
-    .get(input.session_id, input.workspace_id);
+    .get(input.session_id, input.workspace_id) as { id: string; agent_id: string } | undefined;
   if (!sess) {
     throw new QoopiaError("NOT_FOUND", `session ${input.session_id} not found`);
+  }
+  // C3 fix: enforce agent ownership for summarize
+  if (sess.agent_id !== input.agent_id) {
+    throw new QoopiaError("FORBIDDEN", `session ${input.session_id} belongs to another agent`);
+  }
+
+  // H4 fix: validate that boundary messages belong to this session
+  const startMsg = db
+    .prepare(`SELECT id FROM session_messages WHERE id = ? AND session_id = ?`)
+    .get(input.msg_start_id, input.session_id) as { id: number } | undefined;
+  const endMsg = db
+    .prepare(`SELECT id FROM session_messages WHERE id = ? AND session_id = ?`)
+    .get(input.msg_end_id, input.session_id) as { id: number } | undefined;
+  if (!startMsg) {
+    throw new QoopiaError("INVALID_INPUT", `msg_start_id ${input.msg_start_id} not found in session`);
+  }
+  if (!endMsg) {
+    throw new QoopiaError("INVALID_INPUT", `msg_end_id ${input.msg_end_id} not found in session`);
   }
 
   const id = ulid();
@@ -311,6 +345,7 @@ export function sessionSummarize(input: SessionSummarizeInput) {
 
 export function sessionExpand(p: {
   workspace_id: string;
+  agent_id: string;
   start_id: number;
   end_id: number;
   session_id?: string;
@@ -320,6 +355,9 @@ export function sessionExpand(p: {
   }
   const where: string[] = [`workspace_id = ?`, `id BETWEEN ? AND ?`];
   const params: any[] = [p.workspace_id, p.start_id, p.end_id];
+  // H2 fix: filter by agent_id to prevent cross-agent transcript reads
+  where.push(`agent_id = ?`);
+  params.push(p.agent_id);
   if (p.session_id) {
     where.push(`session_id = ?`);
     params.push(p.session_id);

@@ -11,6 +11,7 @@ export const env = {
   LOG_LEVEL: (process.env.QOOPIA_LOG_LEVEL || "info") as "debug" | "info" | "warn" | "error",
   PUBLIC_URL: process.env.QOOPIA_PUBLIC_URL || `http://localhost:${parseInt(process.env.QOOPIA_PORT || "3737", 10)}`,
   OAUTH_ISSUER: process.env.QOOPIA_OAUTH_ISSUER || "",
+  ADMIN_SECRET: process.env.QOOPIA_ADMIN_SECRET || "",
   MAINTENANCE_HOUR: parseInt(process.env.QOOPIA_MAINTENANCE_HOUR || "4", 10),
   BACKUP_KEEP: parseInt(process.env.QOOPIA_BACKUP_KEEP || "7", 10),
   RETENTION_ACTIVITY_DAYS: parseInt(process.env.QOOPIA_RETENTION_ACTIVITY_DAYS || "90", 10),

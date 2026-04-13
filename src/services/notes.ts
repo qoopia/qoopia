@@ -87,16 +87,16 @@ export function createNote(input: NoteCreateInput) {
 
   const type = input.type || "note";
 
-  // Validate project_id references an existing project note
+  // Validate project_id references an existing project note (M1 fix: enforce type='project')
   if (input.project_id) {
     const p = db
       .prepare(
-        `SELECT id, type FROM notes WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`,
+        `SELECT id, type FROM notes WHERE id = ? AND workspace_id = ? AND type = 'project' AND deleted_at IS NULL`,
       )
       .get(input.project_id, input.workspace_id) as
       | { id: string; type: string }
       | undefined;
-    if (!p) throw new QoopiaError("NOT_FOUND", "project_id not found");
+    if (!p) throw new QoopiaError("NOT_FOUND", "project_id not found or not a project");
   }
   if (input.task_bound_id) {
     const t = db
@@ -147,9 +147,10 @@ export function createNote(input: NoteCreateInput) {
 }
 
 export function getNote(workspace_id: string, id: string) {
+  // H3 fix: exclude soft-deleted notes
   const r = db
     .prepare(
-      `SELECT * FROM notes WHERE id = ? AND workspace_id = ? LIMIT 1`,
+      `SELECT * FROM notes WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL LIMIT 1`,
     )
     .get(id, workspace_id) as NoteRow | undefined;
   if (!r) throw new QoopiaError("NOT_FOUND", `note ${id} not found`);
@@ -271,9 +272,10 @@ export interface NoteUpdateInput {
 }
 
 export function updateNote(input: NoteUpdateInput) {
+  // H2 fix: exclude soft-deleted notes, consistent with getNote
   const existing = db
     .prepare(
-      `SELECT * FROM notes WHERE id = ? AND workspace_id = ? LIMIT 1`,
+      `SELECT * FROM notes WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL LIMIT 1`,
     )
     .get(input.id, input.workspace_id) as NoteRow | undefined;
   if (!existing)
@@ -296,6 +298,30 @@ export function updateNote(input: NoteUpdateInput) {
   }
   if (input.metadata_replace) {
     assertNoSecrets(JSON.stringify(input.metadata_replace), "note.metadata");
+  }
+
+  // H2 fix: re-validate project_id and task_bound_id on update (same as create)
+  if (input.project_id !== undefined && input.project_id !== null) {
+    const p = db
+      .prepare(
+        `SELECT id, type FROM notes WHERE id = ? AND workspace_id = ? AND type = 'project' AND deleted_at IS NULL`,
+      )
+      .get(input.project_id, input.workspace_id) as
+      | { id: string; type: string }
+      | undefined;
+    if (!p) throw new QoopiaError("NOT_FOUND", "project_id not found or not a project");
+  }
+  if (input.task_bound_id !== undefined && input.task_bound_id !== null) {
+    const t = db
+      .prepare(
+        `SELECT id, type FROM notes WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`,
+      )
+      .get(input.task_bound_id, input.workspace_id) as
+      | { id: string; type: string }
+      | undefined;
+    if (!t) throw new QoopiaError("NOT_FOUND", "task_bound_id not found");
+    if (t.type !== "task")
+      throw new QoopiaError("INVALID_INPUT", "task_bound_id must reference a task");
   }
 
   const fields: string[] = [];

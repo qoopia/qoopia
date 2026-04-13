@@ -15,17 +15,8 @@ db.exec("PRAGMA synchronous = NORMAL");
 db.exec("PRAGMA busy_timeout = 5000");
 db.exec("PRAGMA foreign_keys = ON");
 
-export function runInTransaction<T>(fn: () => T): T {
-  db.exec("BEGIN");
-  try {
-    const result = fn();
-    db.exec("COMMIT");
-    return result;
-  } catch (err) {
-    db.exec("ROLLBACK");
-    throw err;
-  }
-}
+// Removed unsafe manual BEGIN/COMMIT runInTransaction.
+// Use db.transaction(fn)() directly — it is Bun-native and handles nesting correctly.
 
 export function closeDb() {
   try {

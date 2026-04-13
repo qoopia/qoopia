@@ -88,6 +88,7 @@ export function exchangeCodeForTokens(opts: {
   codeVerifier: string;
   redirectUri: string;
   clientId: string;
+  clientSecret?: string;
 }): { access: string; refresh: string; expiresInSec: number } {
   const codeRow = findActiveToken(opts.code);
   if (!codeRow || codeRow.token_type !== "code") {
@@ -95,6 +96,15 @@ export function exchangeCodeForTokens(opts: {
   }
   if (codeRow.client_id !== opts.clientId) throw new Error("invalid_client");
   if (codeRow.redirect_uri !== opts.redirectUri) throw new Error("invalid_grant");
+
+  // Validate client_secret for confidential clients
+  const clientRow = getClient(opts.clientId);
+  if (clientRow && clientRow.client_secret_hash) {
+    if (!opts.clientSecret) throw new Error("invalid_client");
+    if (sha256Hex(opts.clientSecret) !== clientRow.client_secret_hash) {
+      throw new Error("invalid_client");
+    }
+  }
 
   // PKCE verify
   const method = (codeRow.code_challenge_method || "S256").toUpperCase();
@@ -149,10 +159,20 @@ export function exchangeCodeForTokens(opts: {
 export function refreshTokens(opts: {
   refreshToken: string;
   clientId: string;
+  clientSecret?: string;
 }): { access: string; refresh: string; expiresInSec: number } {
   const row = findActiveToken(opts.refreshToken);
   if (!row || row.token_type !== "refresh") throw new Error("invalid_grant");
   if (row.client_id !== opts.clientId) throw new Error("invalid_client");
+
+  // Validate client_secret for confidential clients
+  const clientRow = getClient(opts.clientId);
+  if (clientRow && clientRow.client_secret_hash) {
+    if (!opts.clientSecret) throw new Error("invalid_client");
+    if (sha256Hex(opts.clientSecret) !== clientRow.client_secret_hash) {
+      throw new Error("invalid_client");
+    }
+  }
 
   // Issue a fresh access token; reuse refresh (simpler) OR rotate it.
   // We rotate for security — revoke old refresh.
@@ -221,16 +241,21 @@ export function registerClient(input: {
   if (!Array.isArray(input.redirect_uris) || input.redirect_uris.length === 0) {
     throw new Error("redirect_uris must be a non-empty array");
   }
-  // Prefer a claude-privileged agent (cross-workspace read capability for
-  // Claude.ai connector); fall back to first active agent.
+  // C1 fix: restrict to agents in the default workspace (single-user assumption).
+  // Prefer claude-privileged for Claude.ai connector; fall back to first active.
+  const defaultWs = db
+    .prepare(`SELECT id FROM workspaces ORDER BY created_at ASC LIMIT 1`)
+    .get() as { id: string } | undefined;
+  if (!defaultWs) throw new Error("No workspace configured");
+
   const agent = (db
     .prepare(
       `SELECT id, workspace_id FROM agents
-       WHERE active = 1
+       WHERE active = 1 AND workspace_id = ?
        ORDER BY (type = 'claude-privileged') DESC, created_at ASC
        LIMIT 1`,
     )
-    .get() as { id: string; workspace_id: string } | undefined);
+    .get(defaultWs.id) as { id: string; workspace_id: string } | undefined);
   if (!agent) throw new Error("No active agent available");
 
   const authMethod = input.token_endpoint_auth_method || "none";
@@ -309,11 +334,22 @@ export function clientWorkspace(client_id: string): {
 } | null {
   const c = getClient(client_id);
   if (!c) return null;
+  // C2 fix: only return workspace if agent is still active
   const a = db
-    .prepare(`SELECT id, workspace_id FROM agents WHERE id = ?`)
+    .prepare(`SELECT id, workspace_id FROM agents WHERE id = ? AND active = 1`)
     .get(c.agent_id) as { id: string; workspace_id: string } | undefined;
   if (!a) return null;
   return { agent_id: a.id, workspace_id: a.workspace_id };
+}
+
+/**
+ * Revoke all OAuth tokens for an agent (call on deactivation).
+ */
+export function revokeAllAgentTokens(agentId: string): number {
+  const info = db
+    .prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE agent_id = ? AND revoked = 0`)
+    .run(agentId);
+  return info.changes;
 }
 
 export function wellKnownAuthorizationServer() {

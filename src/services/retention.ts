@@ -32,8 +32,8 @@ export function runMaintenance(): { ok: boolean; report: Record<string, unknown>
     let notesPurged = 0;
     let sessionsPurged = 0;
     let messagesPurged = 0;
-    db.exec("BEGIN");
-    try {
+    // Use db.transaction() (Bun-native) instead of manual BEGIN/COMMIT
+    const purgeTaskBound = db.transaction(() => {
       for (const t of closed) {
         const delNotes = db
           .prepare(`DELETE FROM notes WHERE task_bound_id = ?`)
@@ -55,38 +55,40 @@ export function runMaintenance(): { ok: boolean; report: Record<string, unknown>
           .run(t.id);
         sessionsPurged += delSess.changes;
       }
-      db.exec("COMMIT");
-    } catch (e) {
-      db.exec("ROLLBACK");
-      throw e;
-    }
+    });
+    purgeTaskBound();
     report.task_bound_closed = closed.length;
     report.notes_purged = notesPurged;
     report.sessions_purged = sessionsPurged;
     report.messages_purged = messagesPurged;
 
     // 2. Idempotency keys
-    const now = nowIso();
+    // H3 fix: normalize both sides to datetime() to avoid ISO-8601 vs SQLite format mismatch
     const idemp = db
-      .prepare(`DELETE FROM idempotency_keys WHERE expires_at < ?`)
-      .run(now);
+      .prepare(`DELETE FROM idempotency_keys WHERE datetime(expires_at) < datetime('now')`)
+      .run();
     report.idempotency_keys_deleted = idemp.changes;
 
-    // 3. Old activity
+    // 3. Old activity — use datetime() on both sides for consistent comparison
     const activityDeleted = db
       .prepare(
-        `DELETE FROM activity WHERE created_at < datetime('now', ?)`,
+        `DELETE FROM activity WHERE datetime(created_at) < datetime('now', ?)`,
       )
       .run(`-${env.RETENTION_ACTIVITY_DAYS} days`);
     report.activity_deleted = activityDeleted.changes;
 
-    // 4. Expired oauth codes + access tokens
-    const oauthDeleted = db
+    // 4. Expired oauth tokens (codes, access, AND refresh) + revoked tokens older than 7 days
+    // H3 fix: normalize expires_at comparison via datetime()
+    const oauthExpired = db
+      .prepare(`DELETE FROM oauth_tokens WHERE datetime(expires_at) < datetime('now')`)
+      .run();
+    const oauthRevoked = db
       .prepare(
-        `DELETE FROM oauth_tokens WHERE expires_at < ? AND token_type IN ('code','access')`,
+        `DELETE FROM oauth_tokens WHERE revoked = 1 AND datetime(created_at) < datetime('now', '-7 days')`,
       )
-      .run(now);
-    report.oauth_expired_deleted = oauthDeleted.changes;
+      .run();
+    report.oauth_expired_deleted = oauthExpired.changes;
+    report.oauth_revoked_deleted = oauthRevoked.changes;
 
     // 5. Backup
     const backupName = `qoopia-${new Date().toISOString().slice(0, 10)}.db`;
@@ -94,7 +96,7 @@ export function runMaintenance(): { ok: boolean; report: Record<string, unknown>
     try {
       fs.mkdirSync(env.BACKUP_DIR, { recursive: true });
       if (fs.existsSync(backupPath)) fs.unlinkSync(backupPath);
-      db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
+      db.prepare(`VACUUM INTO ?`).run(backupPath);
       report.backup = backupPath;
 
       // 6. Rotate
