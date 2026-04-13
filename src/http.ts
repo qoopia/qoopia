@@ -13,7 +13,6 @@ import {
   createAuthorizationCode,
   exchangeCodeForTokens,
   refreshTokens,
-  revokeToken,
   revokeTokenForClient,
   registerClient,
   getClient,
@@ -74,15 +73,16 @@ export function getCurrentAuth(): AuthContext | null {
 function getClientIp(req: IncomingMessage): string {
   const remote = req.socket?.remoteAddress || "unknown";
   const isLocal = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
-  if (isLocal) {
-    // Traffic via Cloudflare tunnel (cloudflared connects locally)
+  // Only trust proxy headers when TRUST_PROXY=true (default) AND the connection
+  // arrives from loopback (i.e. through cloudflared or a local reverse proxy).
+  if (isLocal && env.TRUST_PROXY) {
     return (
       (req.headers["cf-connecting-ip"] as string) ||
       (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
       remote
     );
   }
-  // Direct connection — don't trust proxy headers
+  // Direct connection or TRUST_PROXY=false — use socket address only
   return remote;
 }
 
@@ -421,7 +421,16 @@ function parseForm(body: Buffer): Record<string, string> {
   for (const pair of s.split("&")) {
     const [k, v = ""] = pair.split("=");
     if (!k) continue;
-    out[decodeURIComponent(k)] = decodeURIComponent(v.replace(/\+/g, " "));
+    let key: string;
+    let val: string;
+    try {
+      key = decodeURIComponent(k);
+      val = decodeURIComponent(v.replace(/\+/g, " "));
+    } catch {
+      // Malformed percent-encoding — throw controlled 400 (caught by callers)
+      throw Object.assign(new Error("invalid_request"), { statusCode: 400 });
+    }
+    out[key] = val;
   }
   return out;
 }
@@ -534,7 +543,12 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
 }
 
 function handleAuthorizePost(body: Buffer, res: ServerResponse) {
-  const form = parseForm(body);
+  let form: Record<string, string>;
+  try {
+    form = parseForm(body);
+  } catch {
+    return json(res, 400, { error: "invalid_request", error_description: "malformed form body" });
+  }
   const action = form.action || "approve";
   const nonce = form.nonce;
 
@@ -646,7 +660,12 @@ function jsonToken(res: ServerResponse, status: number, body: unknown) {
 }
 
 function handleToken(body: Buffer, res: ServerResponse) {
-  const form = parseForm(body);
+  let form: Record<string, string>;
+  try {
+    form = parseForm(body);
+  } catch {
+    return jsonToken(res, 400, { error: "invalid_request" });
+  }
   const grantType = form.grant_type;
   try {
     if (grantType === "authorization_code") {
@@ -690,16 +709,29 @@ function handleToken(body: Buffer, res: ServerResponse) {
 }
 
 function handleRevoke(body: Buffer, res: ServerResponse) {
-  const form = parseForm(body);
+  let form: Record<string, string>;
+  try {
+    form = parseForm(body);
+  } catch {
+    return json(res, 400, { error: "invalid_request", error_description: "malformed form body" });
+  }
   const token = form.token;
   const clientId = form.client_id;
   if (!token) return json(res, 400, { error: "invalid_request", error_description: "token is required" });
   if (!clientId) return json(res, 400, { error: "invalid_request", error_description: "client_id is required" });
-  // Per RFC 7009: verify the token belongs to the requesting client before revoking.
-  // revokeTokenForClient returns false if token not found or belongs to another client.
-  const revoked = revokeTokenForClient(token, clientId);
-  // RFC 7009 §2.2: always return 200 even if token was not found (avoid enumeration)
-  return json(res, 200, { revoked });
+  // Per RFC 7009: confidential clients must supply client_secret.
+  // revokeTokenForClient validates the secret and throws "invalid_client" if wrong.
+  try {
+    const revoked = revokeTokenForClient(token, clientId, form.client_secret);
+    // RFC 7009 §2.2: always return 200 even if token was not found (avoid enumeration)
+    return json(res, 200, { revoked });
+  } catch (err) {
+    const msg = (err as Error).message || "";
+    if (msg === "invalid_client") {
+      return json(res, 401, { error: "invalid_client", error_description: "Client authentication failed" });
+    }
+    return json(res, 500, { error: "server_error" });
+  }
 }
 
 function escapeHtml(s: string): string {

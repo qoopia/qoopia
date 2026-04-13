@@ -913,17 +913,43 @@ body {
 
       const el = document.createElement('div');
       el.className = 'agent';
-      el.innerHTML = `
-        <div class="agent-row">
-          <div class="agent-avatar" style="background:${c.dim};color:${c.bg}">${cap(name)[0]}</div>
-          <div class="agent-name">${cap(name)}</div>
-          <div class="agent-online" style="background:${isOnline ? '#22c55e' : isRecent ? '#f59e0b' : '#334155'}"></div>
-        </div>
-        <div class="agent-meta">
-          <span>${notesToday} notes today</span>
-          <span class="agent-meta-val">${lastActive ? fmtTime(lastActive) : 'never'}</span>
-        </div>
-      `;
+
+      // Build DOM nodes instead of innerHTML to prevent XSS from agent names
+      const row = document.createElement('div');
+      row.className = 'agent-row';
+
+      const avatar = document.createElement('div');
+      avatar.className = 'agent-avatar';
+      avatar.style.cssText = `background:${c.dim};color:${c.bg}`;
+      avatar.textContent = cap(name)[0];
+
+      const nameEl = document.createElement('div');
+      nameEl.className = 'agent-name';
+      nameEl.textContent = cap(name);
+
+      const online = document.createElement('div');
+      online.className = 'agent-online';
+      online.style.background = isOnline ? '#22c55e' : isRecent ? '#f59e0b' : '#334155';
+
+      row.appendChild(avatar);
+      row.appendChild(nameEl);
+      row.appendChild(online);
+
+      const meta = document.createElement('div');
+      meta.className = 'agent-meta';
+
+      const notesSpan = document.createElement('span');
+      notesSpan.textContent = notesToday + ' notes today';
+
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'agent-meta-val';
+      timeSpan.textContent = lastActive ? fmtTime(lastActive) : 'never';
+
+      meta.appendChild(notesSpan);
+      meta.appendChild(timeSpan);
+
+      el.appendChild(row);
+      el.appendChild(meta);
       grid.appendChild(el);
     });
   }
@@ -945,11 +971,12 @@ body {
       const summary = esc(a.summary || '');
       const action = a.action || '';
 
+      const safeAgentName = esc(cap(agentName));
       return `<div class="act-item">
-        <div class="act-icon" style="background:${c.dim};color:${c.bg}">${cap(agentName)[0]}</div>
+        <div class="act-icon" style="background:${c.dim};color:${c.bg}">${esc(cap(agentName)[0])}</div>
         <div class="act-content">
           <div class="act-top">
-            <span class="act-agent" style="color:${c.bg}">${cap(agentName)}</span>
+            <span class="act-agent" style="color:${c.bg}">${safeAgentName}</span>
             ${action ? `<span class="act-action">${esc(action)}</span>` : ''}
             <span class="act-time">${time}</span>
           </div>

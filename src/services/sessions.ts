@@ -48,6 +48,23 @@ export function saveMessage(input: SessionSaveInput) {
        WHERE workspace_id = excluded.workspace_id`,
   ).run(input.session_id, input.workspace_id, input.agent_id, now, now);
 
+  // CRITICAL: Defensive cross-workspace check.
+  // If session_id exists in the DB but belongs to a different workspace (ON CONFLICT DO NOTHING
+  // silently skipped the insert), session_messages would still insert via FK on sessions.id only.
+  // This check catches that and prevents cross-workspace corruption.
+  const ownerRow = db
+    .prepare(`SELECT workspace_id FROM sessions WHERE id = ?`)
+    .get(input.session_id) as { workspace_id: string } | undefined;
+  if (!ownerRow) {
+    throw new QoopiaError("INTERNAL", "session upsert failed unexpectedly");
+  }
+  if (ownerRow.workspace_id !== input.workspace_id) {
+    throw new QoopiaError(
+      "FORBIDDEN",
+      `session_id collision: owned by another workspace`,
+    );
+  }
+
   const info = db
     .prepare(
       `INSERT INTO session_messages

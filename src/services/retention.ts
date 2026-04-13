@@ -139,9 +139,17 @@ function msUntilNextMaintenance(): number {
   return next.getTime() - Date.now();
 }
 
+// Minimum grace period after boot before triggering maintenance (5 minutes).
+// Prevents hammering the DB on rapid restarts while still respecting the window.
+const BOOT_GRACE_MS = 5 * 60 * 1000;
+
 export function startMaintenance() {
-  // First run: 1 hour after start (per docs/20-to-be/01-schema.md)
-  const firstRun = 60 * 60 * 1000;
+  // Schedule the first run at the next configured maintenance window (MAINTENANCE_HOUR:00),
+  // but never sooner than BOOT_GRACE_MS from now. This prevents repeated restarts from
+  // postponing cleanup indefinitely (the old "1 hour from boot" approach had that problem).
+  const msToWindow = msUntilNextMaintenance();
+  const firstRun = Math.max(msToWindow, BOOT_GRACE_MS);
+
   maintenanceTimer = setTimeout(() => {
     runMaintenance();
     scheduleDaily();
@@ -150,7 +158,8 @@ export function startMaintenance() {
   if (maintenanceTimer && typeof (maintenanceTimer as any).unref === "function") {
     (maintenanceTimer as any).unref();
   }
-  logger.info(`Maintenance scheduled: first run in ${firstRun / 1000}s`);
+  const hoursUntil = Math.round(firstRun / 1000 / 60);
+  logger.info(`Maintenance scheduled: first run in ~${hoursUntil}m (window=${env.MAINTENANCE_HOUR}:00)`);
 }
 
 function scheduleDaily() {

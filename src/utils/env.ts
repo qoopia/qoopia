@@ -15,6 +15,9 @@ export const env = {
   MAINTENANCE_HOUR: parseInt(process.env.QOOPIA_MAINTENANCE_HOUR || "4", 10),
   BACKUP_KEEP: parseInt(process.env.QOOPIA_BACKUP_KEEP || "7", 10),
   RETENTION_ACTIVITY_DAYS: parseInt(process.env.QOOPIA_RETENTION_ACTIVITY_DAYS || "90", 10),
+  // When true (default), loopback requests may carry trusted proxy headers (cf-connecting-ip, x-forwarded-for).
+  // Set TRUST_PROXY=false if Qoopia is exposed directly (no Cloudflare tunnel / reverse proxy).
+  TRUST_PROXY: (process.env.TRUST_PROXY ?? "true") !== "false",
 };
 
 if (!env.OAUTH_ISSUER) env.OAUTH_ISSUER = env.PUBLIC_URL;

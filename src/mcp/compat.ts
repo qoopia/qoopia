@@ -26,6 +26,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AuthContext } from "../auth/middleware.ts";
 import { QoopiaError } from "../utils/errors.ts";
 import { logger } from "../utils/logger.ts";
+import { db } from "../db/connection.ts";
 import {
   createNote,
   getNote,
@@ -205,6 +206,18 @@ function v2Create(args: Record<string, unknown>, auth: AuthContext) {
         tags: (args.tags as string[]) || [],
       });
     }
+    case "projects": {
+      const name = String(args.name || "").trim();
+      if (!name) throw new QoopiaError("INVALID_INPUT", "name required");
+      return createNote({
+        workspace_id: auth.workspace_id,
+        agent_id: auth.agent_id,
+        text: name,
+        type: "project",
+        metadata: buildProjectMetadata(args),
+        tags: (args.tags as string[]) || [],
+      });
+    }
     case "activity": {
       const id = logActivity({
         workspace_id: auth.workspace_id,
@@ -381,6 +394,30 @@ function v2Note(args: Record<string, unknown>, auth: AuthContext) {
   const text = String(args.text || "").trim();
   if (!text) throw new QoopiaError("INVALID_INPUT", "text required");
   const v2type = (args.type as string) || "memory";
+
+  // Resolve project: accept ULID or exact name (mirrors brief() resolution)
+  let projectId: string | null = null;
+  if (args.project) {
+    const projectVal = String(args.project);
+    const byId = db
+      .prepare(
+        `SELECT id FROM notes WHERE id = ? AND workspace_id = ? AND type = 'project' AND deleted_at IS NULL`,
+      )
+      .get(projectVal, auth.workspace_id) as { id: string } | undefined;
+    if (byId) {
+      projectId = byId.id;
+    } else {
+      const byName = db
+        .prepare(
+          `SELECT id FROM notes WHERE text = ? AND workspace_id = ? AND type = 'project' AND deleted_at IS NULL LIMIT 1`,
+        )
+        .get(projectVal, auth.workspace_id) as { id: string } | undefined;
+      if (byName) {
+        projectId = byName.id;
+      }
+    }
+  }
+
   // V2 valid types: rule, memory, knowledge, context. All map 1:1 in V3.
   return createNote({
     workspace_id: auth.workspace_id,
@@ -394,6 +431,7 @@ function v2Note(args: Record<string, unknown>, auth: AuthContext) {
       v2_entities_hint: args.entities_hint ?? [],
     },
     session_id: (args.session_id as string) || null,
+    project_id: projectId,
   });
 }
 
@@ -436,7 +474,7 @@ export function registerCompatTools(
     "create",
     "[V2 compat] Create entity by type. entity ∈ tasks|deals|contacts|finances|activity. Use note_create for V3-native API.",
     {
-      entity: z.enum(["tasks", "deals", "contacts", "finances", "activity"]),
+      entity: z.enum(["tasks", "deals", "contacts", "finances", "projects", "activity"]),
       title: z.string().optional(),
       description: z.string().optional(),
       name: z.string().optional(),

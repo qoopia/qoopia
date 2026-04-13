@@ -1,5 +1,5 @@
 import { db } from "../db/connection.ts";
-import { safeJsonParse, nowIso } from "../utils/errors.ts";
+import { safeJsonParse, nowIso, QoopiaError } from "../utils/errors.ts";
 
 export interface BriefParams {
   workspace_id: string;
@@ -46,6 +46,11 @@ export function brief(p: BriefParams) {
         projectId = byName.id;
         projectName = byName.text.split("\n")[0]!;
       }
+    }
+    // If caller passed a project filter but it could not be resolved, fail fast.
+    // Silently returning the whole workspace is misleading for agents.
+    if (!projectId) {
+      throw new QoopiaError("NOT_FOUND", `project '${p.project}' not found in workspace`);
     }
   }
 
@@ -193,6 +198,7 @@ export function brief(p: BriefParams) {
   return {
     workspace_id: p.workspace_id,
     project: projectName,
+    project_resolved: p.project ? projectId !== null : undefined,
     open_tasks: {
       total: openTasksTotalRow.c,
       overdue: overdueRow.c,

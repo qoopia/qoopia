@@ -166,7 +166,14 @@ async function main() {
             return;
           }
           case "list-agents": {
-            for (const a of listAgents() as Array<any>) {
+            interface AgentRow {
+              workspace_slug: string;
+              name: string;
+              type: string;
+              active: number;
+              last_seen: string | null;
+            }
+            for (const a of listAgents() as AgentRow[]) {
               console.log(
                 `${a.workspace_slug.padEnd(18)} ${a.name.padEnd(16)} ${a.type.padEnd(18)} active=${a.active} last_seen=${a.last_seen || "-"}`,
               );

@@ -234,9 +234,28 @@ export function revokeToken(token: string): boolean {
 
 /**
  * Revoke a token only if it belongs to the specified client.
- * Per RFC 7009: client must prove ownership before revocation.
+ * Per RFC 7009: confidential clients must authenticate with client_secret before revocation.
+ * Public clients (no client_secret_hash) may revoke without a secret.
  */
-export function revokeTokenForClient(token: string, clientId: string): boolean {
+export function revokeTokenForClient(
+  token: string,
+  clientId: string,
+  clientSecret?: string,
+): boolean {
+  const client = getClient(clientId);
+  if (!client) {
+    // Unknown client — return false (RFC 7009: don't reveal token existence)
+    return false;
+  }
+  // Confidential client: require and verify client_secret
+  if (client.client_secret_hash) {
+    if (!clientSecret) {
+      throw new Error("invalid_client");
+    }
+    if (sha256Hex(clientSecret) !== client.client_secret_hash) {
+      throw new Error("invalid_client");
+    }
+  }
   const hash = sha256Hex(token);
   const info = db
     .prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ? AND client_id = ?`)
@@ -268,6 +287,17 @@ export function registerClient(input: {
   if (!Array.isArray(input.redirect_uris) || input.redirect_uris.length === 0) {
     throw new Error("redirect_uris must be a non-empty array");
   }
+  // Guard: if multiple workspaces exist, explicit workspace binding is required.
+  // This prevents implicit binding to the wrong workspace in multi-workspace deployments.
+  const wsCount = (db
+    .prepare(`SELECT COUNT(*) as c FROM workspaces`)
+    .get() as { c: number }).c;
+  if (wsCount > 1) {
+    throw new Error(
+      "Multi-workspace OAuth registration requires explicit workspace binding — contact admin",
+    );
+  }
+
   // C1 fix: restrict to agents in the default workspace (single-user assumption).
   // Prefer claude-privileged for Claude.ai connector; fall back to first active.
   const defaultWs = db
