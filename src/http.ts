@@ -390,6 +390,7 @@ let dashboardHtml: string | null = null;
 function serveDashboard(res: ServerResponse) {
   if (!dashboardHtml) {
     try {
+      // Resolve path relative to this source file
       const thisDir = typeof __dirname !== "undefined"
         ? __dirname
         : dirname(fileURLToPath(import.meta.url));
