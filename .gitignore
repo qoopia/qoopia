@@ -5,3 +5,4 @@ bun.lockb
 dist/
 .env
 .env.local
+.worktrees/
