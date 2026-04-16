@@ -194,6 +194,25 @@ export async function install(opts: InstallOpts = {}) {
     step(`Agent '${agentName}' already exists (use \`qoopia admin rotate-key ${agentName}\` to get a new key)`);
   }
 
+  // 4b. Ingest daemon agent — idempotent (Phase 7a)
+  const INGEST_KEY_PATH = path.join(os.homedir(), ".qoopia", "ingest.key");
+  const ingestExists = db
+    .prepare(`SELECT id FROM agents WHERE name = 'tailer' AND workspace_id = (SELECT id FROM workspaces WHERE slug = ?)`)
+    .get(workspaceSlug);
+  if (!ingestExists) {
+    const ingestCreated = createAgent({
+      name: "tailer",
+      workspaceSlug,
+      type: "ingest-daemon",
+    });
+    fs.mkdirSync(path.dirname(INGEST_KEY_PATH), { recursive: true });
+    fs.writeFileSync(INGEST_KEY_PATH, ingestCreated.api_key, "utf8");
+    fs.chmodSync(INGEST_KEY_PATH, 0o600);
+    step(`Ingest daemon 'tailer' created, key saved to ${INGEST_KEY_PATH}`);
+  } else {
+    step(`Ingest daemon 'tailer' already exists (${INGEST_KEY_PATH})`);
+  }
+
   // 5. launchd plist
   const bunPath = findBun();
   const qoopiaEntry = path.join(PROJECT_ROOT, "src/index.ts");
