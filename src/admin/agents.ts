@@ -4,7 +4,7 @@ import { generateApiKey, sha256Hex } from "../auth/api-keys.ts";
 import { revokeAllAgentTokens } from "../auth/oauth.ts";
 import { QoopiaError, nowIso } from "../utils/errors.ts";
 
-export type AgentType = "standard" | "claude-privileged" | "steward";
+export type AgentType = "standard" | "claude-privileged" | "steward" | "ingest-daemon";
 
 const AGENT_NAME_RE = /^[a-zA-Z0-9_\-\s]{1,64}$/;
 

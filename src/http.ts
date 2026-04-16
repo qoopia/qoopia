@@ -7,6 +7,8 @@ import crypto from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
+import { getAllowlist } from "./admin/claude-agents.ts";
+import { saveMessage } from "./services/sessions.ts";
 import {
   wellKnownAuthorizationServer,
   wellKnownProtectedResource,
@@ -302,6 +304,73 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   if (url === "/oauth/revoke" && method === "POST") {
     const body = await readBody(req);
     return handleRevoke(body, res);
+  }
+
+  // --- Ingest endpoints (ingest-daemon only) ---
+  if (url === "/ingest/allowlist" && method === "GET") {
+    const fetchReq = nodeReqToFetchRequest(req);
+    const auth = authenticate(fetchReq);
+    if (!auth || auth.type !== "ingest-daemon") {
+      return json(res, 403, { error: "forbidden", error_description: "ingest-daemon credentials required" }, req);
+    }
+    return json(res, 200, getAllowlist(), req);
+  }
+
+  if (url === "/ingest/session" && method === "POST") {
+    const rawBody = await readBody(req);
+    const fetchReq = nodeReqToFetchRequest(req, rawBody);
+    const auth = authenticate(fetchReq);
+    if (!auth || auth.type !== "ingest-daemon") {
+      return json(res, 403, { error: "forbidden", error_description: "ingest-daemon credentials required" }, req);
+    }
+    let payload: {
+      attributed_agent_id?: string;
+      session_id?: string;
+      uuid?: string;
+      role?: string;
+      content?: string;
+      timestamp?: string;
+      cwd?: string;
+    };
+    try {
+      payload = JSON.parse(rawBody.toString("utf8"));
+    } catch {
+      return json(res, 400, { error: "invalid_json" }, req);
+    }
+
+    const { attributed_agent_id, session_id, uuid, role, content } = payload;
+    if (!attributed_agent_id || !session_id || !uuid || !role || !content) {
+      return json(res, 400, { error: "missing_fields", required: ["attributed_agent_id", "session_id", "uuid", "role", "content"] }, req);
+    }
+    if (role !== "user" && role !== "assistant") {
+      return json(res, 400, { error: "invalid_role", allowed: ["user", "assistant"] }, req);
+    }
+
+    // Resolve the target agent's workspace
+    const { db: dbConn } = await import("./db/connection.ts");
+    const targetAgent = dbConn
+      .prepare(`SELECT workspace_id FROM agents WHERE id = ? AND active = 1`)
+      .get(attributed_agent_id) as { workspace_id: string } | undefined;
+    if (!targetAgent) {
+      return json(res, 404, { error: "agent_not_found", agent_id: attributed_agent_id }, req);
+    }
+
+    try {
+      const result = saveMessage({
+        workspace_id: targetAgent.workspace_id,
+        agent_id: attributed_agent_id,
+        session_id,
+        role: role as "user" | "assistant",
+        content,
+        metadata: { ingest_uuid: uuid, ingest_cwd: payload.cwd ?? "", ingest_ts: payload.timestamp ?? "" },
+      });
+      return json(res, 200, result, req);
+    } catch (err) {
+      const e = err as { code?: string; message?: string };
+      if (e.code === "FORBIDDEN") return json(res, 409, { error: "session_conflict", detail: e.message }, req);
+      if (e.code === "INVALID_INPUT") return json(res, 400, { error: "invalid_input", detail: e.message }, req);
+      throw err;
+    }
   }
 
   // --- MCP endpoint ---

@@ -14,6 +14,12 @@ import {
   type AgentType,
 } from "./admin/agents.ts";
 import { createWorkspace, listWorkspaces } from "./admin/workspaces.ts";
+import {
+  registerClaudeAgent,
+  enableAutosession,
+  disableAutosession,
+  listClaudeAgents,
+} from "./admin/claude-agents.ts";
 import { env } from "./utils/env.ts";
 import { db, closeDb } from "./db/connection.ts";
 
@@ -32,12 +38,16 @@ Commands:
   backup [--to <path>]                          Manual SQLite backup
   admin create-workspace <name> [--slug <slug>]
   admin list-workspaces
-  admin create-agent <name> --workspace <slug> [--type standard|claude-privileged|steward]
+  admin create-agent <name> --workspace <slug> [--type standard|claude-privileged|steward|ingest-daemon]
   admin list-agents
   admin rotate-key <name> --workspace <slug>
   admin delete-agent <name> --workspace <slug>
   admin set-type <name> --workspace <slug> --type <type>
   admin promote-steward <name> --workspace <slug>
+  admin register-claude-agent <agent-name> --workspace <slug> --cwd-prefix <path> [--no-autosession]
+  admin enable-autosession --workspace <slug> --cwd-prefix <path>
+  admin disable-autosession --workspace <slug> --cwd-prefix <path>
+  admin list-claude-agents --workspace <slug>
 `);
 }
 
@@ -217,6 +227,50 @@ async function main() {
             setAgentType(name, workspace, "steward");
             console.log(`Agent '${name}' promoted to steward.`);
             console.log("Admin MCP tools are now available to this agent (no restart needed).");
+            return;
+          }
+          case "register-claude-agent": {
+            const agentName = argv[2];
+            if (!agentName) return console.error("Missing agent name");
+            const workspace = need("workspace", arg("workspace"));
+            const cwdPrefix = need("cwd-prefix", arg("cwd-prefix"));
+            const noAutosession = argv.includes("--no-autosession");
+            const rec = registerClaudeAgent({
+              workspaceSlug: workspace,
+              agentName,
+              cwdPrefix,
+              autosessionEnabled: !noAutosession,
+            });
+            console.log(`Registered Claude Code agent '${agentName}' → cwd_prefix: ${cwdPrefix}`);
+            console.log(`  id: ${rec.id}  autosession: ${rec.autosession_enabled ? "enabled" : "disabled"}`);
+            return;
+          }
+          case "enable-autosession": {
+            const workspace = need("workspace", arg("workspace"));
+            const cwdPrefix = need("cwd-prefix", arg("cwd-prefix"));
+            enableAutosession({ workspaceSlug: workspace, cwdPrefix });
+            console.log(`Autosession enabled for cwd_prefix: ${cwdPrefix}`);
+            return;
+          }
+          case "disable-autosession": {
+            const workspace = need("workspace", arg("workspace"));
+            const cwdPrefix = need("cwd-prefix", arg("cwd-prefix"));
+            disableAutosession({ workspaceSlug: workspace, cwdPrefix });
+            console.log(`Autosession disabled for cwd_prefix: ${cwdPrefix}`);
+            return;
+          }
+          case "list-claude-agents": {
+            const workspace = need("workspace", arg("workspace"));
+            const rows = listClaudeAgents(workspace);
+            if (rows.length === 0) {
+              console.log("(no Claude Code agents registered)");
+              return;
+            }
+            for (const r of rows) {
+              console.log(
+                `${r.agent_name.padEnd(16)} ${r.cwd_prefix.padEnd(50)} autosession=${r.autosession_enabled ? "on" : "off"}  (${r.id})`,
+              );
+            }
             return;
           }
           default:
