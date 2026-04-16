@@ -362,7 +362,8 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
         session_id,
         role: role as "user" | "assistant",
         content,
-        metadata: { ingest_uuid: uuid, ingest_cwd: payload.cwd ?? "", ingest_ts: payload.timestamp ?? "" },
+        ingest_uuid: uuid,
+        metadata: { ingest_cwd: payload.cwd ?? "", ingest_ts: payload.timestamp ?? "" },
       });
       return json(res, 200, result, req);
     } catch (err) {

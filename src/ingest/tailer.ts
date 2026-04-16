@@ -24,12 +24,16 @@ const INGEST_KEY_PATH =
 const CLAUDE_PROJECTS_DIR =
   process.env.CLAUDE_PROJECTS_DIR ??
   path.join(os.homedir(), ".claude", "projects");
+const CURSORS_PATH =
+  process.env.QOOPIA_CURSORS_PATH ??
+  path.join(os.homedir(), ".qoopia", "tailer-cursors.json");
 
 // Retry / backoff settings
 const RETRY_BASE_MS = 500;
 const RETRY_MAX_MS = 30_000;
 const RETRY_JITTER = 0.2;
 const QUEUE_FLUSH_INTERVAL_MS = 500;
+const CURSORS_PERSIST_INTERVAL_MS = 5_000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -73,12 +77,15 @@ function dedupKey(sessionId: string, uuid: string): string {
 // ---------------------------------------------------------------------------
 
 const queue: QueueEntry[] = [];
+// Set to true when a new entry is enqueued; cleared by persistCursors() flush.
+let pendingPersist = false;
 
 function enqueue(payload: IngestPayload) {
   const key = dedupKey(payload.session_id, payload.uuid);
   if (seenKeys.has(key)) return;
   seenKeys.add(key);
   queue.push({ payload, attempts: 0, next_attempt_at: Date.now() });
+  pendingPersist = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,10 +212,37 @@ function extractText(raw: string): { role: "user" | "assistant"; text: string; e
 }
 
 // ---------------------------------------------------------------------------
-// Per-file tail state — track byte offset so we only read new data
+// Per-file tail state — track byte offset so we only read new data.
+// Persisted to ~/.qoopia/tailer-cursors.json so restarts don't cause data loss.
 // ---------------------------------------------------------------------------
 
 const fileCursors = new Map<string, number>();
+
+function loadCursors() {
+  try {
+    if (!fs.existsSync(CURSORS_PATH)) return;
+    const raw = fs.readFileSync(CURSORS_PATH, "utf8");
+    const obj = JSON.parse(raw) as Record<string, number>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === "number") fileCursors.set(k, v);
+    }
+    console.log(`[tailer] loaded ${fileCursors.size} cursors from ${CURSORS_PATH}`);
+  } catch (err) {
+    console.error("[tailer] failed to load cursors (starting fresh):", err);
+  }
+}
+
+function persistCursors() {
+  try {
+    const obj: Record<string, number> = {};
+    for (const [k, v] of fileCursors) obj[k] = v;
+    const tmp = CURSORS_PATH + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(obj));
+    fs.renameSync(tmp, CURSORS_PATH); // atomic on POSIX
+  } catch (err) {
+    console.error("[tailer] failed to persist cursors:", err);
+  }
+}
 
 async function processNewLines(filePath: string) {
   const allowlist = await fetchAllowlist();
@@ -328,12 +362,14 @@ function watchProjectsDir() {
 async function flushQueue() {
   const now = Date.now();
   const ready = queue.filter((e) => e.next_attempt_at <= now);
+  let anySuccess = false;
 
   for (const entry of ready) {
     const idx = queue.indexOf(entry);
     try {
       await postIngest(entry.payload);
       queue.splice(idx, 1);
+      anySuccess = true;
     } catch (err) {
       entry.attempts += 1;
       const backoff = Math.min(
@@ -348,6 +384,12 @@ async function flushQueue() {
       );
     }
   }
+
+  // Persist cursors after successful delivery — ensures restarts don't lose progress
+  if (anySuccess && pendingPersist) {
+    persistCursors();
+    pendingPersist = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,13 +399,29 @@ async function flushQueue() {
 console.log("[tailer] starting Phase 7a ingest daemon");
 console.log(`[tailer] Qoopia URL: ${QOOPIA_URL}`);
 console.log(`[tailer] ingest key: ${INGEST_KEY_PATH}`);
+console.log(`[tailer] cursors: ${CURSORS_PATH}`);
+
+// Load persisted cursors BEFORE starting watchers so we resume from last known positions
+loadCursors();
 
 watchProjectsDir();
 
-// Periodic queue flush
+// Periodic queue flush (also persists cursors after successful delivery)
 setInterval(flushQueue, QUEUE_FLUSH_INTERVAL_MS);
 
 // Periodic allowlist refresh (TTL is handled inside fetchAllowlist)
 setInterval(() => fetchAllowlist().catch(console.error), ALLOWLIST_TTL_MS);
+
+// Periodic cursor persist safety net (in case queue stays empty but cursors moved)
+setInterval(() => {
+  if (pendingPersist) {
+    persistCursors();
+    pendingPersist = false;
+  }
+}, CURSORS_PERSIST_INTERVAL_MS);
+
+// Persist on process exit (SIGTERM, SIGINT)
+process.on("SIGTERM", () => { persistCursors(); process.exit(0); });
+process.on("SIGINT",  () => { persistCursors(); process.exit(0); });
 
 console.log("[tailer] ready");

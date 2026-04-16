@@ -15,6 +15,8 @@ export interface SessionSaveInput {
   content: string;
   metadata?: Record<string, unknown>;
   token_count?: number;
+  /** Claude Code JSONL entry uuid — used for server-side dedup in ingest path */
+  ingest_uuid?: string;
 }
 
 export function saveMessage(input: SessionSaveInput) {
@@ -67,22 +69,46 @@ export function saveMessage(input: SessionSaveInput) {
       );
     }
 
-    const info = db
-      .prepare(
-        `INSERT INTO session_messages
+    // When ingest_uuid is provided (ingest-daemon path), use INSERT OR IGNORE for
+    // server-side dedup. The UNIQUE index idx_session_messages_ingest_uuid on
+    // (session_id, ingest_uuid) WHERE ingest_uuid IS NOT NULL makes this safe.
+    const insertSql = input.ingest_uuid
+      ? `INSERT OR IGNORE INTO session_messages
+          (workspace_id, session_id, agent_id, role, content, metadata, token_count, ingest_uuid, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      : `INSERT INTO session_messages
           (workspace_id, session_id, agent_id, role, content, metadata, token_count, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        input.workspace_id,
-        input.session_id,
-        input.agent_id,
-        input.role,
-        input.content,
-        JSON.stringify(input.metadata || {}),
-        input.token_count ?? null,
-        now,
-      );
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+
+    const insertParams = input.ingest_uuid
+      ? [
+          input.workspace_id,
+          input.session_id,
+          input.agent_id,
+          input.role,
+          input.content,
+          JSON.stringify(input.metadata || {}),
+          input.token_count ?? null,
+          input.ingest_uuid,
+          now,
+        ]
+      : [
+          input.workspace_id,
+          input.session_id,
+          input.agent_id,
+          input.role,
+          input.content,
+          JSON.stringify(input.metadata || {}),
+          input.token_count ?? null,
+          now,
+        ];
+
+    const info = db.prepare(insertSql).run(...insertParams);
+
+    // OR IGNORE means changes=0 on duplicate — return dedup signal
+    if (input.ingest_uuid && info.changes === 0) {
+      return { saved: false, duplicate: true, session_id: input.session_id };
+    }
 
     const id = Number(info.lastInsertRowid);
 

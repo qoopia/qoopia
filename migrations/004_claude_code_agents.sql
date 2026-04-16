@@ -20,3 +20,11 @@ CREATE TABLE claude_code_agents (
 
 CREATE INDEX idx_claude_code_agents_agent ON claude_code_agents(agent_id);
 CREATE INDEX idx_claude_code_agents_ws    ON claude_code_agents(workspace_id);
+
+-- Server-side idempotency for ingest: deduplicate by (session_id, ingest_uuid).
+-- ingest_uuid is the Claude Code JSONL entry uuid — globally unique per turn.
+-- NULL allowed (non-ingest messages don't have it).
+ALTER TABLE session_messages ADD COLUMN ingest_uuid TEXT;
+CREATE UNIQUE INDEX idx_session_messages_ingest_uuid
+  ON session_messages(session_id, ingest_uuid)
+  WHERE ingest_uuid IS NOT NULL;
