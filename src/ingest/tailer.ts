@@ -36,6 +36,62 @@ const QUEUE_FLUSH_INTERVAL_MS = 500;
 const CURSORS_PERSIST_INTERVAL_MS = 5_000;
 
 // ---------------------------------------------------------------------------
+// Dialogue tool whitelist — only these tool_use names count as dialogue text.
+// Everything else (note_create, session_save, react, etc.) is dropped.
+// ---------------------------------------------------------------------------
+
+const DIALOGUE_TOOL_WHITELIST = new Set([
+  "mcp__plugin_telegram_telegram__reply",
+  "mcp__plugin_telegram_telegram__edit_message",
+]);
+
+// ---------------------------------------------------------------------------
+// Secret patterns — extracted text matching any of these is skipped entirely.
+// We use known-prefix patterns to minimise false positives (no generic base64).
+// The server has a second layer (assertNoSecrets), so we stay conservative here.
+// ---------------------------------------------------------------------------
+
+const SENSITIVE_PATTERNS: RegExp[] = [
+  /\bq_[A-Za-z0-9_\-]{30,}/,          // Qoopia API keys
+  /\bqcs_[A-Za-z0-9_\-]{30,}/,        // Qoopia client secrets
+  /\bsk-ant-[A-Za-z0-9_\-]{30,}/,     // Anthropic API keys
+  /Bearer\s+[A-Za-z0-9_\-.]{20,}/i,   // Generic bearer tokens
+  /\bghp_[A-Za-z0-9]{30,}/,           // GitHub PATs
+  /\bAIza[A-Za-z0-9_\-]{30,}/,        // Google API keys
+  /api[_\-]?key\s*[:=]\s*\S{20,}/i,   // Generic api_key = ...
+  /password\s*[:=]\s*\S{8,}/i,        // Generic password = ...
+  /secret\s*[:=]\s*\S{20,}/i,         // Generic secret = ...
+];
+
+function containsSecret(text: string): boolean {
+  return SENSITIVE_PATTERNS.some((re) => re.test(text));
+}
+
+// ---------------------------------------------------------------------------
+// Channel XML parser — extracts inner text + metadata from Telegram channel tags.
+// Input: '<channel source="plugin:telegram:telegram" chat_id="..." ...>text</channel>'
+// Output: { text: "text", metadata: { source: "...", chat_id: "...", ... } }
+// If the string is not a channel tag, returns it as-is with empty metadata.
+// ---------------------------------------------------------------------------
+
+function parseChannelText(raw: string): { text: string; metadata: Record<string, unknown> } {
+  const tagMatch = raw.match(/^<channel\s([^>]*)>([\s\S]*?)<\/channel>$/s);
+  if (!tagMatch) return { text: raw, metadata: {} };
+
+  const attrsStr = tagMatch[1]!;
+  const innerText = tagMatch[2]!.trim();
+
+  const metadata: Record<string, unknown> = {};
+  const attrRe = /(\w+)="([^"]*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = attrRe.exec(attrsStr)) !== null) {
+    metadata[m[1]!] = m[2]!;
+  }
+
+  return { text: innerText, metadata };
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -53,6 +109,7 @@ interface IngestPayload {
   content: string;
   timestamp: string;
   cwd: string;
+  metadata?: Record<string, unknown>;
 }
 
 interface QueueEntry {
@@ -111,7 +168,16 @@ async function postIngest(payload: IngestPayload): Promise<void> {
       "Content-Type": "application/json",
       Authorization: `Bearer ${key}`,
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      attributed_agent_id: payload.attributed_agent_id,
+      session_id: payload.session_id,
+      uuid: payload.uuid,
+      role: payload.role,
+      content: payload.content,
+      timestamp: payload.timestamp,
+      cwd: payload.cwd,
+      metadata: payload.metadata ?? {},
+    }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "(no body)");
@@ -165,6 +231,13 @@ function resolveAgent(cwd: string, list: AllowlistEntry[]): string | null {
 // JSONL parsing
 // ---------------------------------------------------------------------------
 
+interface JsonlBlock {
+  type: string;
+  text?: string;
+  name?: string;                       // tool_use: tool name
+  input?: Record<string, unknown>;     // tool_use: arguments
+}
+
 interface JsonlEntry {
   type?: string;
   uuid?: string;
@@ -173,15 +246,29 @@ interface JsonlEntry {
   cwd?: string;
   message?: {
     role?: string;
-    content?: string | Array<{ type: string; text?: string }>;
+    content?: string | JsonlBlock[];
   };
 }
 
+export type ExtractResult = {
+  role: "user" | "assistant";
+  text: string;
+  metadata: Record<string, unknown>;
+  entry: JsonlEntry;
+  source: "text" | "channel" | "tool_use";
+};
+
 /**
- * Extract plain text from a JSONL entry.
- * Returns null if the entry is not a whitelisted user/assistant text turn.
+ * Extract dialogue text from a JSONL entry.
+ *
+ * Handles three sources:
+ *   1. "text" blocks   — existing behaviour (user + assistant plain text)
+ *   2. "channel" tags  — user messages wrapped in <channel source="plugin:telegram:telegram"...>
+ *   3. tool_use blocks — assistant outgoing messages via DIALOGUE_TOOL_WHITELIST
+ *
+ * Returns null when nothing extractable or if a secret is detected.
  */
-function extractText(raw: string): { role: "user" | "assistant"; text: string; entry: JsonlEntry } | null {
+export function extractText(raw: string): ExtractResult | null {
   let entry: JsonlEntry;
   try {
     entry = JSON.parse(raw) as JsonlEntry;
@@ -196,19 +283,86 @@ function extractText(raw: string): { role: "user" | "assistant"; text: string; e
   const role = type as "user" | "assistant";
   const content = message.content;
 
-  let text: string | null = null;
+  // ---- 1. Plain string content (may be a channel tag) ----
   if (typeof content === "string") {
-    text = content.trim();
-  } else if (Array.isArray(content)) {
-    // Concatenate all text blocks; skip thinking/tool_use/tool_result
-    const parts = content
-      .filter((b) => b.type === "text" && typeof b.text === "string")
-      .map((b) => b.text as string);
-    if (parts.length > 0) text = parts.join("\n").trim();
+    const trimmed = content.trim();
+    if (!trimmed) return null;
+    if (trimmed.startsWith("<channel ")) {
+      const parsed = parseChannelText(trimmed);
+      if (!parsed.text) return null;
+      if (containsSecret(parsed.text)) {
+        console.warn(`[tailer] skip ${uuid}: potential secret detected in channel text`);
+        return null;
+      }
+      return { role, text: parsed.text, metadata: parsed.metadata, entry, source: "channel" };
+    }
+    if (containsSecret(trimmed)) {
+      console.warn(`[tailer] skip ${uuid}: potential secret detected`);
+      return null;
+    }
+    return { role, text: trimmed, metadata: {}, entry, source: "text" };
   }
 
-  if (!text) return null;
-  return { role, text, entry };
+  if (!Array.isArray(content)) return null;
+
+  // ---- 2. Text blocks (may contain channel XML) ----
+  const textParts: string[] = [];
+  let channelMeta: Record<string, unknown> = {};
+  let hasChannel = false;
+
+  for (const block of content) {
+    if (block.type !== "text" || typeof block.text !== "string") continue;
+    const raw = block.text.trim();
+    if (!raw) continue;
+    if (raw.startsWith("<channel ")) {
+      const parsed = parseChannelText(raw);
+      textParts.push(parsed.text);
+      channelMeta = parsed.metadata;
+      hasChannel = true;
+    } else {
+      textParts.push(raw);
+    }
+  }
+
+  if (textParts.length > 0) {
+    const text = textParts.join("\n").trim();
+    if (!text) return null;
+    if (containsSecret(text)) {
+      console.warn(`[tailer] skip ${uuid}: potential secret detected`);
+      return null;
+    }
+    return {
+      role,
+      text,
+      metadata: hasChannel ? channelMeta : {},
+      entry,
+      source: hasChannel ? "channel" : "text",
+    };
+  }
+
+  // ---- 3. tool_use blocks (assistant outgoing messages) ----
+  if (role === "assistant") {
+    for (const block of content) {
+      if (block.type !== "tool_use") continue;
+      if (!block.name || !DIALOGUE_TOOL_WHITELIST.has(block.name)) continue;
+      const inputText = block.input?.text;
+      if (typeof inputText !== "string" || !inputText.trim()) continue;
+      const text = inputText.trim();
+      if (containsSecret(text)) {
+        console.warn(`[tailer] skip ${uuid}: potential secret in tool_use.input.text`);
+        return null;
+      }
+      return {
+        role,
+        text,
+        metadata: { tool: block.name },
+        entry,
+        source: "tool_use",
+      };
+    }
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +421,7 @@ async function processNewLines(filePath: string) {
       const result = extractText(trimmed);
       if (!result) continue;
 
-      const { role, text, entry } = result;
+      const { role, text, metadata, entry } = result;
       const cwd = entry.cwd ?? "";
       const agentId = resolveAgent(cwd, allowlist);
       if (!agentId) continue; // cwd not in allowlist or autosession disabled
@@ -280,6 +434,7 @@ async function processNewLines(filePath: string) {
         content: text,
         timestamp: entry.timestamp ?? new Date().toISOString(),
         cwd,
+        metadata,
       });
     }
   } catch (err) {

@@ -331,6 +331,7 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       content?: string;
       timestamp?: string;
       cwd?: string;
+      metadata?: Record<string, unknown>;
     };
     try {
       payload = JSON.parse(rawBody.toString("utf8"));
@@ -363,7 +364,7 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
         role: role as "user" | "assistant",
         content,
         ingest_uuid: uuid,
-        metadata: { ingest_cwd: payload.cwd ?? "", ingest_ts: payload.timestamp ?? "" },
+        metadata: { ingest_cwd: payload.cwd ?? "", ingest_ts: payload.timestamp ?? "", ...(payload.metadata ?? {}) },
       });
       return json(res, 200, result, req);
     } catch (err) {
