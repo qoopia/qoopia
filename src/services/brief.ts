@@ -1,5 +1,5 @@
 import { db } from "../db/connection.ts";
-import { safeJsonParse, nowIso } from "../utils/errors.ts";
+import { safeJsonParse, nowIso, QoopiaError } from "../utils/errors.ts";
 
 export interface BriefParams {
   workspace_id: string;
@@ -47,6 +47,11 @@ export function brief(p: BriefParams) {
         projectName = byName.text.split("\n")[0]!;
       }
     }
+    // If caller passed a project filter but it could not be resolved, fail fast.
+    // Silently returning the whole workspace is misleading for agents.
+    if (!projectId) {
+      throw new QoopiaError("NOT_FOUND", `project '${p.project}' not found in workspace`);
+    }
   }
 
   const extra: string[] = [];
@@ -57,7 +62,7 @@ export function brief(p: BriefParams) {
   }
   if (p.agent) {
     extra.push(
-      `agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ?)`,
+      `agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1)`,
     );
     extraParams.push(p.agent, p.workspace_id);
   }
@@ -144,16 +149,27 @@ export function brief(p: BriefParams) {
     )
     .get(p.workspace_id, ...extraParams) as { c: number };
 
-  // Agent activity
+  // Agent activity — M3 fix: apply agent filter consistently when specified
+  // When project filter is active, notes_today is scoped to that project for consistency.
+  const agentActivityWhere: string[] = [`a.workspace_id = ?`, `a.active = 1`];
+  const agentActivityParams: any[] = [p.workspace_id];
+  if (p.agent) {
+    agentActivityWhere.push(`a.name = ?`);
+    agentActivityParams.push(p.agent);
+  }
+  const notesTodayProjectFilter = projectId
+    ? `AND n.project_id = '${projectId.replace(/'/g, "''")}'`
+    : "";
   const agents = db
     .prepare(
       `SELECT a.id, a.name, a.last_seen,
          (SELECT COUNT(*) FROM notes n WHERE n.agent_id = a.id AND n.workspace_id = a.workspace_id
-           AND n.deleted_at IS NULL AND n.created_at >= datetime('now', '-1 day')) as notes_today
-       FROM agents a WHERE a.workspace_id = ? AND a.active = 1
+           AND n.deleted_at IS NULL AND datetime(n.created_at) >= datetime('now', '-1 day')
+           ${notesTodayProjectFilter}) as notes_today
+       FROM agents a WHERE ${agentActivityWhere.join(" AND ")}
        ORDER BY a.last_seen DESC`,
     )
-    .all(p.workspace_id) as Array<{
+    .all(...agentActivityParams) as Array<{
     id: string;
     name: string;
     last_seen: string | null;
@@ -187,6 +203,7 @@ export function brief(p: BriefParams) {
   return {
     workspace_id: p.workspace_id,
     project: projectName,
+    project_resolved: p.project ? projectId !== null : undefined,
     open_tasks: {
       total: openTasksTotalRow.c,
       overdue: overdueRow.c,

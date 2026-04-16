@@ -34,13 +34,15 @@ export function runMigrations() {
     if (applied) continue;
 
     const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), "utf8");
-    db.exec("BEGIN");
     try {
-      db.exec(sql);
-      db.exec("COMMIT");
+      db.transaction(() => {
+        db.exec(sql);
+        db.prepare(
+          `INSERT INTO schema_versions (version, description) VALUES (?, ?)`,
+        ).run(version, file);
+      })();
       logger.info(`Applied migration ${file}`);
     } catch (err) {
-      db.exec("ROLLBACK");
       throw new Error(`Migration ${file} failed: ${err}`);
     }
   }

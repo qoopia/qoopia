@@ -25,6 +25,8 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AuthContext } from "../auth/middleware.ts";
 import { QoopiaError } from "../utils/errors.ts";
+import { logger } from "../utils/logger.ts";
+import { db } from "../db/connection.ts";
 import {
   createNote,
   getNote,
@@ -32,8 +34,6 @@ import {
   updateNote,
   deleteNote,
 } from "../services/notes.ts";
-import { recall as recallService } from "../services/recall.ts";
-import { brief as briefService } from "../services/brief.ts";
 import { logActivity, listActivity } from "../services/activity.ts";
 
 // V2 plural entity → V3 singular type
@@ -51,9 +51,26 @@ function ok(data: unknown) {
 
 function fail(err: unknown) {
   let msg: string;
-  if (err instanceof QoopiaError) msg = `${err.code}: ${err.message}`;
-  else if (err instanceof Error) msg = `INTERNAL: ${err.message}`;
-  else msg = `INTERNAL: ${String(err)}`;
+  if (err instanceof QoopiaError) {
+    msg = `${err.code}: ${err.message}`;
+  } else if (err instanceof Error) {
+    // M4 fix: log internal errors server-side, return stable generic message
+    const raw = err.message;
+    // Translate SQLite busy/lock errors into retryable domain error
+    if (raw.includes("SQLITE_BUSY") || raw.includes("database is locked")) {
+      msg = "BUSY: Database busy, please retry";
+    } else if (raw.includes("UNIQUE constraint failed") && raw.includes("steward")) {
+      msg = "CONFLICT: active steward already exists";
+    } else if (raw.includes("UNIQUE constraint failed")) {
+      msg = "CONFLICT: a record with the same identifier already exists";
+    } else {
+      logger.error("MCP compat tool internal error", { error: raw, stack: err.stack });
+      msg = "INTERNAL: unexpected error — check server logs";
+    }
+  } else {
+    logger.error("MCP compat tool unknown error", { error: String(err) });
+    msg = "INTERNAL: unexpected error — check server logs";
+  }
   return { isError: true, content: [{ type: "text" as const, text: msg }] };
 }
 
@@ -190,6 +207,18 @@ function v2Create(args: Record<string, unknown>, auth: AuthContext) {
         tags: (args.tags as string[]) || [],
       });
     }
+    case "projects": {
+      const name = String(args.name || "").trim();
+      if (!name) throw new QoopiaError("INVALID_INPUT", "name required");
+      return createNote({
+        workspace_id: auth.workspace_id,
+        agent_id: auth.agent_id,
+        text: name,
+        type: "project",
+        metadata: buildProjectMetadata(args),
+        tags: (args.tags as string[]) || [],
+      });
+    }
     case "activity": {
       const id = logActivity({
         workspace_id: auth.workspace_id,
@@ -215,6 +244,16 @@ function v2Update(args: Record<string, unknown>, auth: AuthContext) {
   const entity = String(args.entity || "");
   const id = String(args.id || "");
   if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
+
+  // Entity type check: verify the note's type matches what caller expects
+  const existingForCheck = getNote(auth.workspace_id, id);
+  const expectedType = ENTITY_TO_TYPE[entity] || entity;
+  if (existingForCheck.type !== expectedType) {
+    throw new QoopiaError(
+      "INVALID_INPUT",
+      `Entity type mismatch: note ${id} is '${existingForCheck.type}', not '${entity}'`,
+    );
+  }
 
   // Build a metadata patch from known typed fields. Anything that maps to
   // V2 metadata for the relevant entity is included; missing fields stay
@@ -341,12 +380,38 @@ function v2List(args: Record<string, unknown>, auth: AuthContext) {
 function v2Get(args: Record<string, unknown>, auth: AuthContext) {
   const id = String(args.id || "");
   if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
-  return getNote(auth.workspace_id, id);
+  const note = getNote(auth.workspace_id, id);
+  // M11 fix: verify the fetched note type matches the requested entity discriminator
+  const entity = String(args.entity || "");
+  if (entity) {
+    const expectedType = ENTITY_TO_TYPE[entity] || entity;
+    if (note.type !== expectedType) {
+      throw new QoopiaError(
+        "NOT_FOUND",
+        `Entity ${id} is type '${note.type}', not '${entity}'`,
+      );
+    }
+  }
+  return note;
 }
 
 function v2Delete(args: Record<string, unknown>, auth: AuthContext) {
   const id = String(args.id || "");
   if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
+
+  // Entity type check: verify the note's type matches what caller expects
+  const entity = String(args.entity || "");
+  if (entity) {
+    const note = getNote(auth.workspace_id, id);
+    const expectedType = ENTITY_TO_TYPE[entity] || entity;
+    if (note.type !== expectedType) {
+      throw new QoopiaError(
+        "INVALID_INPUT",
+        `Entity type mismatch: note ${id} is '${note.type}', not '${entity}'`,
+      );
+    }
+  }
+
   return deleteNote(auth.workspace_id, auth.agent_id, id);
 }
 
@@ -354,6 +419,30 @@ function v2Note(args: Record<string, unknown>, auth: AuthContext) {
   const text = String(args.text || "").trim();
   if (!text) throw new QoopiaError("INVALID_INPUT", "text required");
   const v2type = (args.type as string) || "memory";
+
+  // Resolve project: accept ULID or exact name (mirrors brief() resolution)
+  let projectId: string | null = null;
+  if (args.project) {
+    const projectVal = String(args.project);
+    const byId = db
+      .prepare(
+        `SELECT id FROM notes WHERE id = ? AND workspace_id = ? AND type = 'project' AND deleted_at IS NULL`,
+      )
+      .get(projectVal, auth.workspace_id) as { id: string } | undefined;
+    if (byId) {
+      projectId = byId.id;
+    } else {
+      const byName = db
+        .prepare(
+          `SELECT id FROM notes WHERE text = ? AND workspace_id = ? AND type = 'project' AND deleted_at IS NULL LIMIT 1`,
+        )
+        .get(projectVal, auth.workspace_id) as { id: string } | undefined;
+      if (byName) {
+        projectId = byName.id;
+      }
+    }
+  }
+
   // V2 valid types: rule, memory, knowledge, context. All map 1:1 in V3.
   return createNote({
     workspace_id: auth.workspace_id,
@@ -367,34 +456,7 @@ function v2Note(args: Record<string, unknown>, auth: AuthContext) {
       v2_entities_hint: args.entities_hint ?? [],
     },
     session_id: (args.session_id as string) || null,
-  });
-}
-
-function v2Recall(args: Record<string, unknown>, auth: AuthContext) {
-  const privileged = auth.type === "claude-privileged";
-  // V2 'entities' is comma-separated string ("tasks,deals"). V3 has type filter.
-  // We only honour single-type filter — if V2 passes multiple entities, drop the filter.
-  let typeFilter: string | undefined;
-  const ent = args.entities;
-  if (typeof ent === "string") {
-    const parts = ent.split(",").map((s) => s.trim()).filter(Boolean);
-    if (parts.length === 1) typeFilter = ENTITY_TO_TYPE[parts[0]!] || parts[0];
-  }
-  return recallService({
-    workspace_id: auth.workspace_id,
-    query: String(args.query || ""),
-    limit: args.limit as number | undefined,
-    type: (args.type as string) || typeFilter,
-    privileged,
-  });
-}
-
-function v2Brief(args: Record<string, unknown>, auth: AuthContext) {
-  // V2 had agent_name (the calling agent's name) and agent (filter). V3 only has agent.
-  return briefService({
-    workspace_id: auth.workspace_id,
-    project: args.project as string | undefined,
-    agent: (args.agent as string) || (args.agent_name as string) || undefined,
+    project_id: projectId,
   });
 }
 
@@ -409,7 +471,7 @@ export function registerCompatTools(
     "create",
     "[V2 compat] Create entity by type. entity ∈ tasks|deals|contacts|finances|activity. Use note_create for V3-native API.",
     {
-      entity: z.enum(["tasks", "deals", "contacts", "finances", "activity"]),
+      entity: z.enum(["tasks", "deals", "contacts", "finances", "projects", "activity"]),
       title: z.string().optional(),
       description: z.string().optional(),
       name: z.string().optional(),
@@ -497,7 +559,7 @@ export function registerCompatTools(
 
   server.tool(
     "list",
-    "[V2 compat] List entities by type.",
+    "[V2 compat] List entities by type. Supported filters: project_id, status, entity_type (for activity), limit.",
     {
       entity: z.enum([
         "tasks",
@@ -509,9 +571,6 @@ export function registerCompatTools(
       ]),
       project_id: z.string().optional(),
       status: z.string().optional(),
-      assignee: z.string().optional(),
-      category: z.string().optional(),
-      type: z.string().optional(),
       entity_type: z.string().optional(),
       limit: z.number().int().optional(),
     },

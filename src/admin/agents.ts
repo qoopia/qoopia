@@ -1,22 +1,32 @@
 import { ulid } from "ulid";
 import { db } from "../db/connection.ts";
 import { generateApiKey, sha256Hex } from "../auth/api-keys.ts";
+import { revokeAllAgentTokens } from "../auth/oauth.ts";
 import { QoopiaError, nowIso } from "../utils/errors.ts";
 
 export type AgentType = "standard" | "claude-privileged" | "steward";
+
+const AGENT_NAME_RE = /^[a-zA-Z0-9_\-\s]{1,64}$/;
 
 export function createAgent(opts: {
   name: string;
   workspaceSlug: string;
   type?: AgentType;
 }): { id: string; name: string; api_key: string; workspace_id: string } {
+  if (!AGENT_NAME_RE.test(opts.name)) {
+    throw new QoopiaError(
+      "INVALID_INPUT",
+      "Agent name contains invalid characters (allowed: letters, digits, underscore, hyphen, space; max 64)",
+    );
+  }
+
   const ws = db
     .prepare(`SELECT id FROM workspaces WHERE slug = ?`)
     .get(opts.workspaceSlug) as { id: string } | undefined;
   if (!ws) throw new QoopiaError("NOT_FOUND", `workspace ${opts.workspaceSlug} not found`);
 
   const existing = db
-    .prepare(`SELECT id FROM agents WHERE name = ? AND workspace_id = ?`)
+    .prepare(`SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1`)
     .get(opts.name, ws.id);
   if (existing)
     throw new QoopiaError(
@@ -26,10 +36,18 @@ export function createAgent(opts: {
 
   const id = ulid();
   const apiKey = generateApiKey();
-  db.prepare(
-    `INSERT INTO agents (id, workspace_id, name, type, api_key_hash, active, created_at)
-     VALUES (?, ?, ?, ?, ?, 1, ?)`,
-  ).run(id, ws.id, opts.name, opts.type || "standard", sha256Hex(apiKey), nowIso());
+  try {
+    db.prepare(
+      `INSERT INTO agents (id, workspace_id, name, type, api_key_hash, active, created_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?)`,
+    ).run(id, ws.id, opts.name, opts.type || "standard", sha256Hex(apiKey), nowIso());
+  } catch (err) {
+    const msg = (err as Error).message || "";
+    if (msg.includes("UNIQUE constraint failed")) {
+      throw new QoopiaError("CONFLICT", "Agent with this name already exists in the workspace");
+    }
+    throw err;
+  }
   return { id, name: opts.name, api_key: apiKey, workspace_id: ws.id };
 }
 
@@ -49,7 +67,7 @@ export function rotateAgentKey(name: string, workspaceSlug: string): string {
     .get(workspaceSlug) as { id: string } | undefined;
   if (!ws) throw new QoopiaError("NOT_FOUND", `workspace ${workspaceSlug} not found`);
   const a = db
-    .prepare(`SELECT id FROM agents WHERE name = ? AND workspace_id = ?`)
+    .prepare(`SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1`)
     .get(name, ws.id) as { id: string } | undefined;
   if (!a) throw new QoopiaError("NOT_FOUND", `agent ${name} not found`);
   const newKey = generateApiKey();
@@ -84,10 +102,15 @@ export function deleteAgent(name: string, workspaceSlug: string) {
     .prepare(`SELECT id FROM workspaces WHERE slug = ?`)
     .get(workspaceSlug) as { id: string } | undefined;
   if (!ws) throw new QoopiaError("NOT_FOUND", `workspace ${workspaceSlug} not found`);
-  const info = db
-    .prepare(`UPDATE agents SET active = 0 WHERE name = ? AND workspace_id = ?`)
-    .run(name, ws.id);
-  if (info.changes === 0)
-    throw new QoopiaError("NOT_FOUND", `agent ${name} not found`);
-  return { deactivated: true };
+  const agent = db
+    .prepare(`SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1`)
+    .get(name, ws.id) as { id: string } | undefined;
+  if (!agent) throw new QoopiaError("NOT_FOUND", `agent ${name} not found`);
+
+  db.prepare(`UPDATE agents SET active = 0 WHERE id = ?`).run(agent.id);
+
+  // C2 fix: revoke all OAuth tokens on deactivation
+  const revoked = revokeAllAgentTokens(agent.id);
+
+  return { deactivated: true, tokens_revoked: revoked };
 }

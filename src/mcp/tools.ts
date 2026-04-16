@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AuthContext } from "../auth/middleware.ts";
 import { QoopiaError } from "../utils/errors.ts";
+import { logger } from "../utils/logger.ts";
 import { NOTE_TYPES } from "../services/notes.ts";
 import {
   createNote,
@@ -46,9 +47,26 @@ function ok(data: unknown) {
 
 function fail(err: unknown) {
   let msg: string;
-  if (err instanceof QoopiaError) msg = `${err.code}: ${err.message}`;
-  else if (err instanceof Error) msg = `INTERNAL: ${err.message}`;
-  else msg = `INTERNAL: ${String(err)}`;
+  if (err instanceof QoopiaError) {
+    msg = `${err.code}: ${err.message}`;
+  } else if (err instanceof Error) {
+    // M4 fix: log internal errors server-side, return stable generic message
+    const raw = err.message;
+    // Translate SQLite busy/lock errors into retryable domain error
+    if (raw.includes("SQLITE_BUSY") || raw.includes("database is locked")) {
+      msg = "BUSY: Database busy, please retry";
+    } else if (raw.includes("UNIQUE constraint failed") && raw.includes("steward")) {
+      msg = "CONFLICT: active steward already exists";
+    } else if (raw.includes("UNIQUE constraint failed")) {
+      msg = "CONFLICT: a record with the same identifier already exists";
+    } else {
+      logger.error("MCP tool internal error", { error: raw, stack: err.stack });
+      msg = "INTERNAL: unexpected error — check server logs";
+    }
+  } else {
+    logger.error("MCP tool unknown error", { error: String(err) });
+    msg = "INTERNAL: unexpected error — check server logs";
+  }
   return {
     isError: true,
     content: [{ type: "text" as const, text: msg }],
@@ -325,6 +343,7 @@ const tools: ToolDef[] = [
     handler: (args, auth) =>
       sessionExpand({
         workspace_id: auth.workspace_id,
+        agent_id: auth.agent_id,
         start_id: Number(args.start_id),
         end_id: Number(args.end_id),
         session_id: args.session_id as string | undefined,
@@ -414,8 +433,11 @@ export function registerTools(
     }
   }
 
-  // V2 backward-compatibility aliases (always on, both profiles)
-  registerCompatTools(server, authProvider);
+  // V2 backward-compatibility aliases: skip for memory-only profile to avoid
+  // re-exposing CRUD operations that memory profile is supposed to restrict.
+  if (profile !== "memory") {
+    registerCompatTools(server, authProvider);
+  }
 }
 
 export function toolNames(profile: ToolProfile = "full"): string[] {

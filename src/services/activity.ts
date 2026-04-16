@@ -53,45 +53,48 @@ export interface ActivityListParams {
 }
 
 export function listActivity(p: ActivityListParams) {
-  const where: string[] = [`workspace_id = ?`];
+  const where: string[] = [`a.workspace_id = ?`];
   const params: any[] = [p.workspace_id];
 
   if (p.entity_type) {
-    where.push(`entity_type = ?`);
+    where.push(`a.entity_type = ?`);
     params.push(p.entity_type);
   }
   if (p.entity_id) {
-    where.push(`entity_id = ?`);
+    where.push(`a.entity_id = ?`);
     params.push(p.entity_id);
   }
   if (p.project_id) {
-    where.push(`project_id = ?`);
+    where.push(`a.project_id = ?`);
     params.push(p.project_id);
   }
   if (p.action) {
-    where.push(`action = ?`);
+    where.push(`a.action = ?`);
     params.push(p.action);
   }
   if (p.agent) {
     where.push(
-      `agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ?)`,
+      `a.agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1)`,
     );
     params.push(p.agent, p.workspace_id);
   }
   if (p.since) {
-    where.push(`created_at >= ?`);
+    where.push(`a.created_at >= ?`);
     params.push(p.since);
   }
   if (p.until) {
-    where.push(`created_at <= ?`);
+    where.push(`a.created_at <= ?`);
     params.push(p.until);
   }
 
   const limit = Math.min(Math.max(p.limit || 50, 1), 500);
-  const sql = `SELECT id, action, entity_type, entity_id, project_id, agent_id, summary, details, created_at
-               FROM activity
+  const sql = `SELECT a.id, a.action, a.entity_type, a.entity_id, a.project_id, a.agent_id,
+                      ag.name as agent_name,
+                      a.summary, a.details, a.created_at
+               FROM activity a
+               LEFT JOIN agents ag ON ag.id = a.agent_id
                WHERE ${where.join(" AND ")}
-               ORDER BY created_at DESC
+               ORDER BY a.created_at DESC
                LIMIT ?`;
   const items = db.prepare(sql).all(...params, limit) as Array<{
     id: string;
@@ -100,6 +103,7 @@ export function listActivity(p: ActivityListParams) {
     entity_id: string | null;
     project_id: string | null;
     agent_id: string | null;
+    agent_name: string | null;
     summary: string;
     details: string;
     created_at: string;
@@ -107,7 +111,7 @@ export function listActivity(p: ActivityListParams) {
 
   const totalRow = db
     .prepare(
-      `SELECT COUNT(*) as c FROM activity WHERE ${where.join(" AND ")}`,
+      `SELECT COUNT(*) as c FROM activity a WHERE ${where.join(" AND ")}`,
     )
     .get(...params) as { c: number };
 

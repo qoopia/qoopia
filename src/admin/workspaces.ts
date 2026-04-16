@@ -14,6 +14,13 @@ export function createWorkspace(opts: { name: string; slug?: string }): {
       .trim()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "");
+  // M9 fix: reject empty slugs (e.g. name was punctuation-only)
+  if (!slug || !/[a-z0-9]/.test(slug)) {
+    throw new QoopiaError(
+      "INVALID_INPUT",
+      "Derived slug is empty or has no alphanumeric characters. Provide an explicit --slug or use a name with letters/digits.",
+    );
+  }
   const existing = db
     .prepare(`SELECT id FROM workspaces WHERE slug = ?`)
     .get(slug);

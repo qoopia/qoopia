@@ -87,16 +87,16 @@ export function createNote(input: NoteCreateInput) {
 
   const type = input.type || "note";
 
-  // Validate project_id references an existing project note
+  // Validate project_id references an existing project note (M1 fix: enforce type='project')
   if (input.project_id) {
     const p = db
       .prepare(
-        `SELECT id, type FROM notes WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`,
+        `SELECT id, type FROM notes WHERE id = ? AND workspace_id = ? AND type = 'project' AND deleted_at IS NULL`,
       )
       .get(input.project_id, input.workspace_id) as
       | { id: string; type: string }
       | undefined;
-    if (!p) throw new QoopiaError("NOT_FOUND", "project_id not found");
+    if (!p) throw new QoopiaError("NOT_FOUND", "project_id not found or not a project");
   }
   if (input.task_bound_id) {
     const t = db
@@ -113,43 +113,51 @@ export function createNote(input: NoteCreateInput) {
 
   const id = ulid();
   const now = nowIso();
-  db.prepare(
-    `INSERT INTO notes
-      (id, workspace_id, agent_id, type, text, metadata, project_id, task_bound_id, session_id, source, tags, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    input.workspace_id,
-    input.agent_id,
-    type,
-    input.text,
-    JSON.stringify(input.metadata || {}),
-    input.project_id || null,
-    input.task_bound_id || null,
-    input.session_id || null,
-    input.source || "mcp",
-    JSON.stringify(input.tags || []),
-    now,
-    now,
-  );
 
-  logActivity({
-    workspace_id: input.workspace_id,
-    agent_id: input.agent_id,
-    action: "created",
-    entity_type: "note",
-    entity_id: id,
-    project_id: input.project_id || null,
-    summary: `Created ${type}: ${input.text.slice(0, 80)}`,
-  });
+  // H6 fix: wrap insert + logActivity in a single transaction so partial failure
+  // never leaves the note created without an audit entry or vice versa.
+  const result = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO notes
+        (id, workspace_id, agent_id, type, text, metadata, project_id, task_bound_id, session_id, source, tags, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      input.workspace_id,
+      input.agent_id,
+      type,
+      input.text,
+      JSON.stringify(input.metadata || {}),
+      input.project_id || null,
+      input.task_bound_id || null,
+      input.session_id || null,
+      input.source || "mcp",
+      JSON.stringify(input.tags || []),
+      now,
+      now,
+    );
 
-  return { created: true, id, type, workspace_id: input.workspace_id, created_at: now };
+    logActivity({
+      workspace_id: input.workspace_id,
+      agent_id: input.agent_id,
+      action: "created",
+      entity_type: "note",
+      entity_id: id,
+      project_id: input.project_id || null,
+      summary: `Created ${type}: ${input.text.slice(0, 80)}`,
+    });
+
+    return { created: true, id, type, workspace_id: input.workspace_id, created_at: now };
+  })();
+
+  return result;
 }
 
 export function getNote(workspace_id: string, id: string) {
+  // H3 fix: exclude soft-deleted notes
   const r = db
     .prepare(
-      `SELECT * FROM notes WHERE id = ? AND workspace_id = ? LIMIT 1`,
+      `SELECT * FROM notes WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL LIMIT 1`,
     )
     .get(id, workspace_id) as NoteRow | undefined;
   if (!r) throw new QoopiaError("NOT_FOUND", `note ${id} not found`);
@@ -195,7 +203,7 @@ export function listNotes(p: NoteListParams) {
   }
   if (p.agent) {
     where.push(
-      `agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ?)`,
+      `agent_id IN (SELECT id FROM agents WHERE name = ? AND workspace_id = ? AND active = 1)`,
     );
     params.push(p.agent, p.workspace_id);
   }
@@ -271,9 +279,10 @@ export interface NoteUpdateInput {
 }
 
 export function updateNote(input: NoteUpdateInput) {
+  // H2 fix: exclude soft-deleted notes, consistent with getNote
   const existing = db
     .prepare(
-      `SELECT * FROM notes WHERE id = ? AND workspace_id = ? LIMIT 1`,
+      `SELECT * FROM notes WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL LIMIT 1`,
     )
     .get(input.id, input.workspace_id) as NoteRow | undefined;
   if (!existing)
@@ -296,6 +305,30 @@ export function updateNote(input: NoteUpdateInput) {
   }
   if (input.metadata_replace) {
     assertNoSecrets(JSON.stringify(input.metadata_replace), "note.metadata");
+  }
+
+  // H2 fix: re-validate project_id and task_bound_id on update (same as create)
+  if (input.project_id !== undefined && input.project_id !== null) {
+    const p = db
+      .prepare(
+        `SELECT id, type FROM notes WHERE id = ? AND workspace_id = ? AND type = 'project' AND deleted_at IS NULL`,
+      )
+      .get(input.project_id, input.workspace_id) as
+      | { id: string; type: string }
+      | undefined;
+    if (!p) throw new QoopiaError("NOT_FOUND", "project_id not found or not a project");
+  }
+  if (input.task_bound_id !== undefined && input.task_bound_id !== null) {
+    const t = db
+      .prepare(
+        `SELECT id, type FROM notes WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`,
+      )
+      .get(input.task_bound_id, input.workspace_id) as
+      | { id: string; type: string }
+      | undefined;
+    if (!t) throw new QoopiaError("NOT_FOUND", "task_bound_id not found");
+    if (t.type !== "task")
+      throw new QoopiaError("INVALID_INPUT", "task_bound_id must reference a task");
   }
 
   const fields: string[] = [];
@@ -344,22 +377,30 @@ export function updateNote(input: NoteUpdateInput) {
   fields.push(`updated_at = ?`);
   values.push(now);
 
-  db.prepare(
-    `UPDATE notes SET ${fields.join(", ")} WHERE id = ? AND workspace_id = ?`,
-  ).run(...values, input.id, input.workspace_id);
+  // H6 fix: wrap update + logActivity atomically
+  const result = db.transaction(() => {
+    db.prepare(
+      `UPDATE notes SET ${fields.join(", ")} WHERE id = ? AND workspace_id = ?`,
+    ).run(...values, input.id, input.workspace_id);
 
-  logActivity({
-    workspace_id: input.workspace_id,
-    agent_id: input.agent_id,
-    action: "updated",
-    entity_type: "note",
-    entity_id: input.id,
-    project_id: existing.project_id,
-    summary: `Updated ${existing.type}: ${updated.join(", ")}`,
-    details: { fields_updated: updated },
-  });
+    // Use the new project_id if it was changed, otherwise keep the existing one
+    const effectiveProjectId =
+      input.project_id !== undefined ? input.project_id : existing.project_id;
+    logActivity({
+      workspace_id: input.workspace_id,
+      agent_id: input.agent_id,
+      action: "updated",
+      entity_type: "note",
+      entity_id: input.id,
+      project_id: effectiveProjectId,
+      summary: `Updated ${existing.type}: ${updated.join(", ")}`,
+      details: { fields_updated: updated },
+    });
 
-  return { updated: true, id: input.id, fields_updated: updated, updated_at: now };
+    return { updated: true, id: input.id, fields_updated: updated, updated_at: now };
+  })();
+
+  return result;
 }
 
 export function deleteNote(workspace_id: string, agent_id: string, id: string) {
@@ -373,19 +414,31 @@ export function deleteNote(workspace_id: string, agent_id: string, id: string) {
   if (!existing) throw new QoopiaError("NOT_FOUND", `note ${id} not found`);
 
   const now = nowIso();
-  db.prepare(
-    `UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND workspace_id = ?`,
-  ).run(now, now, id, workspace_id);
 
-  logActivity({
-    workspace_id,
-    agent_id,
-    action: "deleted",
-    entity_type: "note",
-    entity_id: id,
-    project_id: existing.project_id,
-    summary: `Deleted ${existing.type} ${id}`,
-  });
+  // H6 fix: wrap soft-delete + logActivity atomically
+  // M12 fix: remove from FTS index on soft-delete to prevent monotonic index growth
+  const result = db.transaction(() => {
+    db.prepare(
+      `UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND workspace_id = ?`,
+    ).run(now, now, id, workspace_id);
 
-  return { deleted: true, id };
+    // Remove from FTS index — find rowid via the notes row we just soft-deleted
+    db.prepare(
+      `DELETE FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?)`,
+    ).run(id);
+
+    logActivity({
+      workspace_id,
+      agent_id,
+      action: "deleted",
+      entity_type: "note",
+      entity_id: id,
+      project_id: existing.project_id,
+      summary: `Deleted ${existing.type} ${id}`,
+    });
+
+    return { deleted: true, id };
+  })();
+
+  return result;
 }

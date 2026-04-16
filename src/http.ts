@@ -1,5 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { AsyncLocalStorage } from "node:async_hooks";
+import crypto from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
@@ -9,7 +13,7 @@ import {
   createAuthorizationCode,
   exchangeCodeForTokens,
   refreshTokens,
-  revokeToken,
+  revokeTokenForClient,
   registerClient,
   getClient,
   clientWorkspace,
@@ -18,6 +22,28 @@ import { db } from "./db/connection.ts";
 import { env } from "./utils/env.ts";
 import { logger } from "./utils/logger.ts";
 import { apiLimiter, authLimiter } from "./utils/rate-limit.ts";
+
+// --- OAuth consent nonces ---
+// Server-generated one-time nonces for the consent form POST.
+// Keyed by nonce string, value holds the pending authorization parameters.
+interface ConsentNonce {
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  codeChallengeMethod: string;
+  state: string;
+  scope: string;
+  expires: number; // unix ms
+}
+const consentNonces = new Map<string, ConsentNonce>();
+const NONCE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function pruneNonces() {
+  const now = Date.now();
+  for (const [k, v] of consentNonces) {
+    if (v.expires < now) consentNonces.delete(k);
+  }
+}
 
 // --- CORS allowlist ---
 const ALLOWED_ORIGINS = new Set([
@@ -42,13 +68,22 @@ export function getCurrentAuth(): AuthContext | null {
 }
 
 // --- Client IP extraction ---
+// Only trust cf-connecting-ip from actual Cloudflare (remote is loopback or private).
+// On a direct connection, use socket address to prevent header spoofing.
 function getClientIp(req: IncomingMessage): string {
-  return (
-    (req.headers["cf-connecting-ip"] as string) ||
-    (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
-    req.socket?.remoteAddress ||
-    "unknown"
-  );
+  const remote = req.socket?.remoteAddress || "unknown";
+  const isLocal = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+  // Only trust proxy headers when TRUST_PROXY=true (default) AND the connection
+  // arrives from loopback (i.e. through cloudflared or a local reverse proxy).
+  if (isLocal && env.TRUST_PROXY) {
+    return (
+      (req.headers["cf-connecting-ip"] as string) ||
+      (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+      remote
+    );
+  }
+  // Direct connection or TRUST_PROXY=false — use socket address only
+  return remote;
 }
 
 /**
@@ -70,9 +105,17 @@ interface NodeReqWithBody extends IncomingMessage {
   _body?: Buffer;
 }
 
+const MAX_BODY_BYTES = 1_048_576; // 1 MB
+
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
+    total += (chunk as Buffer).length;
+    if (total > MAX_BODY_BYTES) {
+      req.destroy();
+      throw new Error("payload_too_large");
+    }
     chunks.push(chunk as Buffer);
   }
   return Buffer.concat(chunks);
@@ -134,9 +177,14 @@ export function startHttpServer() {
     try {
       await handleRequest(req as NodeReqWithBody, res);
     } catch (err) {
-      logger.error("Request handler failed", { error: String(err) });
+      const msg = (err as Error).message || "";
       if (!res.headersSent) {
-        json(res, 500, { error: "internal_error" });
+        if (msg === "payload_too_large") {
+          json(res, 413, { error: "payload_too_large", max_bytes: MAX_BODY_BYTES });
+        } else {
+          logger.error("Request handler failed", { error: String(err) });
+          json(res, 500, { error: "internal_error" });
+        }
       }
     }
   });
@@ -193,9 +241,14 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     return text(
       res,
       200,
-      `Qoopia V3.0 MCP server\nMCP endpoint: ${env.PUBLIC_URL}/mcp\nHealth: ${env.PUBLIC_URL}/health\n`,
+      `Qoopia V3.0 MCP server\nMCP endpoint: ${env.PUBLIC_URL}/mcp\nHealth: ${env.PUBLIC_URL}/health\nDashboard: ${env.PUBLIC_URL}/dashboard\n`,
       req,
     );
+  }
+
+  // --- Dashboard ---
+  if (url === "/dashboard") {
+    return serveDashboard(res);
   }
 
   // --- OAuth discovery ---
@@ -239,6 +292,10 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       res.end(JSON.stringify({ error: "too_many_requests" }));
       return;
     }
+    // Require admin secret for client registration (prevents anonymous self-service)
+    if (!checkAdminSecret(req)) {
+      return json(res, 401, { error: "unauthorized", error_description: "Admin secret required for client registration" });
+    }
     const body = await readBody(req);
     return handleRegister(body, res);
   }
@@ -253,6 +310,30 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   }
 
   return json(res, 404, { error: "not_found" }, req);
+}
+
+// ---------- Dashboard ----------
+
+let dashboardHtml: string | null = null;
+
+function serveDashboard(res: ServerResponse) {
+  if (!dashboardHtml) {
+    try {
+      const thisDir = typeof __dirname !== "undefined"
+        ? __dirname
+        : dirname(fileURLToPath(import.meta.url));
+      dashboardHtml = readFileSync(join(thisDir, "public", "dashboard.html"), "utf8");
+    } catch {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("Dashboard not found");
+      return;
+    }
+  }
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-cache",
+  });
+  res.end(dashboardHtml);
 }
 
 // ---------- MCP handler ----------
@@ -304,12 +385,42 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
     });
 
     await server.connect(transport);
-    const parsedBody = body && body.length > 0 ? JSON.parse(body.toString("utf8")) : undefined;
+    let parsedBody: unknown;
+    if (body && body.length > 0) {
+      try {
+        parsedBody = JSON.parse(body.toString("utf8"));
+      } catch {
+        return json(res, 400, { error: "invalid_json", message: "Request body is not valid JSON" }, req);
+      }
+    }
     await transport.handleRequest(req, res, parsedBody);
   });
 }
 
 // ---------- OAuth handlers ----------
+
+/**
+ * Check that the request carries the admin secret (Bearer or X-Admin-Secret header).
+ * If ADMIN_SECRET is not configured, returns false (deny-by-default).
+ */
+function checkAdminSecret(req: IncomingMessage): boolean {
+  if (!env.ADMIN_SECRET) return false;
+  const expected = Buffer.from(env.ADMIN_SECRET);
+  const authHeader = req.headers["authorization"] as string | undefined;
+  if (authHeader) {
+    const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (bearer) {
+      const provided = Buffer.from(bearer);
+      if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return true;
+    }
+  }
+  const xSecret = req.headers["x-admin-secret"] as string | undefined;
+  if (xSecret) {
+    const provided = Buffer.from(xSecret);
+    if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return true;
+  }
+  return false;
+}
 
 function parseForm(body: Buffer): Record<string, string> {
   const out: Record<string, string> = {};
@@ -317,7 +428,16 @@ function parseForm(body: Buffer): Record<string, string> {
   for (const pair of s.split("&")) {
     const [k, v = ""] = pair.split("=");
     if (!k) continue;
-    out[decodeURIComponent(k)] = decodeURIComponent(v.replace(/\+/g, " "));
+    let key: string;
+    let val: string;
+    try {
+      key = decodeURIComponent(k);
+      val = decodeURIComponent(v.replace(/\+/g, " "));
+    } catch {
+      // Malformed percent-encoding — throw controlled 400 (caught by callers)
+      throw Object.assign(new Error("invalid_request"), { statusCode: 400 });
+    }
+    out[key] = val;
   }
   return out;
 }
@@ -371,6 +491,20 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
     });
   }
 
+  // Generate a one-time nonce that authenticates the consent POST without
+  // requiring the admin secret in the browser form (fix for audit issue #1).
+  pruneNonces();
+  const nonce = crypto.randomUUID();
+  consentNonces.set(nonce, {
+    clientId,
+    redirectUri,
+    codeChallenge,
+    codeChallengeMethod,
+    state,
+    scope,
+    expires: Date.now() + NONCE_TTL_MS,
+  });
+
   const safeName = escapeHtml(client.name || "Unknown Client");
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -399,12 +533,7 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
     <p><span class="client">${safeName}</span> wants to connect to Qoopia</p>
     <p class="info">This will grant access to your notes, tasks, deals, contacts, finances, and session memory.</p>
     <form method="POST" action="/oauth/authorize">
-      <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
-      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
-      <input type="hidden" name="state" value="${escapeHtml(state)}">
-      <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
-      <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}">
-      <input type="hidden" name="scope" value="${escapeHtml(scope)}">
+      <input type="hidden" name="nonce" value="${escapeHtml(nonce)}">
       <div class="actions">
         <button type="submit" name="action" value="deny" class="deny">Deny</button>
         <button type="submit" name="action" value="approve" class="approve">Approve</button>
@@ -421,17 +550,29 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
 }
 
 function handleAuthorizePost(body: Buffer, res: ServerResponse) {
-  const form = parseForm(body);
-  const action = form.action || "approve";
-  const clientId = form.client_id;
-  const redirectUri = form.redirect_uri;
-  const codeChallenge = form.code_challenge;
-  const codeChallengeMethod = form.code_challenge_method || "S256";
-  const state = form.state || "";
-
-  if (!clientId || !redirectUri || !codeChallenge) {
-    return json(res, 400, { error: "invalid_request" });
+  let form: Record<string, string>;
+  try {
+    form = parseForm(body);
+  } catch {
+    return json(res, 400, { error: "invalid_request", error_description: "malformed form body" });
   }
+  const action = form.action || "approve";
+  const nonce = form.nonce;
+
+  // Validate one-time nonce — this authenticates the consent POST without
+  // requiring the admin secret header from the browser form.
+  if (!nonce) {
+    return json(res, 400, { error: "invalid_request", error_description: "Missing nonce" });
+  }
+  pruneNonces();
+  const pending = consentNonces.get(nonce);
+  if (!pending) {
+    return json(res, 400, { error: "invalid_request", error_description: "Invalid or expired nonce" });
+  }
+  // Consume nonce immediately (one-time use)
+  consentNonces.delete(nonce);
+
+  const { clientId, redirectUri, codeChallenge, codeChallengeMethod, state } = pending;
 
   if (action === "deny") {
     const url = new URL(redirectUri);
@@ -445,12 +586,6 @@ function handleAuthorizePost(body: Buffer, res: ServerResponse) {
   const client = getClient(clientId);
   if (!client) {
     return json(res, 400, { error: "invalid_client" });
-  }
-  if (!client.redirect_uris.includes(redirectUri)) {
-    return json(res, 400, {
-      error: "invalid_request",
-      error_description: "redirect_uri not registered",
-    });
   }
   const ws = clientWorkspace(clientId);
   if (!ws) {
@@ -519,21 +654,39 @@ function handleRegister(body: Buffer, res: ServerResponse) {
   }
 }
 
+function jsonToken(res: ServerResponse, status: number, body: unknown) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": String(Buffer.byteLength(payload)),
+    "cache-control": "no-store",
+    "pragma": "no-cache",
+    "x-content-type-options": "nosniff",
+  });
+  res.end(payload);
+}
+
 function handleToken(body: Buffer, res: ServerResponse) {
-  const form = parseForm(body);
+  let form: Record<string, string>;
+  try {
+    form = parseForm(body);
+  } catch {
+    return jsonToken(res, 400, { error: "invalid_request" });
+  }
   const grantType = form.grant_type;
   try {
     if (grantType === "authorization_code") {
       if (!form.code || !form.code_verifier || !form.redirect_uri || !form.client_id) {
-        return json(res, 400, { error: "invalid_request" });
+        return jsonToken(res, 400, { error: "invalid_request" });
       }
       const out = exchangeCodeForTokens({
         code: form.code,
         codeVerifier: form.code_verifier,
         redirectUri: form.redirect_uri,
         clientId: form.client_id,
+        clientSecret: form.client_secret,
       });
-      return json(res, 200, {
+      return jsonToken(res, 200, {
         access_token: out.access,
         refresh_token: out.refresh,
         token_type: "Bearer",
@@ -542,31 +695,50 @@ function handleToken(body: Buffer, res: ServerResponse) {
     }
     if (grantType === "refresh_token") {
       if (!form.refresh_token || !form.client_id) {
-        return json(res, 400, { error: "invalid_request" });
+        return jsonToken(res, 400, { error: "invalid_request" });
       }
       const out = refreshTokens({
         refreshToken: form.refresh_token,
         clientId: form.client_id,
+        clientSecret: form.client_secret,
       });
-      return json(res, 200, {
+      return jsonToken(res, 200, {
         access_token: out.access,
         refresh_token: out.refresh,
         token_type: "Bearer",
         expires_in: out.expiresInSec,
       });
     }
-    return json(res, 400, { error: "unsupported_grant_type" });
+    return jsonToken(res, 400, { error: "unsupported_grant_type" });
   } catch (err) {
-    return json(res, 400, { error: (err as Error).message || "invalid_grant" });
+    return jsonToken(res, 400, { error: (err as Error).message || "invalid_grant" });
   }
 }
 
 function handleRevoke(body: Buffer, res: ServerResponse) {
-  const form = parseForm(body);
+  let form: Record<string, string>;
+  try {
+    form = parseForm(body);
+  } catch {
+    return json(res, 400, { error: "invalid_request", error_description: "malformed form body" });
+  }
   const token = form.token;
-  if (!token) return json(res, 400, { error: "invalid_request" });
-  revokeToken(token);
-  return json(res, 200, { revoked: true });
+  const clientId = form.client_id;
+  if (!token) return json(res, 400, { error: "invalid_request", error_description: "token is required" });
+  if (!clientId) return json(res, 400, { error: "invalid_request", error_description: "client_id is required" });
+  // Per RFC 7009: confidential clients must supply client_secret.
+  // revokeTokenForClient validates the secret and throws "invalid_client" if wrong.
+  try {
+    const revoked = revokeTokenForClient(token, clientId, form.client_secret);
+    // RFC 7009 §2.2: always return 200 even if token was not found (avoid enumeration)
+    return json(res, 200, { revoked });
+  } catch (err) {
+    const msg = (err as Error).message || "";
+    if (msg === "invalid_client") {
+      return json(res, 401, { error: "invalid_client", error_description: "Client authentication failed" });
+    }
+    return json(res, 500, { error: "server_error" });
+  }
 }
 
 function escapeHtml(s: string): string {

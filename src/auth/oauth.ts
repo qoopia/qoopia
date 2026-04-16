@@ -88,105 +88,140 @@ export function exchangeCodeForTokens(opts: {
   codeVerifier: string;
   redirectUri: string;
   clientId: string;
+  clientSecret?: string;
 }): { access: string; refresh: string; expiresInSec: number } {
-  const codeRow = findActiveToken(opts.code);
-  if (!codeRow || codeRow.token_type !== "code") {
-    throw new Error("invalid_grant");
-  }
-  if (codeRow.client_id !== opts.clientId) throw new Error("invalid_client");
-  if (codeRow.redirect_uri !== opts.redirectUri) throw new Error("invalid_grant");
-
-  // PKCE verify
-  const method = (codeRow.code_challenge_method || "S256").toUpperCase();
-  let computed: string;
-  if (method === "S256") {
-    computed = crypto
-      .createHash("sha256")
-      .update(opts.codeVerifier)
-      .digest("base64url");
-  } else {
-    computed = opts.codeVerifier;
-  }
-  if (computed !== codeRow.code_challenge) {
-    throw new Error("invalid_grant");
+  // Validate client_secret before entering the transaction (read-only check)
+  const clientRow = getClient(opts.clientId);
+  if (clientRow && clientRow.client_secret_hash) {
+    if (!opts.clientSecret) throw new Error("invalid_client");
+    if (sha256Hex(opts.clientSecret) !== clientRow.client_secret_hash) {
+      throw new Error("invalid_client");
+    }
   }
 
-  // Burn code
-  db.prepare(
-    `UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ?`,
-  ).run(codeRow.token_hash);
+  return db.transaction(() => {
+    const codeHash = sha256Hex(opts.code);
+    // Atomically revoke the code — only succeeds if it exists and is still active
+    const revokeInfo = db.prepare(
+      `UPDATE oauth_tokens SET revoked = 1
+       WHERE token_hash = ? AND revoked = 0 AND token_type = 'code'
+         AND expires_at > ? AND client_id = ?`,
+    ).run(codeHash, nowIso(), opts.clientId);
 
-  // Issue tokens
-  const access = genOpaque("qa");
-  const refresh = genOpaque("qr");
-  const now = nowIso();
-  const stmt = db.prepare(
-    `INSERT INTO oauth_tokens
-      (token_hash, client_id, agent_id, workspace_id, token_type, expires_at, revoked, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
-  );
-  stmt.run(
-    sha256Hex(access),
-    codeRow.client_id,
-    codeRow.agent_id,
-    codeRow.workspace_id,
-    "access",
-    plusSec(ACCESS_TTL_SEC),
-    now,
-  );
-  stmt.run(
-    sha256Hex(refresh),
-    codeRow.client_id,
-    codeRow.agent_id,
-    codeRow.workspace_id,
-    "refresh",
-    plusSec(REFRESH_TTL_SEC),
-    now,
-  );
-  return { access, refresh, expiresInSec: ACCESS_TTL_SEC };
+    if (revokeInfo.changes !== 1) throw new Error("invalid_grant");
+
+    // Fetch the code row we just revoked (for PKCE & redirect verification)
+    const codeRow = db.prepare(
+      `SELECT * FROM oauth_tokens WHERE token_hash = ?`,
+    ).get(codeHash) as OAuthTokenRecord | undefined;
+    if (!codeRow) throw new Error("invalid_grant");
+    if (codeRow.redirect_uri !== opts.redirectUri) throw new Error("invalid_grant");
+
+    // PKCE verify
+    const method = (codeRow.code_challenge_method || "S256").toUpperCase();
+    let computed: string;
+    if (method === "S256") {
+      computed = crypto
+        .createHash("sha256")
+        .update(opts.codeVerifier)
+        .digest("base64url");
+    } else {
+      computed = opts.codeVerifier;
+    }
+    if (computed !== codeRow.code_challenge) {
+      throw new Error("invalid_grant");
+    }
+
+    // Issue tokens
+    const access = genOpaque("qa");
+    const refresh = genOpaque("qr");
+    const now = nowIso();
+    const stmt = db.prepare(
+      `INSERT INTO oauth_tokens
+        (token_hash, client_id, agent_id, workspace_id, token_type, expires_at, revoked, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+    );
+    stmt.run(
+      sha256Hex(access),
+      codeRow.client_id,
+      codeRow.agent_id,
+      codeRow.workspace_id,
+      "access",
+      plusSec(ACCESS_TTL_SEC),
+      now,
+    );
+    stmt.run(
+      sha256Hex(refresh),
+      codeRow.client_id,
+      codeRow.agent_id,
+      codeRow.workspace_id,
+      "refresh",
+      plusSec(REFRESH_TTL_SEC),
+      now,
+    );
+    return { access, refresh, expiresInSec: ACCESS_TTL_SEC };
+  })();
 }
 
 export function refreshTokens(opts: {
   refreshToken: string;
   clientId: string;
+  clientSecret?: string;
 }): { access: string; refresh: string; expiresInSec: number } {
-  const row = findActiveToken(opts.refreshToken);
-  if (!row || row.token_type !== "refresh") throw new Error("invalid_grant");
-  if (row.client_id !== opts.clientId) throw new Error("invalid_client");
+  // Validate client_secret before entering the transaction (read-only check)
+  const clientRow = getClient(opts.clientId);
+  if (clientRow && clientRow.client_secret_hash) {
+    if (!opts.clientSecret) throw new Error("invalid_client");
+    if (sha256Hex(opts.clientSecret) !== clientRow.client_secret_hash) {
+      throw new Error("invalid_client");
+    }
+  }
 
-  // Issue a fresh access token; reuse refresh (simpler) OR rotate it.
-  // We rotate for security — revoke old refresh.
-  db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ?`).run(
-    row.token_hash,
-  );
+  return db.transaction(() => {
+    const refreshHash = sha256Hex(opts.refreshToken);
+    // Atomically revoke the refresh token — only succeeds once
+    const revokeInfo = db.prepare(
+      `UPDATE oauth_tokens SET revoked = 1
+       WHERE token_hash = ? AND revoked = 0 AND token_type = 'refresh'
+         AND expires_at > ? AND client_id = ?`,
+    ).run(refreshHash, nowIso(), opts.clientId);
 
-  const access = genOpaque("qa");
-  const refresh = genOpaque("qr");
-  const now = nowIso();
-  const stmt = db.prepare(
-    `INSERT INTO oauth_tokens
-      (token_hash, client_id, agent_id, workspace_id, token_type, expires_at, revoked, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
-  );
-  stmt.run(
-    sha256Hex(access),
-    row.client_id,
-    row.agent_id,
-    row.workspace_id,
-    "access",
-    plusSec(ACCESS_TTL_SEC),
-    now,
-  );
-  stmt.run(
-    sha256Hex(refresh),
-    row.client_id,
-    row.agent_id,
-    row.workspace_id,
-    "refresh",
-    plusSec(REFRESH_TTL_SEC),
-    now,
-  );
-  return { access, refresh, expiresInSec: ACCESS_TTL_SEC };
+    if (revokeInfo.changes !== 1) throw new Error("invalid_grant");
+
+    // Fetch row for agent/workspace
+    const row = db.prepare(
+      `SELECT * FROM oauth_tokens WHERE token_hash = ?`,
+    ).get(refreshHash) as OAuthTokenRecord | undefined;
+    if (!row) throw new Error("invalid_grant");
+
+    const access = genOpaque("qa");
+    const refresh = genOpaque("qr");
+    const now = nowIso();
+    const stmt = db.prepare(
+      `INSERT INTO oauth_tokens
+        (token_hash, client_id, agent_id, workspace_id, token_type, expires_at, revoked, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+    );
+    stmt.run(
+      sha256Hex(access),
+      row.client_id,
+      row.agent_id,
+      row.workspace_id,
+      "access",
+      plusSec(ACCESS_TTL_SEC),
+      now,
+    );
+    stmt.run(
+      sha256Hex(refresh),
+      row.client_id,
+      row.agent_id,
+      row.workspace_id,
+      "refresh",
+      plusSec(REFRESH_TTL_SEC),
+      now,
+    );
+    return { access, refresh, expiresInSec: ACCESS_TTL_SEC };
+  })();
 }
 
 export function revokeToken(token: string): boolean {
@@ -194,6 +229,37 @@ export function revokeToken(token: string): boolean {
   const info = db
     .prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ?`)
     .run(hash);
+  return info.changes > 0;
+}
+
+/**
+ * Revoke a token only if it belongs to the specified client.
+ * Per RFC 7009: confidential clients must authenticate with client_secret before revocation.
+ * Public clients (no client_secret_hash) may revoke without a secret.
+ */
+export function revokeTokenForClient(
+  token: string,
+  clientId: string,
+  clientSecret?: string,
+): boolean {
+  const client = getClient(clientId);
+  if (!client) {
+    // Unknown client — return false (RFC 7009: don't reveal token existence)
+    return false;
+  }
+  // Confidential client: require and verify client_secret
+  if (client.client_secret_hash) {
+    if (!clientSecret) {
+      throw new Error("invalid_client");
+    }
+    if (sha256Hex(clientSecret) !== client.client_secret_hash) {
+      throw new Error("invalid_client");
+    }
+  }
+  const hash = sha256Hex(token);
+  const info = db
+    .prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ? AND client_id = ?`)
+    .run(hash, clientId);
   return info.changes > 0;
 }
 
@@ -221,16 +287,46 @@ export function registerClient(input: {
   if (!Array.isArray(input.redirect_uris) || input.redirect_uris.length === 0) {
     throw new Error("redirect_uris must be a non-empty array");
   }
-  // Prefer a claude-privileged agent (cross-workspace read capability for
-  // Claude.ai connector); fall back to first active agent.
+  for (const uri of input.redirect_uris) {
+    if (typeof uri !== "string") {
+      throw new Error(`Invalid redirect URI: must be a string`);
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(uri);
+    } catch {
+      throw new Error(`Invalid redirect URI: ${uri}`);
+    }
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      throw new Error(`Invalid redirect URI scheme: ${uri} (only http/https allowed)`);
+    }
+  }
+  // Guard: if multiple workspaces exist, explicit workspace binding is required.
+  // This prevents implicit binding to the wrong workspace in multi-workspace deployments.
+  const wsCount = (db
+    .prepare(`SELECT COUNT(*) as c FROM workspaces`)
+    .get() as { c: number }).c;
+  if (wsCount > 1) {
+    throw new Error(
+      "Multi-workspace OAuth registration requires explicit workspace binding — contact admin",
+    );
+  }
+
+  // C1 fix: restrict to agents in the default workspace (single-user assumption).
+  // Prefer claude-privileged for Claude.ai connector; fall back to first active.
+  const defaultWs = db
+    .prepare(`SELECT id FROM workspaces ORDER BY created_at ASC LIMIT 1`)
+    .get() as { id: string } | undefined;
+  if (!defaultWs) throw new Error("No workspace configured");
+
   const agent = (db
     .prepare(
       `SELECT id, workspace_id FROM agents
-       WHERE active = 1
+       WHERE active = 1 AND workspace_id = ?
        ORDER BY (type = 'claude-privileged') DESC, created_at ASC
        LIMIT 1`,
     )
-    .get() as { id: string; workspace_id: string } | undefined);
+    .get(defaultWs.id) as { id: string; workspace_id: string } | undefined);
   if (!agent) throw new Error("No active agent available");
 
   const authMethod = input.token_endpoint_auth_method || "none";
@@ -243,7 +339,7 @@ export function registerClient(input: {
   let client_secret: string | undefined;
   let secretHash = "";
   if (!isPublic) {
-    client_secret = crypto.randomBytes(32).toString("base64url");
+    client_secret = `qcs_${crypto.randomBytes(32).toString("base64url")}`;
     secretHash = sha256Hex(client_secret);
   }
 
@@ -309,11 +405,22 @@ export function clientWorkspace(client_id: string): {
 } | null {
   const c = getClient(client_id);
   if (!c) return null;
+  // C2 fix: only return workspace if agent is still active
   const a = db
-    .prepare(`SELECT id, workspace_id FROM agents WHERE id = ?`)
+    .prepare(`SELECT id, workspace_id FROM agents WHERE id = ? AND active = 1`)
     .get(c.agent_id) as { id: string; workspace_id: string } | undefined;
   if (!a) return null;
   return { agent_id: a.id, workspace_id: a.workspace_id };
+}
+
+/**
+ * Revoke all OAuth tokens for an agent (call on deactivation).
+ */
+export function revokeAllAgentTokens(agentId: string): number {
+  const info = db
+    .prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE agent_id = ? AND revoked = 0`)
+    .run(agentId);
+  return info.changes;
 }
 
 export function wellKnownAuthorizationServer() {
