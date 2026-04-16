@@ -525,6 +525,7 @@ async function flushQueue() {
       await postIngest(entry.payload);
       queue.splice(idx, 1);
       anySuccess = true;
+      console.log(`[tailer] POST ok: ${entry.payload.session_id} uuid=${entry.payload.uuid} role=${entry.payload.role}`);
     } catch (err) {
       entry.attempts += 1;
       const backoff = Math.min(
