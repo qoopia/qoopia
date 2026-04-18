@@ -1,87 +1,121 @@
-# Qoopia V3 — Workspace
+# Qoopia
 
-Рабочая мастерская для редизайна Qoopia. **Прод-система живёт в `~/.openclaw/qoopia/` и её мы не трогаем**, пока не закончим проектирование и не согласуем миграцию.
+Persistent memory and context server for Claude Code agents. Gives your agents a shared brain — notes, tasks, sessions, and recall — so they remember what matters across restarts and conversations.
 
-## Цель
+## What it does
 
-Превратить Qoopia в:
-1. Стабильный **RAG-слой** — единый источник знаний для всех агентов
-2. Единый **источник правды** по сущностям (tasks, deals, contacts, finances, notes, projects)
-3. Стабильный **MCP сервер** для любой системы, которая хочет подключиться
-4. Систему с **идеальной логикой записей** — понятно, что куда пишется
-5. **Минимальный порог входа** — новый пользователь понимает систему за минуты, не часы
+- **Persistent memory** — notes, tasks, contacts, deals all live in SQLite, survive process restarts
+- **Session continuity** — agents save and restore conversation context so compaction doesn't lose history
+- **Full-text search** — `recall("topic")` finds relevant entries across all memory types
+- **Multi-agent** — each agent gets its own API key, workspace-scoped access, and activity log
+- **MCP server** — connects to Claude Code agents via a local HTTP endpoint (no cloud required)
 
-## Владелец
+## Requirements
 
-Асхат Солтанов.
+- macOS (tested on Mac Mini M-series)
+- [Bun](https://bun.sh) — `curl -fsSL https://bun.sh/install | bash`
+- [Claude Code](https://claude.ai/download) with Max subscription
 
-## Как тут ориентироваться
-
-```
-qoopia-v3/
-├── docs/
-│   ├── 00-principles/   ← ФАЗА 1: зачем и для кого. Пишется первой.
-│   ├── 10-as-is/        ← ФАЗА 2: как устроено сегодня на самом деле
-│   ├── 20-to-be/        ← ФАЗА 3: целевая архитектура
-│   ├── 30-migration/    ← ФАЗА 4: план миграции
-│   └── decisions/       ← ADR (Architecture Decision Records): почему сделали вот так
-├── research/            ← выписки из прод-Qoopia: код, схема, замеры
-└── README.md            ← ты здесь
-```
-
-## Фазы работы
-
-| Фаза | Что | Статус |
-|---|---|---|
-| 0. Setup | Workspace, git, tracking | ✅ done |
-| 1. Principles | Зачем Qoopia, для кого, что "хорошо" | ✅ done (после Simplicity Pass) |
-| 1.5. Simplicity Pass | Аудит принципов на over-engineering после lcm-mcp ревью | ✅ done |
-| 2. AS-IS | Как устроено сегодня | ✅ done — 9 документов в `docs/10-as-is/` |
-| 3. TO-BE | Целевая архитектура | ✅ done — 5 документов в `docs/20-to-be/` + 3 ADR |
-| 4. Migration | План переезда | ✅ done — 4 документа в `docs/30-migration/` + ADR-011 |
-| 5. Execute | Реализация | ⚪ pending — **следующая** (требует coding time) |
-
-**Правило**: каждая фаза заканчивается явным "да, идём дальше" от владельца. Не проскакиваем.
-
-## Команда (6 линз)
-
-Каждое решение проходит через шесть взглядов:
-
-1. **Product & UX** — ради кого это, как чувствуется первый контакт
-2. **Information Architecture** — что куда пишется, какие категории
-3. **Data & Retrieval (RAG)** — схема, embeddings, гибридный поиск
-4. **API & MCP** — форма tools, ergonomics для LLM
-5. **Security & Ops** — workspaces, keys, бэкапы, rollback
-6. **Migration** — как переехать без потерь
-
-Если хоть одна линза против — возвращаемся.
-
-## ADR-процесс
-
-Каждое важное решение фиксируется как отдельный файл `docs/decisions/ADR-NNN-title.md`.
-Формат — см. `docs/decisions/ADR-000-template.md`.
-Смысл: через полгода мы (или новый агент) открываем ADR и **понимаем почему** мы решили именно так, а не иначе.
-
-## Как вернуться к работе в новой сессии
-
-Claude Desktop App не имеет "Projects" для Claude Code (только для обычных чатов). Вместо этого **Claude Code группирует сессии по рабочей папке** — "OPENCLAW", "ZA-GAME" и т.д. появляются автоматически когда ты стартовал сессию из соответствующей папки.
-
-**Чтобы появился проект "qoopia-v3" в сайдбаре Claude Code**, запусти следующую сессию отсюда:
+## Install
 
 ```bash
-cd ~/qoopia-v3 && claude
+git clone https://github.com/qoopia/qoopia.git
+cd qoopia
+bun install
+bun run install-service   # installs as a launchd service, starts on login
 ```
 
-Или через Desktop App: New session → выбери папку `~/qoopia-v3/`.
+Check it's running:
 
-При старте сессии Claude Code **автоматически прочитает `CLAUDE.md`** в этой папке, и новый агент получит онбординг: куда смотреть, какая фаза, что read-only, как сохранить прогресс. Контракт лежит в `CLAUDE.md` в корне.
+```bash
+curl http://localhost:3737/health
+```
 
-## Прогресс
+## Connect an agent
 
-- 2026-04-11: Фаза 0 завершена. Workspace создан.
-- 2026-04-11: Фаза 1 (Principles) пройдена — 5 документов написаны и подписаны.
-- 2026-04-11: Фаза 1.5 (Simplicity Pass) проведена после изучения peer implementation lcm-mcp от Нияза Ирсалиева. Вырезано over-engineering по 8 областям. V3.0 scope радикально упрощён: FTS5 only, no semantic, no auto-compaction, no large file handling, one workspace mode, one notes table.
-- 2026-04-11: Фаза 1 закрыта финально. 6 ADR зафиксированы.
-- 2026-04-11: Фаза 2 (AS-IS audit) завершена. 9 документов в `docs/10-as-is/`. Финальная карта миграции: V2 9379 LoC → V3.0 ~1787 LoC (−81%), 20 таблиц → 10, 2 внешних API deps → 0, `intelligence.ts` (657 LoC) → DROP. 300-char truncation bug pinpointed at `memory.ts:218`.
-- 2026-04-11: Фаза 3 (TO-BE) завершена. 5 документов в `docs/20-to-be/` + 4 ADR. Bootstrap решения: Runtime = Bun (ADR-007), Transport = MCP SDK (ADR-008), Auth = opaque tokens (ADR-009). Executable DDL готов, 13 MCP tools specs готовы, 6 system prompt templates готовы, `qoopia install` flow готов. Target: ~1725 LoC core, 3 deps. Phase 3 accepted via ADR-010.
-- 2026-04-11: Фаза 4 (Migration planning) завершена. 4 документа в `docs/30-migration/` + ADR-011. Executable spec для `scripts/migrate-from-v2.ts` (~400 LoC) с row-by-row mapping всех V2 таблиц. Cutover runbook: parallel V2+V3, per-agent migration (Alan → Aizek → Dan → Claude → Aidan), 4 rollback scenarios, Saule deployment gate. Timeline: ~22 дня от code-ready до V2 off. **5 из 6 фаз закрыто за одну сессию**. Осталась только Phase 5 (Execute — coding).
+In your agent's `.md` file (e.g. `~/.claude/agents/myagent.md`), add an MCP server block:
+
+```yaml
+---
+name: myagent
+model: claude-opus-4-7
+mcpServers:
+  qoopia:
+    type: http
+    url: http://localhost:3737/mcp
+    headers:
+      Authorization: "Bearer YOUR_API_KEY"
+---
+```
+
+Get a new API key via the dashboard at `http://localhost:3737/dashboard` or via CLI:
+
+```bash
+bun run qoopia agent:create --name myagent
+```
+
+## Memory protocol (recommended)
+
+Paste this into your agent's system prompt to get automatic session continuity:
+
+```
+On session start:
+1. recall("CONTEXT") — load your rules and context
+2. brief() — see open tasks and recent activity
+3. session_recent(session_id='agentname-YYYY-MM-DD') — restore last conversation
+
+During conversation:
+- session_save(...) after each user message and assistant reply
+
+On session end:
+- note_create (type=memory) — save decisions and non-obvious discoveries
+```
+
+## MCP tools
+
+| Tool | What it does |
+|------|-------------|
+| `recall(query)` | Full-text search across all notes and memory |
+| `brief()` | Open tasks, recent activity, pending items |
+| `note_create(content, type, tags)` | Create a persistent note |
+| `note_list(type?, tags?)` | List notes with optional filters |
+| `note_get(id)` | Get a single note by ID |
+| `note_update(id, content)` | Update note content |
+| `note_delete(id)` | Delete a note |
+| `session_save(session_id, role, content)` | Save a conversation turn |
+| `session_recent(session_id)` | Restore recent session context |
+| `session_summarize(session_id)` | Compress session into a summary block |
+| `create(type, data)` | Create task / contact / deal / project |
+| `list(type, filters?)` | List entities with filters |
+| `get(type, id)` | Get single entity |
+| `update(type, id, data)` | Update entity |
+| `delete(type, id)` | Delete entity |
+| `activity_list(agent_id?, limit?)` | See agent activity log |
+
+## Service management
+
+```bash
+# Status
+launchctl print gui/$(id -u)/com.qoopia.server
+
+# Restart
+launchctl kickstart -k gui/$(id -u)/com.qoopia.server
+
+# Stop
+launchctl unload ~/Library/LaunchAgents/com.qoopia.server.plist
+
+# Logs
+tail -f ~/.qoopia/logs/qoopia.log
+```
+
+## Dashboard
+
+Open `http://localhost:3737/dashboard` in your browser to see:
+- All agents and their last activity
+- Notes and tasks
+- Session history
+- API key management
+
+## License
+
+MIT
