@@ -28,11 +28,11 @@ export function authenticate(request: Request): AuthContext | null {
     return agentToContext(agent, "api-key");
   }
 
-  // OAuth access token path
+  // OAuth access token path — require active=1 so deactivated agents cannot auth
   const oauthRow = findActiveToken(token);
   if (oauthRow && oauthRow.token_type === "access") {
     const a = db
-      .prepare(`SELECT * FROM agents WHERE id = ?`)
+      .prepare(`SELECT * FROM agents WHERE id = ? AND active = 1`)
       .get(oauthRow.agent_id) as AgentRecord | undefined;
     if (a) return agentToContext(a, "oauth");
   }
