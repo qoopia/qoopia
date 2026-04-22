@@ -144,15 +144,34 @@ export function listClaudeAgents(workspaceSlug: string): Array<{
 }
 
 /**
- * Get the full allowlist (all workspaces) for the tailer daemon.
+ * Get the allowlist for the tailer daemon.
  * Only returns entries where autosession_enabled = 1.
+ *
+ * If workspace_id is provided, returns only entries for that workspace
+ * (hard isolation — tailer видит только агентов своего workspace).
+ * Если workspace_id не передан — возвращает глобальный список (для
+ * admin/migration-сценариев, НЕ для обслуживания ingest-daemon запросов).
  */
-export function getAllowlist(): Array<{
+export function getAllowlist(workspace_id?: string): Array<{
   cwd_prefix: string;
   agent_id: string;
   workspace_id: string;
   autosession_enabled: number;
 }> {
+  if (workspace_id) {
+    return db
+      .prepare(
+        `SELECT cwd_prefix, agent_id, workspace_id, autosession_enabled
+         FROM claude_code_agents
+         WHERE autosession_enabled = 1 AND workspace_id = ?`,
+      )
+      .all(workspace_id) as Array<{
+        cwd_prefix: string;
+        agent_id: string;
+        workspace_id: string;
+        autosession_enabled: number;
+      }>;
+  }
   return db
     .prepare(
       `SELECT cwd_prefix, agent_id, workspace_id, autosession_enabled

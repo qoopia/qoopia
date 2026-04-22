@@ -314,7 +314,8 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     if (!auth || auth.type !== "ingest-daemon") {
       return json(res, 403, { error: "forbidden", error_description: "ingest-daemon credentials required" }, req);
     }
-    return json(res, 200, getAllowlist(), req);
+    // Hard-isolation: каждый tailer получает allowlist только своего workspace.
+    return json(res, 200, getAllowlist(auth.workspace_id), req);
   }
 
   if (url === "/ingest/session" && method === "POST") {
@@ -355,6 +356,12 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       .get(attributed_agent_id) as { workspace_id: string } | undefined;
     if (!targetAgent) {
       return json(res, 404, { error: "agent_not_found", agent_id: attributed_agent_id }, req);
+    }
+
+    // Hard-isolation guard: ingest-daemon token привязан к своему workspace,
+    // запись в чужой workspace запрещена даже если attacker угадал чужой agent ULID.
+    if (targetAgent.workspace_id !== auth.workspace_id) {
+      return json(res, 403, { error: "workspace_mismatch", error_description: "ingest token workspace does not match target agent workspace" }, req);
     }
 
     try {

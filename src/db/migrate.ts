@@ -37,8 +37,12 @@ export function runMigrations() {
     try {
       db.transaction(() => {
         db.exec(sql);
+        // INSERT OR IGNORE: некоторые исторические migration-файлы (001) содержат
+        // собственный INSERT INTO schema_versions. Wrapper не должен падать на
+        // UNIQUE constraint, если запись уже существует — свежая установка иначе
+        // зацикливается и БД неюзабельна.
         db.prepare(
-          `INSERT INTO schema_versions (version, description) VALUES (?, ?)`,
+          `INSERT OR IGNORE INTO schema_versions (version, description) VALUES (?, ?)`,
         ).run(version, file);
       })();
       logger.info(`Applied migration ${file}`);
