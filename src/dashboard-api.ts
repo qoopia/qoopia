@@ -257,6 +257,66 @@ function listNotesByAgent(
   });
 }
 
+// ---- /api/dashboard/agents/:agent_id/search?q=... ----
+function searchMessages(
+  res: ServerResponse,
+  workspaceId: string,
+  agentId: string,
+  query: string,
+  limit = 50,
+) {
+  // Sanitize FTS query: strip characters SQLite FTS5 treats as operators
+  // and just quote the bare tokens. This matches the simple-search UX users expect.
+  const cleaned = query
+    .replace(/[-\"\'`():*^~]/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter((t) => t.length > 0)
+    .map((t) => `"${t}"`)
+    .join(" AND ");
+  if (!cleaned) {
+    return json(res, 200, { items: [], total: 0, query });
+  }
+  try {
+    const rows = db
+      .prepare(
+        `SELECT m.id, m.session_id, m.role, m.content, m.created_at,
+                s.title as session_title
+         FROM session_messages m
+         JOIN sessions s ON s.id = m.session_id
+         WHERE m.rowid IN (
+           SELECT rowid FROM session_messages_fts
+           WHERE session_messages_fts MATCH ?
+         )
+         AND m.agent_id = ? AND m.workspace_id = ?
+         ORDER BY m.id DESC
+         LIMIT ?`,
+      )
+      .all(cleaned, agentId, workspaceId, Math.min(Math.max(limit, 1), 200)) as Array<{
+      id: number;
+      session_id: string;
+      role: string;
+      content: string;
+      created_at: string;
+      session_title: string | null;
+    }>;
+    return json(res, 200, {
+      items: rows.map((r) => ({
+        ...r,
+        // Truncate content to keep response light
+        content: r.content.length > 400 ? r.content.slice(0, 400) + "…" : r.content,
+      })),
+      total: rows.length,
+      query,
+    });
+  } catch (e) {
+    return json(res, 400, {
+      error: "invalid_query",
+      error_description: (e as Error).message,
+    });
+  }
+}
+
 function safeJson(s: string): unknown {
   try {
     return JSON.parse(s);
@@ -319,6 +379,15 @@ export function handleDashboardApi(
   if (m) {
     const limit = parseInt(u.searchParams.get("limit") || "500", 10);
     sessionMessages(res, workspaceId, decodeURIComponent(m[1]!), limit);
+    return true;
+  }
+
+  // /api/dashboard/agents/:agent_id/search?q=...
+  m = path.match(/^\/api\/dashboard\/agents\/([^/]+)\/search$/);
+  if (m) {
+    const q = u.searchParams.get("q") || "";
+    const limit = parseInt(u.searchParams.get("limit") || "50", 10);
+    searchMessages(res, workspaceId, decodeURIComponent(m[1]!), q, limit);
     return true;
   }
 

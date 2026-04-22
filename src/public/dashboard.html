@@ -174,6 +174,19 @@ body {
 }
 .agent-name { font-weight: 600; font-size: 1.05rem; }
 .agent-meta { font-size: .75rem; color: var(--text3); }
+.live-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--red); margin-right: 6px; vertical-align: middle;
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(239,68,68,.5); }
+  50%      { opacity: .6; box-shadow: 0 0 0 6px rgba(239,68,68,0); }
+}
+.recent-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--green); margin-right: 6px; vertical-align: middle;
+}
 .agent-stats {
   display: grid; grid-template-columns: repeat(3, 1fr);
   gap: 8px; margin-top: 14px;
@@ -269,6 +282,9 @@ body {
   background: var(--surface2);
 }
 .sess-chev { color: var(--text3); font-size: 1.2rem; }
+.copyable { cursor: pointer; user-select: all; }
+.copyable:hover { color: var(--accent); }
+.copyable.flash { color: var(--green) !important; transition: color .3s; }
 
 /* ---- Session transcript ---- */
 .transcript { display: flex; flex-direction: column; gap: 10px; }
@@ -592,14 +608,23 @@ body {
   const LIVE_AGENTS = ['alan', 'aizek', 'aidan', 'dan'];
   const LIVE_ORDER = { alan: 0, aizek: 1, aidan: 2, dan: 3 };
 
+  function liveStatus(iso) {
+    if (!iso) return '';
+    const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (diff < 90) return '<span class="live-dot" title="active now"></span>';
+    if (diff < 600) return '<span class="recent-dot" title="active recently"></span>';
+    return '';
+  }
+
   function renderCard(a) {
+    const lastIso = a.last_session_active || a.last_seen;
     return `
       <div class="agent-card" data-id="${esc(a.id)}">
         <div class="agent-head">
           <div class="agent-avatar ${avatarClass(a.name)}">${initial(a.name)}</div>
           <div>
-            <div class="agent-name">${esc(a.name)}</div>
-            <div class="agent-meta">last seen ${fmtTime(a.last_session_active || a.last_seen)}</div>
+            <div class="agent-name">${liveStatus(lastIso)}${esc(a.name)}</div>
+            <div class="agent-meta">last seen ${fmtTime(lastIso)}</div>
           </div>
         </div>
         <div class="agent-stats">
@@ -666,6 +691,9 @@ body {
         <button class="tab ${view.tab === 'memory' ? 'active' : ''}" data-tab="memory">
           Memory <span class="tab-badge">${a.notes_count}</span>
         </button>
+        <button class="tab ${view.tab === 'search' ? 'active' : ''}" data-tab="search">
+          Search
+        </button>
       </div>
       <div id="tabBody"><div class="loading">Loading…</div></div>`;
     main.querySelectorAll('.tab').forEach((el) => {
@@ -676,6 +704,7 @@ body {
     });
     if (view.tab === 'sessions') return renderSessions();
     if (view.tab === 'memory') return renderMemory();
+    if (view.tab === 'search') return renderSearch();
   }
 
   async function renderSessions() {
@@ -689,10 +718,12 @@ body {
         return;
       }
       body.innerHTML = '<div class="sess-list">' +
-        data.items.map((s) => `
+        data.items.map((s) => {
+          const live = liveStatus(s.last_active);
+          return `
           <div class="sess-item" data-id="${esc(s.id)}">
             <div class="sess-info">
-              <div class="sess-title">${esc(s.title || '(untitled)')}</div>
+              <div class="sess-title">${live}${esc(s.title || '(untitled)')}</div>
               <div class="sess-id">${esc(s.id)}</div>
             </div>
             <div class="sess-badges">
@@ -700,7 +731,8 @@ body {
               <span class="sess-badge">${fmtTime(s.last_active)}</span>
             </div>
             <div class="sess-chev">›</div>
-          </div>`).join('') + '</div>';
+          </div>`;
+        }).join('') + '</div>';
       body.querySelectorAll('.sess-item').forEach((el) => {
         el.onclick = () => {
           const id = el.getAttribute('data-id');
@@ -716,6 +748,7 @@ body {
   async function renderMemory() {
     const a = view.agent;
     const body = $('#tabBody');
+    const sortBy = view.notesSort || 'created_desc'; // created_desc | updated_desc
     const url = `/api/dashboard/agents/${encodeURIComponent(a.id)}/notes?limit=500` +
       (view.noteType ? `&type=${encodeURIComponent(view.noteType)}` : '');
     try {
@@ -726,27 +759,131 @@ body {
         .concat(NOTE_TYPES.filter((t) => breakdownMap[t]).map((t) =>
           `<button class="note-filter ${view.noteType === t ? 'active' : ''}" data-t="${t}">${t} <span style="opacity:.6">· ${breakdownMap[t]}</span></button>`
         )).join('');
-      const items = data.items.length ? data.items.map((n) => `
+
+      // Client-side sort
+      const sorted = data.items.slice().sort((x, y) => {
+        const k = sortBy === 'updated_desc' ? 'updated_at' : 'created_at';
+        return (y[k] || '').localeCompare(x[k] || '');
+      });
+
+      const sortToggle = `
+        <div style="display:flex; justify-content:flex-end; gap: 6px; margin-bottom: 12px;">
+          <button class="note-filter ${sortBy === 'created_desc' ? 'active' : ''}" data-sort="created_desc">Newest created</button>
+          <button class="note-filter ${sortBy === 'updated_desc' ? 'active' : ''}" data-sort="updated_desc">Recently updated</button>
+        </div>`;
+
+      const items = sorted.length ? sorted.map((n) => `
         <div class="note t-${esc(n.type)}">
           <div class="note-head">
             <span class="note-type">${esc(n.type)}</span>
             <span>${fmtTimeFull(n.created_at)}</span>
+            ${n.updated_at && n.updated_at !== n.created_at ? `<span>· upd ${fmtTime(n.updated_at)}</span>` : ''}
             <span style="flex:1"></span>
-            <span style="font-family: var(--mono); opacity: .5">${esc(n.id.slice(0, 12))}</span>
+            <span class="copyable" style="font-family: var(--mono); opacity: .55" data-copy="${esc(n.id)}" title="click to copy">${esc(n.id.slice(0, 12))}</span>
           </div>
           <div class="note-text">${esc(n.text)}</div>
           ${n.tags && n.tags.length ? '<div class="note-meta">tags: ' + n.tags.map(esc).join(', ') + '</div>' : ''}
         </div>`).join('') : '<div class="empty">No notes matching filter.</div>';
-      body.innerHTML = `<div class="note-filters">${filters}</div><div class="note-list">${items}</div>`;
-      body.querySelectorAll('.note-filter').forEach((el) => {
+
+      body.innerHTML = `<div class="note-filters">${filters}</div>${sortToggle}<div class="note-list">${items}</div>`;
+      body.querySelectorAll('[data-t]').forEach((el) => {
         el.onclick = () => {
           const t = el.getAttribute('data-t');
           view.noteType = t || null;
           renderMemory();
         };
       });
+      body.querySelectorAll('[data-sort]').forEach((el) => {
+        el.onclick = () => {
+          view.notesSort = el.getAttribute('data-sort');
+          renderMemory();
+        };
+      });
+      body.querySelectorAll('.copyable[data-copy]').forEach((el) => {
+        el.onclick = (ev) => { ev.stopPropagation(); copyText(el, el.getAttribute('data-copy')); };
+      });
     } catch (e) { setConn(false); body.innerHTML = '<div class="err">Failed to load memory.</div>'; }
   }
+
+  async function renderSearch() {
+    const a = view.agent;
+    const body = $('#tabBody');
+    const q = view.searchQuery || '';
+    body.innerHTML = `
+      <div style="margin-bottom: 16px">
+        <input type="text" id="searchInp"
+               placeholder="Search across all messages…"
+               value="${esc(q)}"
+               style="width: 100%; padding: 10px 14px; border-radius: 8px;
+                      border: 1px solid var(--border); background: var(--surface);
+                      color: var(--text); font-size: .9rem; font-family: var(--font); outline: none;">
+      </div>
+      <div id="searchResults"></div>`;
+    const inp = $('#searchInp');
+    inp.focus();
+    let debounce;
+    inp.addEventListener('input', () => {
+      clearTimeout(debounce);
+      view.searchQuery = inp.value;
+      debounce = setTimeout(doSearch, 300);
+    });
+    if (q) await doSearch();
+
+    async function doSearch() {
+      const results = $('#searchResults');
+      const qq = (view.searchQuery || '').trim();
+      if (!qq) { results.innerHTML = '<div class="empty">Type to search…</div>'; return; }
+      results.innerHTML = '<div class="loading">Searching…</div>';
+      try {
+        const data = await api(
+          `/api/dashboard/agents/${encodeURIComponent(a.id)}/search?q=${encodeURIComponent(qq)}&limit=80`
+        );
+        setConn(true);
+        if (!data.items.length) {
+          results.innerHTML = '<div class="empty">Nothing found.</div>';
+          return;
+        }
+        results.innerHTML = '<div class="transcript">' +
+          data.items.map((m) => `
+            <div class="msg ${esc(m.role)}" data-session="${esc(m.session_id)}">
+              <div class="msg-head">
+                ${roleIcon(m.role)}
+                <span class="msg-role ${esc(m.role)}">${esc(m.role)}</span>
+                <span>${fmtTimeFull(m.created_at)}</span>
+                <span style="flex:1"></span>
+                <span class="copyable" style="font-family:var(--mono); opacity:.55" title="click to copy session_id">${esc(m.session_id.slice(0,16))}…</span>
+              </div>
+              <div class="msg-content">${esc(m.content)}</div>
+            </div>`).join('') + '</div>';
+        // wire copyable session_ids
+        results.querySelectorAll('.copyable').forEach((el, i) => {
+          const sid = data.items[i].session_id;
+          el.onclick = (ev) => { ev.stopPropagation(); copyText(el, sid); };
+        });
+        // click on msg → jump to that session
+        results.querySelectorAll('.msg').forEach((el, i) => {
+          el.style.cursor = 'pointer';
+          el.addEventListener('dblclick', () => {
+            const sid = el.getAttribute('data-session');
+            goSession(a, { id: sid, title: null });
+          });
+        });
+      } catch (e) { setConn(false); results.innerHTML = '<div class="err">Search failed.</div>'; }
+    }
+  }
+
+  function roleIcon(role) {
+    const map = { user: '👤', assistant: '🤖', tool: '🔧', system: '⚙️' };
+    return '<span style="margin-right:4px">' + (map[role] || '•') + '</span>';
+  }
+
+  function copyText(el, text) {
+    navigator.clipboard.writeText(text).then(() => {
+      el.classList.add('flash');
+      setTimeout(() => el.classList.remove('flash'), 600);
+    });
+  }
+  window.copyText = copyText;
 
   async function renderSession() {
     const a = view.agent;
@@ -754,12 +891,16 @@ body {
     main.innerHTML = `
       <div class="detail-head">
         <div class="agent-avatar ${avatarClass(a.name)}">${initial(a.name)}</div>
-        <div>
+        <div style="flex:1; min-width:0">
           <div class="detail-title">${esc(s.title || '(untitled session)')}</div>
-          <div class="detail-sub" style="font-family: var(--mono)">${esc(s.id)}</div>
+          <div class="detail-sub" style="font-family: var(--mono)">
+            <span class="copyable" id="sidCopy" title="click to copy">${esc(s.id)}</span>
+          </div>
         </div>
       </div>
       <div id="tabBody"><div class="loading">Loading transcript…</div></div>`;
+    const sidEl = $('#sidCopy');
+    if (sidEl) sidEl.onclick = () => copyText(sidEl, s.id);
     const body = $('#tabBody');
     try {
       const data = await api(`/api/dashboard/sessions/${encodeURIComponent(s.id)}/messages?limit=1000`);
@@ -772,6 +913,7 @@ body {
         data.messages.map((m) => `
           <div class="msg ${esc(m.role)}">
             <div class="msg-head">
+              ${roleIcon(m.role)}
               <span class="msg-role ${esc(m.role)}">${esc(m.role)}</span>
               <span>${fmtTimeFull(m.created_at)}</span>
               ${m.token_count != null ? `<span>· ${m.token_count} tok</span>` : ''}
