@@ -183,6 +183,10 @@ body {
   text-transform: uppercase; letter-spacing: .04em;
 }
 
+/* System agents — dimmed */
+.system-grid .agent-card { opacity: .72; }
+.system-grid .agent-card:hover { opacity: 1; }
+
 /* Agent color variants */
 .agent-avatar.alan { background: var(--accent-dim); color: var(--accent); }
 .agent-avatar.aizek { background: var(--green-dim); color: var(--green); }
@@ -545,6 +549,27 @@ body {
   }
   window.loadView = loadView;
 
+  const LIVE_AGENTS = ['alan', 'aizek', 'aidan', 'dan'];
+  const LIVE_ORDER = { alan: 0, aizek: 1, aidan: 2, dan: 3 };
+
+  function renderCard(a) {
+    return `
+      <div class="agent-card" data-id="${esc(a.id)}">
+        <div class="agent-head">
+          <div class="agent-avatar ${avatarClass(a.name)}">${initial(a.name)}</div>
+          <div>
+            <div class="agent-name">${esc(a.name)}</div>
+            <div class="agent-meta">last seen ${fmtTime(a.last_session_active || a.last_seen)}</div>
+          </div>
+        </div>
+        <div class="agent-stats">
+          <div class="stat"><div class="stat-val">${a.sessions_count}</div><div class="stat-lbl">Sessions</div></div>
+          <div class="stat"><div class="stat-val">${a.messages_count}</div><div class="stat-lbl">Messages</div></div>
+          <div class="stat"><div class="stat-val">${a.notes_count}</div><div class="stat-lbl">Notes</div></div>
+        </div>
+      </div>`;
+  }
+
   async function renderHome() {
     if (!agentsCache) main.innerHTML = '<div class="loading">Loading agents…</div>';
     try {
@@ -553,25 +578,25 @@ body {
       setConn(true);
     } catch (e) { setConn(false); return; }
 
+    const live = agentsCache
+      .filter((a) => LIVE_AGENTS.includes((a.name || '').toLowerCase()))
+      .sort((a, b) => (LIVE_ORDER[a.name.toLowerCase()] ?? 99) - (LIVE_ORDER[b.name.toLowerCase()] ?? 99));
+    const sys = agentsCache
+      .filter((a) => !LIVE_AGENTS.includes((a.name || '').toLowerCase()))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
     const html = [
-      '<div class="section-title">Agents · click to drill in</div>',
+      '<div class="section-title">Live agents · click to drill in</div>',
       '<div class="agent-grid">',
-      ...agentsCache.map((a) => `
-        <div class="agent-card" data-id="${esc(a.id)}">
-          <div class="agent-head">
-            <div class="agent-avatar ${avatarClass(a.name)}">${initial(a.name)}</div>
-            <div>
-              <div class="agent-name">${esc(a.name)}</div>
-              <div class="agent-meta">last seen ${fmtTime(a.last_session_active || a.last_seen)}</div>
-            </div>
-          </div>
-          <div class="agent-stats">
-            <div class="stat"><div class="stat-val">${a.sessions_count}</div><div class="stat-lbl">Sessions</div></div>
-            <div class="stat"><div class="stat-val">${a.messages_count}</div><div class="stat-lbl">Messages</div></div>
-            <div class="stat"><div class="stat-val">${a.notes_count}</div><div class="stat-lbl">Notes</div></div>
-          </div>
-        </div>`),
+      ...live.map(renderCard),
       '</div>',
+      sys.length ? `
+        <div class="section-title" style="margin-top: 36px; color: var(--text3)">
+          System agents · infra &amp; integrations
+        </div>
+        <div class="agent-grid system-grid">
+          ${sys.map(renderCard).join('')}
+        </div>` : '',
     ].join('');
     main.innerHTML = html;
     main.querySelectorAll('.agent-card').forEach((el) => {
