@@ -71,21 +71,20 @@ export function getCurrentAuth(): AuthContext | null {
 }
 
 // --- Client IP extraction ---
-// Only trust cf-connecting-ip from actual Cloudflare (remote is loopback or private).
-// On a direct connection, use socket address to prevent header spoofing.
+// Trust proxy-hop headers ONLY when TRUST_PROXY=true AND the connection arrives
+// from one of TRUSTED_PROXIES (default: loopback). Иначе — socket address, чтобы
+// предотвратить header spoofing от сетевого атакующего.
+const TRUSTED_PROXIES_SET = new Set(env.TRUSTED_PROXIES);
 function getClientIp(req: IncomingMessage): string {
   const remote = req.socket?.remoteAddress || "unknown";
-  const isLocal = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
-  // Only trust proxy headers when TRUST_PROXY=true (default) AND the connection
-  // arrives from loopback (i.e. through cloudflared or a local reverse proxy).
-  if (isLocal && env.TRUST_PROXY) {
+  if (env.TRUST_PROXY && TRUSTED_PROXIES_SET.has(remote)) {
     return (
       (req.headers["cf-connecting-ip"] as string) ||
       (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
       remote
     );
   }
-  // Direct connection or TRUST_PROXY=false — use socket address only
+  // Direct connection, untrusted source, or TRUST_PROXY=false — socket only
   return remote;
 }
 

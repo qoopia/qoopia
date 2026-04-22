@@ -24,9 +24,18 @@ export const env = {
   MAINTENANCE_HOUR: requireInt(process.env.QOOPIA_MAINTENANCE_HOUR, "QOOPIA_MAINTENANCE_HOUR", 4),
   BACKUP_KEEP: requireInt(process.env.QOOPIA_BACKUP_KEEP, "QOOPIA_BACKUP_KEEP", 7),
   RETENTION_ACTIVITY_DAYS: requireInt(process.env.QOOPIA_RETENTION_ACTIVITY_DAYS, "QOOPIA_RETENTION_ACTIVITY_DAYS", 90),
-  // When true (default), loopback requests may carry trusted proxy headers (cf-connecting-ip, x-forwarded-for).
-  // Set TRUST_PROXY=false if Qoopia is exposed directly (no Cloudflare tunnel / reverse proxy).
-  TRUST_PROXY: (process.env.TRUST_PROXY ?? "true") !== "false",
+  // Когда true, запросы от доверенных прокси могут нести клиентский IP в
+  // cf-connecting-ip / x-forwarded-for. Default=false: небезопасные дефолты
+  // не должны включаться сами. Поднимая Qoopia за cloudflared / nginx на
+  // loopback — выставляй TRUST_PROXY=true в окружении (см. launchd plist).
+  TRUST_PROXY: (process.env.TRUST_PROXY ?? "false") === "true",
+  // Comma-separated список IP, которым доверяем хедеры. Запрос считается
+  // пришедшим через доверенный прокси, только если socket.remoteAddress ∈ этому
+  // списку. Default = loopback (нормальный случай за cloudflared/nginx).
+  TRUSTED_PROXIES: (process.env.TRUSTED_PROXIES ?? "127.0.0.1,::1,::ffff:127.0.0.1")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
 };
 
 if (!env.OAUTH_ISSUER) env.OAUTH_ISSUER = env.PUBLIC_URL;
