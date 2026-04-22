@@ -6,6 +6,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import crypto from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server.ts";
+import { handleDashboardApi } from "./dashboard-api.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
 import { getAllowlist } from "./admin/claude-agents.ts";
 import { saveMessage } from "./services/sessions.ts";
@@ -373,6 +374,11 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       if (e.code === "INVALID_INPUT") return json(res, 400, { error: "invalid_input", detail: e.message }, req);
       throw err;
     }
+  }
+
+  // --- Dashboard API (read-only, ADMIN_SECRET guarded) ---
+  if (url.startsWith("/api/dashboard")) {
+    if (handleDashboardApi(req, res)) return;
   }
 
   // --- MCP endpoint ---
