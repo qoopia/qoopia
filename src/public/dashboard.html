@@ -40,12 +40,14 @@
 }
 
 html { font-size: 15px; }
+html, body { overflow-x: hidden; max-width: 100%; }
 body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font);
   min-height: 100vh;
   -webkit-font-smoothing: antialiased;
+  width: 100%;
 }
 
 /* ---- Login ---- */
@@ -98,6 +100,8 @@ body {
   border-bottom: 1px solid var(--border);
   background: var(--surface);
   position: sticky; top: 0; z-index: 10;
+  flex-wrap: wrap;
+  max-width: 100%;
 }
 .brand {
   display: flex; align-items: center; gap: 10px;
@@ -107,7 +111,11 @@ body {
   width: 10px; height: 10px; border-radius: 50%;
   background: var(--accent);
 }
-.crumb { color: var(--text3); font-size: .9rem; }
+.crumb {
+  color: var(--text3); font-size: .9rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0; flex: 1 1 auto;
+}
 .crumb a {
   color: var(--text2); text-decoration: none; cursor: pointer;
 }
@@ -131,7 +139,7 @@ body {
 }
 .icon-btn:hover { border-color: var(--border-hover); color: var(--text); }
 
-.content { padding: 32px 24px; max-width: 1280px; margin: 0 auto; }
+.content { padding: 32px 24px; max-width: 1280px; margin: 0 auto; width: 100%; }
 
 /* ---- Agent grid ---- */
 .section-title {
@@ -241,11 +249,12 @@ body {
   display: flex; align-items: center; gap: 12px;
 }
 .sess-item:hover { border-color: var(--border-hover); }
-.sess-info { flex: 1; min-width: 0; }
+.sess-info { flex: 1; min-width: 0; overflow: hidden; }
 .sess-id {
   font-family: var(--mono); font-size: .78rem;
   color: var(--text2);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 100%;
 }
 .sess-title {
   font-size: .9rem; color: var(--text); margin-top: 2px;
@@ -287,9 +296,11 @@ body {
 .msg-content {
   font-size: .85rem; line-height: 1.55;
   white-space: pre-wrap; word-break: break-word;
+  overflow-wrap: anywhere;
   font-family: var(--mono);
   color: var(--text);
   max-height: 400px; overflow: auto;
+  max-width: 100%;
 }
 
 /* ---- Notes/Memory ---- */
@@ -329,7 +340,9 @@ body {
 .note-text {
   font-size: .88rem; line-height: 1.55;
   white-space: pre-wrap; word-break: break-word;
+  overflow-wrap: anywhere;
   color: var(--text);
+  max-width: 100%;
 }
 .note-meta {
   margin-top: 8px; font-size: .72rem; color: var(--text3);
@@ -363,6 +376,33 @@ body {
 .empty {
   text-align: center; padding: 60px 20px;
   color: var(--text3); font-size: .9rem;
+}
+
+/* ---- Mobile ---- */
+@media (max-width: 640px) {
+  html { font-size: 14px; }
+  .content { padding: 20px 14px; }
+  .topbar { padding: 10px 14px; gap: 10px; }
+  .spacer { display: none; }
+  .conn { order: 99; }
+  .agent-grid { grid-template-columns: 1fr; gap: 12px; }
+  .agent-card { padding: 16px; }
+  .agent-stats { gap: 6px; }
+  .stat { padding: 6px; }
+  .stat-val { font-size: 1rem; }
+  .sess-item { padding: 12px 14px; gap: 10px; }
+  .note { padding: 12px 14px; }
+  .note-filters { gap: 5px; }
+  .note-filter { padding: 4px 9px; font-size: .75rem; }
+  .tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .tab { flex-shrink: 0; padding: 10px 12px; }
+  .detail-head { gap: 10px; }
+  .detail-head .agent-avatar { width: 40px; height: 40px; }
+  .detail-title { font-size: 1.1rem; }
+  .detail-sub { font-size: .75rem; word-break: break-all; }
+  .msg { padding: 10px 12px; }
+  .msg-content { font-size: .8rem; }
+  .icon-btn { padding: 5px 8px; font-size: .75rem; }
 }
 .loading {
   text-align: center; padding: 40px; color: var(--text3);
