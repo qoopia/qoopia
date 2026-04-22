@@ -57,8 +57,28 @@ export class RateLimiter {
   }
 }
 
-/** General API: 100 requests per minute per IP */
-export const apiLimiter = new RateLimiter({ windowMs: 60_000, maxHits: 100 });
+/**
+ * Per-route бакеты. Каждый endpoint-класс получает свой счётчик — чтобы шумный
+ * /mcp клиент не вытеснял ingest/OAuth/dashboard.
+ */
 
-/** Auth endpoints: 20 per minute per IP */
+/** Safety net: защита от общего abuse. Высокий лимит, ловит только патологию. */
+export const globalLimiter = new RateLimiter({ windowMs: 60_000, maxHits: 1000 });
+
+/** MCP tool invocations (частые tools/call от агентов). */
+export const mcpLimiter = new RateLimiter({ windowMs: 60_000, maxHits: 300 });
+
+/** Ingest pipeline (tailer bulk writes). */
+export const ingestLimiter = new RateLimiter({ windowMs: 60_000, maxHits: 500 });
+
+/** Dashboard API (read-only list queries). */
+export const dashboardLimiter = new RateLimiter({ windowMs: 60_000, maxHits: 200 });
+
+/** OAuth endpoints (атакуемые — credential stuffing, замер). */
 export const authLimiter = new RateLimiter({ windowMs: 60_000, maxHits: 20 });
+
+/**
+ * @deprecated used to be the single global limiter. Left as alias to globalLimiter
+ * so existing imports keep working during migration. Prefer per-route limiters.
+ */
+export const apiLimiter = globalLimiter;

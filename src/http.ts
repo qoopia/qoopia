@@ -24,7 +24,14 @@ import {
 import { db } from "./db/connection.ts";
 import { env } from "./utils/env.ts";
 import { logger } from "./utils/logger.ts";
-import { apiLimiter, authLimiter } from "./utils/rate-limit.ts";
+import {
+  globalLimiter,
+  mcpLimiter,
+  ingestLimiter,
+  dashboardLimiter,
+  authLimiter,
+  type RateLimiter,
+} from "./utils/rate-limit.ts";
 
 // --- OAuth consent nonces ---
 // Server-generated one-time nonces for the consent form POST.
@@ -198,6 +205,25 @@ export function startHttpServer() {
   return httpServer;
 }
 
+/**
+ * Per-route rate-limit guard. Returns true если лимит превышен и 429 уже
+ * отправлен — вызывающий должен сразу return.
+ */
+function rateLimit429(
+  limiter: RateLimiter,
+  scope: string,
+  clientIp: string,
+  res: ServerResponse,
+): boolean {
+  if (limiter.allow(clientIp)) return false;
+  res.writeHead(429, {
+    "content-type": "application/json",
+    "retry-after": String(limiter.retryAfterSec(clientIp)),
+  });
+  res.end(JSON.stringify({ error: "too_many_requests", scope }));
+  return true;
+}
+
 async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   const url = req.url || "/";
   const method = (req.method || "GET").toUpperCase();
@@ -220,13 +246,14 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     return;
   }
 
-  // --- Rate limiting (general: 100 req/min per IP) ---
-  if (!apiLimiter.allow(clientIp)) {
+  // --- Global safety-net rate limit (1000 req/min per IP) ---
+  // Per-route limiters (mcp/ingest/dashboard/auth) срабатывают в своих хэндлерах.
+  if (!globalLimiter.allow(clientIp)) {
     res.writeHead(429, {
       "content-type": "application/json",
-      "retry-after": String(apiLimiter.retryAfterSec(clientIp)),
+      "retry-after": String(globalLimiter.retryAfterSec(clientIp)),
     });
-    res.end(JSON.stringify({ error: "too_many_requests" }));
+    res.end(JSON.stringify({ error: "too_many_requests", scope: "global" }));
     return;
   }
 
@@ -263,37 +290,21 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
 
   // --- OAuth endpoints (stricter: 20 req/min per IP) ---
   if (url.startsWith("/oauth/authorize") && method === "GET") {
-    if (!authLimiter.allow(clientIp)) {
-      res.writeHead(429, { "content-type": "application/json", "retry-after": String(authLimiter.retryAfterSec(clientIp)) });
-      res.end(JSON.stringify({ error: "too_many_requests" }));
-      return;
-    }
+    if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
     return handleAuthorizeGet(req, res);
   }
   if (url === "/oauth/authorize" && method === "POST") {
-    if (!authLimiter.allow(clientIp)) {
-      res.writeHead(429, { "content-type": "application/json", "retry-after": String(authLimiter.retryAfterSec(clientIp)) });
-      res.end(JSON.stringify({ error: "too_many_requests" }));
-      return;
-    }
+    if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
     const body = await readBody(req);
     return handleAuthorizePost(body, res);
   }
   if (url === "/oauth/token" && method === "POST") {
-    if (!authLimiter.allow(clientIp)) {
-      res.writeHead(429, { "content-type": "application/json", "retry-after": String(authLimiter.retryAfterSec(clientIp)) });
-      res.end(JSON.stringify({ error: "too_many_requests" }));
-      return;
-    }
+    if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
     const body = await readBody(req);
     return handleToken(body, res);
   }
   if (url === "/oauth/register" && method === "POST") {
-    if (!authLimiter.allow(clientIp)) {
-      res.writeHead(429, { "content-type": "application/json", "retry-after": String(authLimiter.retryAfterSec(clientIp)) });
-      res.end(JSON.stringify({ error: "too_many_requests" }));
-      return;
-    }
+    if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
     // Require admin secret for client registration (prevents anonymous self-service)
     if (!checkAdminSecret(req)) {
       return json(res, 401, { error: "unauthorized", error_description: "Admin secret required for client registration" });
@@ -306,8 +317,9 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     return handleRevoke(body, res);
   }
 
-  // --- Ingest endpoints (ingest-daemon only) ---
+  // --- Ingest endpoints (ingest-daemon only, 500 req/min per IP) ---
   if (url === "/ingest/allowlist" && method === "GET") {
+    if (rateLimit429(ingestLimiter, "ingest", clientIp, res)) return;
     const fetchReq = nodeReqToFetchRequest(req);
     const auth = authenticate(fetchReq);
     if (!auth || auth.type !== "ingest-daemon") {
@@ -318,6 +330,7 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   }
 
   if (url === "/ingest/session" && method === "POST") {
+    if (rateLimit429(ingestLimiter, "ingest", clientIp, res)) return;
     const rawBody = await readBody(req);
     const fetchReq = nodeReqToFetchRequest(req, rawBody);
     const auth = authenticate(fetchReq);
@@ -382,13 +395,15 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     }
   }
 
-  // --- Dashboard API (read-only, ADMIN_SECRET guarded) ---
+  // --- Dashboard API (read-only, 200 req/min per IP) ---
   if (url.startsWith("/api/dashboard")) {
+    if (rateLimit429(dashboardLimiter, "dashboard", clientIp, res)) return;
     if (handleDashboardApi(req, res)) return;
   }
 
-  // --- MCP endpoint ---
+  // --- MCP endpoint (300 req/min per IP) ---
   if (url === "/mcp" || url.startsWith("/mcp?")) {
+    if (rateLimit429(mcpLimiter, "mcp", clientIp, res)) return;
     return handleMcp(req, res);
   }
 
