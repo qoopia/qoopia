@@ -151,11 +151,44 @@ function enqueue(payload: IngestPayload) {
 
 let ingestKey: string | null = null;
 
+/**
+ * Валидация пути ingest-key:
+ *  - должен быть абсолютным (path.isAbsolute)
+ *  - не должен содержать .. сегментов (path.normalize === запрос)
+ *  - владельцем должен быть текущий пользователь
+ *  - права доступа group/other должны быть 0 (mode & 0o077 === 0), иначе
+ *    агент может подмонтировать чужие ключи через env.
+ */
+function validateIngestKeyPath(p: string): void {
+  if (!path.isAbsolute(p)) {
+    throw new Error(`QOOPIA_INGEST_KEY_PATH must be absolute, got: ${p}`);
+  }
+  const normalized = path.normalize(p);
+  if (normalized !== p || normalized.split(path.sep).includes("..")) {
+    throw new Error(`QOOPIA_INGEST_KEY_PATH must not contain .. segments, got: ${p}`);
+  }
+  if (!fs.existsSync(p)) {
+    throw new Error(`Ingest key not found at ${p}. Run: qoopia admin register-ingest-daemon`);
+  }
+  const st = fs.statSync(p);
+  if (!st.isFile()) {
+    throw new Error(`QOOPIA_INGEST_KEY_PATH must be a regular file, got: ${p}`);
+  }
+  if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+    throw new Error(`Ingest key ${p} is owned by uid=${st.uid}, expected current user uid=${process.getuid()}`);
+  }
+  // mode & 0o077 must be zero (no group/other read/write/exec bits)
+  if ((st.mode & 0o077) !== 0) {
+    throw new Error(
+      `Ingest key ${p} has unsafe permissions ${(st.mode & 0o777).toString(8)}; ` +
+      `expected 0600 (run: chmod 600 ${p})`,
+    );
+  }
+}
+
 function getIngestKey(): string {
   if (ingestKey) return ingestKey;
-  if (!fs.existsSync(INGEST_KEY_PATH)) {
-    throw new Error(`Ingest key not found at ${INGEST_KEY_PATH}. Run: qoopia admin register-ingest-daemon`);
-  }
+  validateIngestKeyPath(INGEST_KEY_PATH);
   ingestKey = fs.readFileSync(INGEST_KEY_PATH, "utf8").trim();
   return ingestKey;
 }
