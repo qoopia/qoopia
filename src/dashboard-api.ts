@@ -1,9 +1,10 @@
 /**
  * Dashboard V4 — read-only HTTP API for the agent monitor dashboard.
  *
- * All endpoints are workspace-wide (no agent ownership filtering) — intended for
- * the single-workspace owner's eyes only. Protected by ADMIN_SECRET via
- * Authorization: Bearer <secret> OR X-Admin-Secret header.
+ * All endpoints are workspace-scoped: каждый запрос аутентифицируется через
+ * Bearer-токен любого активного агента workspace’а (см. checkDashboardAuth),
+ * и возвращает данные только этого workspace’а. ADMIN_SECRET здесь НЕ
+ * используется — он применяется только к /oauth/register.
  *
  * Routes (all GET, JSON out):
  *   /api/dashboard/agents
