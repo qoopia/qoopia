@@ -32,6 +32,7 @@ import {
   authLimiter,
   type RateLimiter,
 } from "./utils/rate-limit.ts";
+import { audit } from "./utils/audit.ts";
 
 // --- OAuth consent nonces ---
 // Server-generated one-time nonces for the consent form POST.
@@ -216,6 +217,7 @@ function rateLimit429(
   res: ServerResponse,
 ): boolean {
   if (limiter.allow(clientIp)) return false;
+  audit({ event: "rate_limit_trigger", result: "deny", ip: clientIp, scope });
   res.writeHead(429, {
     "content-type": "application/json",
     "retry-after": String(limiter.retryAfterSec(clientIp)),
@@ -307,8 +309,10 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
     // Require admin secret for client registration (prevents anonymous self-service)
     if (!checkAdminSecret(req)) {
+      audit({ event: "admin_secret_fail", result: "deny", ip: clientIp, scope: "/oauth/register" });
       return json(res, 401, { error: "unauthorized", error_description: "Admin secret required for client registration" });
     }
+    audit({ event: "oauth_register", result: "allow", ip: clientIp });
     const body = await readBody(req);
     return handleRegister(body, res);
   }
@@ -323,6 +327,7 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     const fetchReq = nodeReqToFetchRequest(req);
     const auth = authenticate(fetchReq);
     if (!auth || auth.type !== "ingest-daemon") {
+      audit({ event: "ingest_forbidden", result: "deny", ip: clientIp, scope: "/ingest/allowlist", detail: auth ? `wrong type: ${auth.type}` : "no auth" });
       return json(res, 403, { error: "forbidden", error_description: "ingest-daemon credentials required" }, req);
     }
     // Hard-isolation: каждый tailer получает allowlist только своего workspace.
@@ -335,6 +340,7 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     const fetchReq = nodeReqToFetchRequest(req, rawBody);
     const auth = authenticate(fetchReq);
     if (!auth || auth.type !== "ingest-daemon") {
+      audit({ event: "ingest_forbidden", result: "deny", ip: clientIp, scope: "/ingest/session", detail: auth ? `wrong type: ${auth.type}` : "no auth" });
       return json(res, 403, { error: "forbidden", error_description: "ingest-daemon credentials required" }, req);
     }
     let payload: {
@@ -373,6 +379,14 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
     // Hard-isolation guard: ingest-daemon token привязан к своему workspace,
     // запись в чужой workspace запрещена даже если attacker угадал чужой agent ULID.
     if (targetAgent.workspace_id !== auth.workspace_id) {
+      audit({
+        event: "workspace_mismatch",
+        result: "deny",
+        ip: clientIp,
+        workspace_id: auth.workspace_id,
+        agent_id: attributed_agent_id,
+        detail: `caller workspace ${auth.workspace_id} tried to write to agent's workspace ${targetAgent.workspace_id}`,
+      });
       return json(res, 403, { error: "workspace_mismatch", error_description: "ingest token workspace does not match target agent workspace" }, req);
     }
 
