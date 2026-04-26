@@ -19,6 +19,7 @@ cookie** (`qoopia_dash`), not the raw Bearer token.
 Browser        →  POST /api/dashboard/login
                   Authorization: Bearer <agent_api_key>
 Server         →  validates Bearer (steward / standard / claude-privileged)
+               →  REQUIRES auth.source === "api-key" (OAuth tokens 401)
                →  signs payload {agent_id, exp = now+24h} with HMAC-SHA256
                →  Set-Cookie: qoopia_dash=<payloadB64>.<tagB64>;
                   Path=/api/dashboard; HttpOnly; SameSite=Strict;
@@ -26,6 +27,14 @@ Server         →  validates Bearer (steward / standard / claude-privileged)
                →  200 { ok, agent_id, type, isAdmin, expires_in }
 Browser        →  discards Bearer; clears the input field; never stores it
 ```
+
+OAuth access tokens are explicitly rejected at this endpoint
+(QDASHCOOKIE-001). An OAuth token is short-lived (1h) and revocable via
+`oauth_tokens.revoked`; minting a 24h dashboard cookie from one would let
+the cookie outlive the OAuth grant, because the cookie payload does not
+back-point at the token row. If we later want OAuth-driven dashboard
+sessions, that needs explicit TTL/revocation binding (see Post-merge
+hardening below) — separate decision, separate ADR.
 
 ### Subsequent reads
 
@@ -63,13 +72,28 @@ cookie path we're trying to avoid.
 The cookie carries `base64url(JSON({agent_id, exp})) "." base64url(HMAC)`,
 not the api_key. Three consequences:
 
-1. Leaking the cookie does not leak the api_key. Rotation = api_key
-   rotation (which requires admin DB write), so an exfiltrated cookie is
-   a single 24-hour token, not a permanent credential.
+1. Leaking the cookie does not leak the api_key. An exfiltrated cookie is
+   a single 24-hour bearer, not a permanent credential.
 2. Deactivating an agent immediately invalidates outstanding cookies via
-   the per-request DB check.
+   the per-request DB check (`agents.active = 1`).
 3. The cookie payload is opaque to the dashboard JS (HttpOnly), so an
    XSS cannot read it.
+
+**Cookie revocation in this PR is limited to:**
+
+- Agent deactivation (per-request `active=1` check on the cookie path).
+- Rotation of `QOOPIA_SESSION_SECRET` (or process restart on the
+  ephemeral fallback key) — invalidates every outstanding cookie at once.
+- Cookie expiry (24h Max-Age + payload `exp`).
+- Logout — clears the *browser's* cookie copy only; the signed value
+  remains valid elsewhere until one of the conditions above fires.
+
+**Rotating the agent's `api_key` does NOT, on its own, revoke outstanding
+cookies.** The cookie payload binds to `agent_id`, not to api_key
+material, and `rotateAgentKey()` only updates `api_key_hash`. Operators
+who need instant session kill on key rotation should also deactivate +
+reactivate the agent or rotate the session secret, until the post-merge
+hardening below lands.
 
 ### Signing key
 
@@ -103,7 +127,28 @@ reaches the lookup).
   contains zero bytes of the raw Bearer, cookie auth works without
   Authorization, /mcp does not honor the cookie, Origin mismatch is
   rejected, deactivation kills outstanding cookies, tampered cookies
-  return 401.
+  return 401, and OAuth access tokens cannot mint a dashboard cookie.
+
+## Post-merge hardening
+
+These do not block this PR but should follow:
+
+1. **Instant revocation on api_key rotation** — bind the cookie to
+   either `agents.session_version` (incremented by `rotateAgentKey()` and
+   `deactivateAgent()`) or to `api_key_rotated_at`, and check it during
+   cookie verification. Today rotation requires admin to also flip
+   `active` to kill outstanding cookies.
+2. **OAuth-driven dashboard sessions (separate ADR)** — if/when wanted,
+   bind the cookie's TTL and revocation to the underlying OAuth token
+   row so revoking the OAuth grant kills the cookie.
+3. **`crypto.timingSafeEqual` over fixed-length buffers** instead of the
+   hand-rolled string compare (QDASHCOOKIE-003).
+4. **Stronger Secure-cookie hygiene** — also set `Secure` when
+   `QOOPIA_PUBLIC_URL` is `https://...`, with explicit dev opt-out, so
+   misconfigured `TRUST_PROXY` does not silently downgrade
+   (QDASHCOOKIE-004).
+5. **Explicit tests** for expired cookies, payload-JSON tampering, and
+   `Referer`-only Origin handling.
 
 ## Alternatives rejected
 

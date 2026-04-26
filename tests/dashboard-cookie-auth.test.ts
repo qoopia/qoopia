@@ -31,11 +31,13 @@ import {
 } from "bun:test";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
+import crypto from "node:crypto";
 import { runMigrations } from "../src/db/migrate.ts";
 import { createWorkspace } from "../src/admin/workspaces.ts";
 import { createAgent } from "../src/admin/agents.ts";
 import { startHttpServer } from "../src/http.ts";
 import { db } from "../src/db/connection.ts";
+import { sha256Hex } from "../src/auth/api-keys.ts";
 
 let server: Server;
 let baseUrl = "";
@@ -375,5 +377,75 @@ describe("QDASH-COOKIE: tampered cookies are rejected", () => {
       headers: { cookie: `qoopia_dash=garbage.value` },
     });
     expect(r.status).toBe(401);
+  });
+});
+
+describe("QDASHCOOKIE-001: OAuth access token cannot mint a dashboard cookie", () => {
+  // Mint a real OAuth access token bound to the steward agent by writing
+  // directly to oauth_tokens. Format mirrors src/auth/oauth.ts (`qa_*`).
+  // The token IS valid for /mcp via authenticate() — this test pins that
+  // the dashboard endpoint specifically rejects the OAuth source.
+  const TEST_CLIENT_ID = "qc_test_oauth_client";
+
+  function ensureTestClient(agentId: string): void {
+    db.prepare(
+      `INSERT OR IGNORE INTO oauth_clients
+        (id, name, agent_id, client_secret_hash, redirect_uris, created_at)
+       VALUES (?, ?, ?, '', '[]', ?)`,
+    ).run(TEST_CLIENT_ID, "qdash-cookie-test", agentId, new Date().toISOString());
+  }
+
+  function mintOauthAccessToken(agentId: string, workspaceId: string): string {
+    ensureTestClient(agentId);
+    const access = `qa_${crypto.randomBytes(32).toString("base64url")}`;
+    const now = new Date()
+      .toISOString()
+      .replace(/\.\d{3}Z$/, "Z");
+    const exp = new Date(Date.now() + 60 * 60 * 1000)
+      .toISOString()
+      .replace(/\.\d{3}Z$/, "Z");
+    db.prepare(
+      `INSERT INTO oauth_tokens
+        (token_hash, client_id, agent_id, workspace_id, token_type,
+         expires_at, revoked, created_at)
+       VALUES (?, ?, ?, ?, 'access', ?, 0, ?)`,
+    ).run(
+      sha256Hex(access),
+      TEST_CLIENT_ID,
+      agentId,
+      workspaceId,
+      exp,
+      now,
+    );
+    return access;
+  }
+
+  test("POST /login with OAuth access token → 401 + no Set-Cookie", async () => {
+    const oauthToken = mintOauthAccessToken(STEWARD_ID, WORKSPACE_ID);
+
+    // Sanity: this OAuth token actually authenticates non-login dashboard
+    // routes (because authenticate() honors OAuth there). If this check
+    // fails, the test below is meaningless — we'd be testing a dead token.
+    const sanity = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { authorization: `Bearer ${oauthToken}` },
+    });
+    expect(sanity.status).toBe(200);
+
+    // The actual invariant: /login refuses OAuth source.
+    const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${oauthToken}` },
+    });
+    expect(r.status).toBe(401);
+    expect(getSetCookie(r, "qoopia_dash")).toBeNull();
+  });
+
+  test("api_key login still works (no regression on the supported path)", async () => {
+    const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${STEWARD_KEY}` },
+    });
+    expect(r.status).toBe(200);
+    expect(getSetCookie(r, "qoopia_dash")).not.toBeNull();
   });
 });

@@ -27,9 +27,25 @@
  *   SameSite=Strict cookie scoped to /api/dashboard. Subsequent GETs are
  *   authenticated by the cookie automatically; if the Authorization header
  *   is also supplied (curl, scripts) it still wins. POST /logout clears
- *   the cookie. The cookie value IS the same Bearer token the agent owns,
- *   not a new session id — so it carries the same scope guarantees as the
- *   header path and rotation = api_key rotation.
+ *   the cookie.
+ *
+ *   The cookie value is a server-signed `{agent_id, exp}` payload —
+ *   `base64url(JSON) "." base64url(HMAC-SHA256)` — NOT the raw Bearer.
+ *   Cookie minting is restricted to static `api_key` Bearers (see
+ *   loginHandler / QDASHCOOKIE-001 fix). OAuth access tokens are NOT
+ *   accepted at /api/dashboard/login: an OAuth token's lifetime and
+ *   revocation are managed in `oauth_tokens`, and minting a 24h dashboard
+ *   cookie from a 1h OAuth token would silently extend its blast radius.
+ *
+ *   Cookie revocation in this PR is limited to:
+ *     • agent deactivation (per-request `active=1` DB check),
+ *     • rotation of `QOOPIA_SESSION_SECRET` (or process restart on the
+ *       ephemeral fallback key),
+ *     • cookie expiry (24h Max-Age + payload `exp`).
+ *   Rotating the agent's `api_key` does NOT, on its own, revoke
+ *   outstanding cookies — the cookie payload does not bind to api_key
+ *   material. Instant revocation on key rotation is tracked as post-merge
+ *   hardening (see ADR-015 §Consequences).
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createHmac, randomBytes } from "node:crypto";
@@ -336,6 +352,13 @@ function originAllowed(req: IncomingMessage): boolean {
  * with the server-side session key; verification on later requests resolves
  * the agent_id back to a live DB row, so deactivating the agent invalidates
  * any outstanding cookie immediately.
+ *
+ * QDASHCOOKIE-001: cookie minting is restricted to static `api_key`
+ * Bearers. Accepting OAuth access tokens here would let a 1h OAuth token
+ * be exchanged for a 24h dashboard cookie that survives OAuth token
+ * revocation (the cookie does not carry a back-pointer to the token row).
+ * Mixing OAuth into dashboard sessions is a separate auth-semantics
+ * decision that requires explicit TTL/revocation binding; not in this PR.
  */
 function loginHandler(req: IncomingMessage, res: ServerResponse) {
   if (!originAllowed(req)) {
@@ -354,7 +377,15 @@ function loginHandler(req: IncomingMessage, res: ServerResponse) {
     });
     return;
   }
-  const auth = checkDashboardAuth(req);
+
+  // Resolve the Bearer directly so we can inspect `auth.source`.
+  // checkDashboardAuth() collapses source down to a DashboardAuth, which
+  // would let an OAuth access token mint a 24h cookie — explicitly
+  // rejected here.
+  const fetchReq = new Request("http://local/", {
+    headers: { authorization: header },
+  });
+  const auth = authenticate(fetchReq);
   if (!auth) {
     json(res, 401, {
       error: "unauthorized",
@@ -363,7 +394,31 @@ function loginHandler(req: IncomingMessage, res: ServerResponse) {
     });
     return;
   }
-  const cookie = buildSessionCookie(req, signSession(auth.agent_id));
+  if (auth.source !== "api-key") {
+    // Do NOT issue Set-Cookie. Do NOT echo the source back in the body
+    // either (don't help an attacker fingerprint the token type).
+    json(res, 401, {
+      error: "unauthorized",
+      error_description:
+        "Dashboard cookie can only be minted from a static agent api_key. OAuth access tokens are not accepted at this endpoint.",
+    });
+    return;
+  }
+  if (!ALLOWED_TYPES.has(auth.type)) {
+    json(res, 401, {
+      error: "unauthorized",
+      error_description:
+        "Bearer token rejected (unknown, inactive, or wrong agent type).",
+    });
+    return;
+  }
+  const dashAuth: DashboardAuth = {
+    workspace_id: auth.workspace_id,
+    agent_id: auth.agent_id,
+    type: auth.type,
+    isAdmin: ADMIN_TYPES.has(auth.type),
+  };
+  const cookie = buildSessionCookie(req, signSession(dashAuth.agent_id));
   res.writeHead(200, {
     "content-type": "application/json",
     "cache-control": "no-store",
@@ -373,9 +428,9 @@ function loginHandler(req: IncomingMessage, res: ServerResponse) {
   res.end(
     JSON.stringify({
       ok: true,
-      agent_id: auth.agent_id,
-      type: auth.type,
-      isAdmin: auth.isAdmin,
+      agent_id: dashAuth.agent_id,
+      type: dashAuth.type,
+      isAdmin: dashAuth.isAdmin,
       expires_in: SESSION_TTL_SEC,
     }),
   );
