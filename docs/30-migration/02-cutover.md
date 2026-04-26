@@ -121,19 +121,50 @@ Agent migrated если **все** проверки зелёные:
 
 ### V2 → read-only switch
 
-После migration script complete:
+После migration script complete делаем app-level read-only через quiesce + restart с
+read-only флагом. **НЕ через `chmod 444`** — у запущенного V2 уже открыты file descriptors,
+SQLite в WAL mode держит -wal/-shm; chmod не блокирует write через открытый fd, а если
+новые writes всё-таки случаются — WAL расходится с DB и получаем corruption (Codex
+security review QSEC-004).
 
 ```bash
-chmod 444 ~/.openclaw/qoopia/data/qoopia.db
-chmod 444 ~/.openclaw/qoopia/data/qoopia.db-wal
-chmod 444 ~/.openclaw/qoopia/data/qoopia.db-shm
+# 1. Stop V2 cleanly — закроет open fds, флашнет WAL.
+launchctl unload ~/Library/LaunchAgents/com.openclaw.gateway.plist
+
+# 2. Force WAL checkpoint в саму DB (если V2 не успел сам).
+sqlite3 ~/.openclaw/qoopia/data/qoopia.db "PRAGMA wal_checkpoint(TRUNCATE);"
+
+# 3. Immutable snapshot для rollback baseline (не трогаем оригинал).
+cp ~/.openclaw/qoopia/data/qoopia.db ~/.openclaw/qoopia/data/qoopia.db.pre-v3-snapshot
+chmod 400 ~/.openclaw/qoopia/data/qoopia.db.pre-v3-snapshot
+
+# 4. Restart V2 с app-level read-only флагом
+#    (V2 поддерживает QOOPIA_READ_ONLY=1 → SQLite open mode SQLITE_OPEN_READONLY,
+#    write-tools возвращают QoopiaError("READ_ONLY") до DB layer).
+QOOPIA_READ_ONLY=1 launchctl load ~/Library/LaunchAgents/com.openclaw.gateway.plist
+
+# 5. Verify write actually blocked at app layer — критический gate.
+curl -sf -X POST http://localhost:3737/api/notes \
+  -H "Authorization: Bearer $V2_TEST_KEY" \
+  -d '{"text":"write-block test","type":"memory"}' | jq .
+# Ожидаем: {"error":"READ_ONLY",...}, HTTP 403/409.
+# Если 200 — STOP, не продолжать migration: V2 всё ещё принимает writes,
+# snapshot невалиден, rollback baseline не гарантирован.
 ```
 
-V2 process получит `SQLITE_READONLY` errors при попытке write. Agents на V2 могут только читать — новые notes не создаются.
+V2 process отвергает writes на уровне приложения **и** на уровне SQLite open mode. Agents
+на V2 могут только читать — новые notes не создаются.
 
-**Why**: это гарантирует **consistent rollback point**. Если через неделю мы решим откатиться — данные V2 такие же как в момент migration, никто их не менял «между делом».
+**Why**: это гарантирует **consistent rollback point**. Если через неделю мы решим
+откатиться — данные V2 такие же как в момент migration, никто их не менял «между делом».
+Snapshot `qoopia.db.pre-v3-snapshot` — иммутабельный baseline на случай если live V2 DB
+повредится между сейчас и rollback.
 
-**Undo** (при emergency rollback): `chmod 644 ~/.openclaw/qoopia/data/qoopia.db*`.
+**Undo** (при emergency rollback):
+```bash
+launchctl unload ~/Library/LaunchAgents/com.openclaw.gateway.plist
+launchctl load   ~/Library/LaunchAgents/com.openclaw.gateway.plist  # без QOOPIA_READ_ONLY
+```
 
 ### Monitoring обоих services
 
@@ -301,7 +332,7 @@ Day 0:  bunx qoopia install --port 3738 (parallel)
         ↓
 Day 0:  Run migrate-from-v2 script
         ↓
-Day 0:  V2 → read-only (chmod 444)
+Day 0:  V2 → read-only (quiesce + restart с QOOPIA_READ_ONLY=1)
         ↓
 Day 0:  Verify migration (counts + samples)
         ↓
