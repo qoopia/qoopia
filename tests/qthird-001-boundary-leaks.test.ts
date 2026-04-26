@@ -143,15 +143,23 @@ describe("QTHIRD-001: recall(scope='activity'|'all') does not leak", () => {
 
 describe("QTHIRD-001: updateNote refuses non-owner non-admin on private", () => {
   test("agent A cannot update agent B's private note (NOT_FOUND, not FORBIDDEN)", () => {
-    expect(() =>
+    let caught: unknown;
+    try {
       updateNote({
         workspace_id: WORKSPACE_ID,
         agent_id: AGENT_A,
         is_admin: false,
         id: B_PRIVATE_NOTE_ID,
         text: "attacker overwrite attempt",
-      }),
-    ).toThrow(QoopiaError);
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(QoopiaError);
+    // Codex required: must be NOT_FOUND (existence-blind), never FORBIDDEN
+    // — FORBIDDEN would confirm the ID points at a real note and leak
+    // existence to a probing sibling.
+    expect((caught as QoopiaError).code).toBe("NOT_FOUND");
 
     // The note text must be unchanged — verify via owner read.
     const owner = getNote(WORKSPACE_ID, B_PRIVATE_NOTE_ID, AGENT_B, false);
@@ -194,9 +202,14 @@ describe("QTHIRD-001: deleteNote refuses non-owner non-admin on private", () => 
       visibility: "private",
     }).id;
 
-    expect(() =>
-      deleteNote(WORKSPACE_ID, AGENT_A, id, false),
-    ).toThrow(QoopiaError);
+    let caught: unknown;
+    try {
+      deleteNote(WORKSPACE_ID, AGENT_A, id, false);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(QoopiaError);
+    expect((caught as QoopiaError).code).toBe("NOT_FOUND");
 
     // Owner read still succeeds — the note was not deleted.
     const owner = getNote(WORKSPACE_ID, id, AGENT_B, false);
