@@ -231,7 +231,18 @@ export async function install(opts: InstallOpts = {}) {
   let adminSecret: string;
   if (fs.existsSync(adminSecretPath)) {
     adminSecret = fs.readFileSync(adminSecretPath, "utf8").trim();
-    step(`Reusing existing admin secret from ${adminSecretPath}`);
+    // QTHIRD-002: chmod 0600 on the reuse path too — fs.writeFileSync
+    // sets mode only at create time, so a file that was created with
+    // looser perms (or whose mode drifted) would otherwise stay readable
+    // by other local users.
+    try {
+      fs.chmodSync(adminSecretPath, 0o600);
+    } catch (err) {
+      console.warn(
+        `⚠ chmod 0600 on ${adminSecretPath} failed: ${(err as Error).message}`,
+      );
+    }
+    step(`Reusing existing admin secret from ${adminSecretPath} (chmod 0600 enforced)`);
   } else {
     adminSecret = crypto.randomBytes(32).toString("base64");
     fs.writeFileSync(adminSecretPath, adminSecret + "\n", { encoding: "utf8", mode: 0o600 });
@@ -253,7 +264,18 @@ export async function install(opts: InstallOpts = {}) {
   fs.mkdirSync(plistDir, { recursive: true });
   const plistPath = path.join(plistDir, "com.qoopia.mcp.plist");
   fs.writeFileSync(plistPath, plist, "utf8");
-  step(`LaunchAgent plist written: ${plistPath}`);
+  // QTHIRD-002: the plist embeds QOOPIA_ADMIN_SECRET — lock it down to
+  // owner-only so other local users can't read the secret out of the
+  // launchd config. fs.writeFileSync uses the process umask by default,
+  // which on a typical Mac leaves it world-readable.
+  try {
+    fs.chmodSync(plistPath, 0o600);
+  } catch (err) {
+    console.warn(
+      `⚠ chmod 0600 on ${plistPath} failed: ${(err as Error).message}`,
+    );
+  }
+  step(`LaunchAgent plist written: ${plistPath} (chmod 0600)`);
 
   // 6. Load service (unload first if already loaded)
   try {
