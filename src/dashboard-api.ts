@@ -1,20 +1,27 @@
 /**
  * Dashboard V4 — read-only HTTP API for the agent monitor dashboard.
  *
- * All endpoints are workspace-scoped: каждый запрос аутентифицируется через
- * Bearer-токен любого активного агента workspace’а (см. checkDashboardAuth),
- * и возвращает данные только этого workspace’а. ADMIN_SECRET здесь НЕ
- * используется — он применяется только к /oauth/register.
+ * Authorization model (QSEC-001, Codex review 2026-04-25):
+ *   - `steward` and `claude-privileged` agents see the whole workspace
+ *     (this is the dashboard/admin view).
+ *   - `standard` agents can ONLY see their own agent record, sessions,
+ *     messages, notes, and search. Cross-agent access returns 403.
+ *   - `ingest-daemon` and any other type get 403 from dashboard endpoints.
+ *
+ * Before this change, any valid agent Bearer token could read every other
+ * agent's transcripts and memory in the same workspace. The new auth context
+ * carries `isAdmin` and `agent_id` so each handler can enforce scope.
  *
  * Routes (all GET, JSON out):
  *   /api/dashboard/agents
  *   /api/dashboard/agents/:agent_id/sessions
  *   /api/dashboard/sessions/:session_id/messages
  *   /api/dashboard/agents/:agent_id/notes?type=...&limit=...
+ *   /api/dashboard/agents/:agent_id/search?q=...
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { db } from "./db/connection.ts";
-import { authenticate } from "./auth/middleware.ts";
+import { authenticate, type AuthContext } from "./auth/middleware.ts";
 
 function json(res: ServerResponse, status: number, body: unknown) {
   const payload = JSON.stringify(body);
@@ -27,31 +34,77 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(payload);
 }
 
+const ADMIN_TYPES = new Set(["steward", "claude-privileged"]);
+/** ingest-daemon and unknown types must NOT see dashboard data. */
+const ALLOWED_TYPES = new Set(["steward", "claude-privileged", "standard"]);
+
+export interface DashboardAuth {
+  workspace_id: string;
+  agent_id: string;
+  type: string;
+  isAdmin: boolean;
+}
+
 /**
- * Authenticate dashboard requests via any valid workspace agent Bearer token.
- * Returns the workspace_id of the authenticated agent, or null if unauth.
- * All 4 agents share one workspace, so any valid agent key sees all data.
+ * Authenticate dashboard requests via Bearer token. Returns auth context with
+ * agent_id and isAdmin flag, or null if the agent's type is not allowed on
+ * the dashboard at all.
  */
-export function checkDashboardAuth(req: IncomingMessage): string | null {
+export function checkDashboardAuth(req: IncomingMessage): DashboardAuth | null {
   const header = (req.headers["authorization"] as string | undefined) || "";
   if (!header) return null;
   const fetchReq = new Request("http://local/", {
     headers: { authorization: header },
   });
   const auth = authenticate(fetchReq);
-  return auth?.workspace_id ?? null;
+  if (!auth) return null;
+  if (!ALLOWED_TYPES.has(auth.type)) return null;
+  return {
+    workspace_id: auth.workspace_id,
+    agent_id: auth.agent_id,
+    type: auth.type,
+    isAdmin: ADMIN_TYPES.has(auth.type),
+  };
 }
 
+/**
+ * Enforce per-agent scope for standard agents. Returns true if the request
+ * should be denied (403 already written).
+ */
+function denyIfNotOwn(
+  res: ServerResponse,
+  auth: DashboardAuth,
+  requestedAgentId: string,
+): boolean {
+  if (auth.isAdmin) return false;
+  if (requestedAgentId === auth.agent_id) return false;
+  json(res, 403, {
+    error: "forbidden",
+    error_description:
+      "Standard agents can only read their own dashboard data; ask a steward for cross-agent visibility.",
+  });
+  return true;
+}
+
+// Re-export for any internal callers that imported the old AuthContext.
+export type { AuthContext };
+
 // ---- /api/dashboard/agents ----
-function listAgents(res: ServerResponse, workspaceId: string) {
-  const rows = db
-    .prepare(
-      `SELECT id, workspace_id, name, type, active, last_seen, created_at
+function listAgents(res: ServerResponse, auth: DashboardAuth) {
+  // Standard agents only see themselves; admins see the workspace.
+  const sql = auth.isAdmin
+    ? `SELECT id, workspace_id, name, type, active, last_seen, created_at
        FROM agents
        WHERE active = 1 AND workspace_id = ?
-       ORDER BY name ASC`,
-    )
-    .all(workspaceId) as Array<{
+       ORDER BY name ASC`
+    : `SELECT id, workspace_id, name, type, active, last_seen, created_at
+       FROM agents
+       WHERE active = 1 AND workspace_id = ? AND id = ?
+       ORDER BY name ASC`;
+  const args: string[] = auth.isAdmin
+    ? [auth.workspace_id]
+    : [auth.workspace_id, auth.agent_id];
+  const rows = db.prepare(sql).all(...args) as Array<{
     id: string;
     workspace_id: string;
     name: string;
@@ -102,7 +155,14 @@ function listAgents(res: ServerResponse, workspaceId: string) {
 }
 
 // ---- /api/dashboard/agents/:agent_id/sessions ----
-function listSessions(res: ServerResponse, workspaceId: string, agentId: string, limit = 100) {
+function listSessions(
+  res: ServerResponse,
+  auth: DashboardAuth,
+  agentId: string,
+  limit = 100,
+) {
+  if (denyIfNotOwn(res, auth, agentId)) return;
+  const workspaceId = auth.workspace_id;
   const rows = db
     .prepare(
       `SELECT s.id, s.workspace_id, s.agent_id, s.title, s.metadata,
@@ -139,10 +199,11 @@ function listSessions(res: ServerResponse, workspaceId: string, agentId: string,
 // ---- /api/dashboard/sessions/:session_id/messages ----
 function sessionMessages(
   res: ServerResponse,
-  workspaceId: string,
+  auth: DashboardAuth,
   sessionId: string,
   limit = 500,
 ) {
+  const workspaceId = auth.workspace_id;
   const sess = db
     .prepare(
       `SELECT id, agent_id, workspace_id, title, created_at, last_active
@@ -159,6 +220,8 @@ function sessionMessages(
       }
     | undefined;
   if (!sess) return json(res, 404, { error: "session_not_found" });
+  // Non-admin: session must belong to the authenticated agent.
+  if (denyIfNotOwn(res, auth, sess.agent_id)) return;
 
   const rows = db
     .prepare(
@@ -199,11 +262,13 @@ function sessionMessages(
 // ---- /api/dashboard/agents/:agent_id/notes ----
 function listNotesByAgent(
   res: ServerResponse,
-  workspaceId: string,
+  auth: DashboardAuth,
   agentId: string,
   type: string | null,
   limit = 200,
 ) {
+  if (denyIfNotOwn(res, auth, agentId)) return;
+  const workspaceId = auth.workspace_id;
   const where: string[] = [`agent_id = ?`, `workspace_id = ?`, `deleted_at IS NULL`];
   const params: any[] = [agentId, workspaceId];
   if (type) {
@@ -261,11 +326,13 @@ function listNotesByAgent(
 // ---- /api/dashboard/agents/:agent_id/search?q=... ----
 function searchMessages(
   res: ServerResponse,
-  workspaceId: string,
+  auth: DashboardAuth,
   agentId: string,
   query: string,
   limit = 50,
 ) {
+  if (denyIfNotOwn(res, auth, agentId)) return;
+  const workspaceId = auth.workspace_id;
   // Sanitize FTS query: strip characters SQLite FTS5 treats as operators
   // and just quote the bare tokens. This matches the simple-search UX users expect.
   const cleaned = query
@@ -340,11 +407,12 @@ export function handleDashboardApi(
     json(res, 405, { error: "method_not_allowed" });
     return true;
   }
-  const workspaceId = checkDashboardAuth(req);
-  if (!workspaceId) {
+  const auth = checkDashboardAuth(req);
+  if (!auth) {
     json(res, 401, {
       error: "unauthorized",
-      error_description: "Valid agent Bearer token required",
+      error_description:
+        "Valid agent Bearer token required (steward/standard/claude-privileged)",
     });
     return true;
   }
@@ -354,7 +422,7 @@ export function handleDashboardApi(
 
   // /api/dashboard/agents
   if (path === "/api/dashboard/agents") {
-    listAgents(res, workspaceId);
+    listAgents(res, auth);
     return true;
   }
 
@@ -362,7 +430,7 @@ export function handleDashboardApi(
   let m = path.match(/^\/api\/dashboard\/agents\/([^/]+)\/sessions$/);
   if (m) {
     const limit = parseInt(u.searchParams.get("limit") || "100", 10);
-    listSessions(res, workspaceId, decodeURIComponent(m[1]!), limit);
+    listSessions(res, auth, decodeURIComponent(m[1]!), limit);
     return true;
   }
 
@@ -371,7 +439,7 @@ export function handleDashboardApi(
   if (m) {
     const type = u.searchParams.get("type");
     const limit = parseInt(u.searchParams.get("limit") || "200", 10);
-    listNotesByAgent(res, workspaceId, decodeURIComponent(m[1]!), type, limit);
+    listNotesByAgent(res, auth, decodeURIComponent(m[1]!), type, limit);
     return true;
   }
 
@@ -379,7 +447,7 @@ export function handleDashboardApi(
   m = path.match(/^\/api\/dashboard\/sessions\/([^/]+)\/messages$/);
   if (m) {
     const limit = parseInt(u.searchParams.get("limit") || "500", 10);
-    sessionMessages(res, workspaceId, decodeURIComponent(m[1]!), limit);
+    sessionMessages(res, auth, decodeURIComponent(m[1]!), limit);
     return true;
   }
 
@@ -388,7 +456,7 @@ export function handleDashboardApi(
   if (m) {
     const q = u.searchParams.get("q") || "";
     const limit = parseInt(u.searchParams.get("limit") || "50", 10);
-    searchMessages(res, workspaceId, decodeURIComponent(m[1]!), q, limit);
+    searchMessages(res, auth, decodeURIComponent(m[1]!), q, limit);
     return true;
   }
 
