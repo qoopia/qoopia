@@ -455,7 +455,8 @@ function projectsRootResolved(): string {
   return _projectsRootResolved;
 }
 
-function isSafeWatchPath(p: string): boolean {
+// Exported for QRERUN-002 regression tests; not part of the public API.
+export function isSafeWatchPath(p: string): boolean {
   try {
     const lst = fs.lstatSync(p);
     if (lst.isSymbolicLink()) {
@@ -505,12 +506,53 @@ function isSafeWatchDir(p: string): boolean {
   }
 }
 
+/**
+ * QRERUN-002: re-validate path before open, use O_NOFOLLOW to refuse
+ * mid-flight symlink swaps, then compare fd identity (ino+dev) with a
+ * fresh lstat to detect a race where the regular file was replaced
+ * between the watcher event and our open().
+ *
+ * Drops the event silently (no enqueue) on any mismatch — the watcher
+ * will fire again if the legitimate file keeps changing.
+ */
 async function processNewLines(filePath: string) {
   const allowlist = await fetchAllowlist();
+  // Re-run path-safety check immediately before open (was previously only
+  // done in watchFile() at watch-time, leaving a TOCTOU window).
+  if (!isSafeWatchPath(filePath)) return;
+
   let fd: fs.promises.FileHandle | null = null;
   try {
-    fd = await fs.promises.open(filePath, "r");
-    const stat = await fd.stat();
+    // O_NOFOLLOW forces open() to fail with ELOOP if filePath is now a
+    // symlink — closes the race window between isSafeWatchPath() above
+    // and the actual open syscall.
+    const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+    fd = await fs.promises.open(filePath, flags);
+
+    // Confirm the fd we opened still points at the regular file we
+    // validated, not at a swapped-in target. Compare device + inode of
+    // the fd against a fresh lstat of the path.
+    const fdStat = await fd.stat();
+    let pathStat: fs.Stats;
+    try {
+      pathStat = fs.lstatSync(filePath);
+    } catch {
+      return; // path vanished between open and lstat — drop
+    }
+    if (
+      pathStat.isSymbolicLink() ||
+      !fdStat.isFile() ||
+      pathStat.ino !== fdStat.ino ||
+      pathStat.dev !== fdStat.dev
+    ) {
+      console.warn(
+        `[tailer] dropping event: identity changed for ${filePath} ` +
+          `(symlink=${pathStat.isSymbolicLink()} ino_match=${pathStat.ino === fdStat.ino} dev_match=${pathStat.dev === fdStat.dev})`,
+      );
+      return;
+    }
+
+    const stat = fdStat;
     const cursor = fileCursors.get(filePath) ?? 0;
     if (stat.size <= cursor) return; // Nothing new
 
