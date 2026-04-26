@@ -307,7 +307,7 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   if (url === "/oauth/authorize" && method === "POST") {
     if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
     const body = await readBody(req);
-    return handleAuthorizePost(body, res);
+    return handleAuthorizePost(req, body, res, clientIp);
   }
   if (url === "/oauth/token" && method === "POST") {
     if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
@@ -628,6 +628,21 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
   });
 
   const safeName = escapeHtml(client.name || "Unknown Client");
+  // QSEC-002: when ADMIN_SECRET is configured we require the owner to type
+  // it in before issuing a code. This protects against an attacker who
+  // discovers a registered client_id+redirect_uri and walks the consent
+  // page anonymously.
+  const requireOwnerSecret = !!env.ADMIN_SECRET;
+  const ownerSecretField = requireOwnerSecret
+    ? `
+      <div class="secret">
+        <label for="admin_secret">Admin secret</label>
+        <input type="password" id="admin_secret" name="admin_secret" autocomplete="current-password" required>
+      </div>`
+    : "";
+  const ownerSecretNote = requireOwnerSecret
+    ? `<p class="info">Enter the workspace ADMIN_SECRET to confirm you are the owner.</p>`
+    : `<p class="info warn">QOOPIA_ADMIN_SECRET is not set; consent is gated by loopback origin only. Set the secret before exposing OAuth via tunnel/LAN.</p>`;
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -641,6 +656,10 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
     h1 { font-size: 20px; margin: 0 0 8px; }
     .client { color: #7c8aff; font-weight: 600; }
     .info { color: #888; font-size: 14px; margin: 16px 0 24px; }
+    .info.warn { color: #ffb37c; }
+    .secret { margin: 0 0 20px; text-align: left; }
+    .secret label { display:block; font-size: 12px; color:#888; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 1px; }
+    .secret input { width: 100%; padding: 10px 12px; box-sizing: border-box; border-radius: 8px; border: 1px solid #2a2a3e; background: #0f0f1c; color: #e0e0e0; font-size: 14px; }
     .actions { display: flex; gap: 12px; justify-content: center; }
     button { padding: 12px 32px; border-radius: 8px; border: none; font-size: 16px; font-weight: 600; cursor: pointer; }
     button:hover { opacity: 0.85; }
@@ -653,9 +672,9 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
     <div class="logo">🔑</div>
     <h1>Authorize access</h1>
     <p><span class="client">${safeName}</span> wants to connect to Qoopia</p>
-    <p class="info">This will grant access to your notes, tasks, deals, contacts, finances, and session memory.</p>
+    ${ownerSecretNote}
     <form method="POST" action="/oauth/authorize">
-      <input type="hidden" name="nonce" value="${escapeHtml(nonce)}">
+      <input type="hidden" name="nonce" value="${escapeHtml(nonce)}">${ownerSecretField}
       <div class="actions">
         <button type="submit" name="action" value="deny" class="deny">Deny</button>
         <button type="submit" name="action" value="approve" class="approve">Approve</button>
@@ -671,7 +690,37 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
   res.end(html);
 }
 
-function handleAuthorizePost(body: Buffer, res: ServerResponse) {
+/**
+ * QSEC-002: ensure the consent POST is coming from the workspace owner.
+ * Two acceptable proofs:
+ *   1. Form field `admin_secret` matches env.ADMIN_SECRET (constant-time).
+ *   2. ADMIN_SECRET is unset AND the request originates from a loopback
+ *      socket (single-machine dev install with no tunnel/LAN exposure).
+ *
+ * Note: when running behind cloudflared the socket is always 127.0.0.1, so
+ * tunnel deployments MUST set QOOPIA_ADMIN_SECRET. This is intentional —
+ * we want failure-loud rather than silent auto-approval.
+ */
+function isLoopbackSocket(req: IncomingMessage): boolean {
+  const ra = req.socket.remoteAddress || "";
+  return ra === "127.0.0.1" || ra === "::1" || ra === "::ffff:127.0.0.1";
+}
+
+function verifyConsentSecret(formSecret: string | undefined): boolean {
+  if (!env.ADMIN_SECRET) return false;
+  if (!formSecret) return false;
+  const expected = Buffer.from(env.ADMIN_SECRET);
+  const provided = Buffer.from(formSecret);
+  if (provided.length !== expected.length) return false;
+  return crypto.timingSafeEqual(provided, expected);
+}
+
+function handleAuthorizePost(
+  req: IncomingMessage,
+  body: Buffer,
+  res: ServerResponse,
+  clientIp: string,
+) {
   let form: Record<string, string>;
   try {
     form = parseForm(body);
@@ -681,8 +730,7 @@ function handleAuthorizePost(body: Buffer, res: ServerResponse) {
   const action = form.action || "approve";
   const nonce = form.nonce;
 
-  // Validate one-time nonce — this authenticates the consent POST without
-  // requiring the admin secret header from the browser form.
+  // Validate one-time nonce — protects against CSRF on the consent form.
   if (!nonce) {
     return json(res, 400, { error: "invalid_request", error_description: "Missing nonce" });
   }
@@ -697,6 +745,12 @@ function handleAuthorizePost(body: Buffer, res: ServerResponse) {
   const { clientId, redirectUri, codeChallenge, codeChallengeMethod, state } = pending;
 
   if (action === "deny") {
+    audit({
+      event: "oauth_consent",
+      result: "deny",
+      ip: clientIp,
+      detail: `client=${clientId} action=deny`,
+    });
     const url = new URL(redirectUri);
     url.searchParams.set("error", "access_denied");
     if (state) url.searchParams.set("state", state);
@@ -704,7 +758,27 @@ function handleAuthorizePost(body: Buffer, res: ServerResponse) {
     return res.end();
   }
 
-  // Auto-approve: resolve client → agent → workspace, issue code
+  // QSEC-002: gate the approve path on owner proof.
+  const secretOk = verifyConsentSecret(form.admin_secret);
+  const loopbackOk = !env.ADMIN_SECRET && isLoopbackSocket(req);
+  if (!secretOk && !loopbackOk) {
+    audit({
+      event: "oauth_consent",
+      result: "deny",
+      ip: clientIp,
+      detail: env.ADMIN_SECRET
+        ? `client=${clientId} reason=admin_secret_missing_or_invalid`
+        : `client=${clientId} reason=non_loopback_no_admin_secret`,
+    });
+    return json(res, 401, {
+      error: "access_denied",
+      error_description: env.ADMIN_SECRET
+        ? "Owner consent required: admin_secret missing or invalid."
+        : "Owner consent required: set QOOPIA_ADMIN_SECRET when serving OAuth from tunnel/LAN.",
+    });
+  }
+
+  // Resolve client → agent → workspace, issue code
   const client = getClient(clientId);
   if (!client) {
     return json(res, 400, { error: "invalid_client" });
@@ -724,6 +798,14 @@ function handleAuthorizePost(body: Buffer, res: ServerResponse) {
     codeChallenge,
     codeChallengeMethod,
     redirectUri,
+  });
+  audit({
+    event: "oauth_consent",
+    result: "allow",
+    ip: clientIp,
+    workspace_id: ws.workspace_id,
+    agent_id: ws.agent_id,
+    detail: `client=${clientId} via=${secretOk ? "admin_secret" : "loopback"}`,
   });
   const url = new URL(redirectUri);
   url.searchParams.set("code", code);

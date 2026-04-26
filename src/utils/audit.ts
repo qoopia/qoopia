@@ -22,7 +22,8 @@ export type AuditEvent =
   | "rate_limit_trigger"
   | "oauth_register"
   | "oauth_token"
-  | "oauth_revoke";
+  | "oauth_revoke"
+  | "oauth_consent";
 
 export type AuditResult = "allow" | "deny" | "error";
 
