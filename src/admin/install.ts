@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
@@ -220,6 +221,23 @@ export async function install(opts: InstallOpts = {}) {
     path.join(PROJECT_ROOT, "templates/com.qoopia.mcp.plist"),
     "utf8",
   );
+
+  // QRERUN-001: persist a randomly-generated QOOPIA_ADMIN_SECRET into the
+  // plist so /oauth/authorize is always gated on owner consent. Reuse an
+  // existing one if found (idempotent install) — never silently rotate it,
+  // because that would invalidate any consent flow already trusted by
+  // Claude.ai etc.
+  const adminSecretPath = path.join(env.DATA_DIR, "admin-secret");
+  let adminSecret: string;
+  if (fs.existsSync(adminSecretPath)) {
+    adminSecret = fs.readFileSync(adminSecretPath, "utf8").trim();
+    step(`Reusing existing admin secret from ${adminSecretPath}`);
+  } else {
+    adminSecret = crypto.randomBytes(32).toString("base64");
+    fs.writeFileSync(adminSecretPath, adminSecret + "\n", { encoding: "utf8", mode: 0o600 });
+    step(`Generated admin secret → ${adminSecretPath} (chmod 0600)`);
+  }
+
   const plist = plistTemplate
     .replace(/{{BUN_PATH}}/g, bunPath)
     .replace(/{{QOOPIA_ENTRY}}/g, qoopiaEntry)
@@ -228,6 +246,7 @@ export async function install(opts: InstallOpts = {}) {
     .replace(/{{LOG_DIR}}/g, env.LOG_DIR)
     .replace(/{{BACKUP_DIR}}/g, env.BACKUP_DIR)
     .replace(/{{QOOPIA_PUBLIC_URL}}/g, env.PUBLIC_URL)
+    .replace(/{{QOOPIA_ADMIN_SECRET}}/g, adminSecret)
     .replace(/{{WORKING_DIR}}/g, PROJECT_ROOT);
 
   const plistDir = path.join(os.homedir(), "Library/LaunchAgents");

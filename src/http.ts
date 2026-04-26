@@ -182,7 +182,27 @@ function nodeReqToFetchRequest(req: IncomingMessage, body?: Buffer): Request {
   return new Request(url, init);
 }
 
+/**
+ * QRERUN-001: refuse to start the HTTP server if /oauth/authorize is reachable
+ * but env.ADMIN_SECRET is empty. Without this gate the consent POST handler
+ * has no owner-proof to verify, and the previous loopback-fallback was unsafe
+ * behind tunnels (cloudflared etc. always present as 127.0.0.1).
+ *
+ * Throws so launchd surfaces the failure in stderr and the install runbook
+ * can prompt the operator to set QOOPIA_ADMIN_SECRET.
+ */
+export function assertOAuthReady(): void {
+  if (env.ADMIN_SECRET) return;
+  const msg =
+    "QOOPIA_ADMIN_SECRET is not set. /oauth/authorize cannot start without it " +
+    "(QRERUN-001 fail-closed). Generate one and add it to your launchd plist " +
+    "or shell env: `openssl rand -base64 32`.";
+  logger.error(msg);
+  throw new Error(msg);
+}
+
 export function startHttpServer() {
+  assertOAuthReady();
   const httpServer = createServer(async (req, res) => {
     try {
       await handleRequest(req as NodeReqWithBody, res);
@@ -628,21 +648,15 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
   });
 
   const safeName = escapeHtml(client.name || "Unknown Client");
-  // QSEC-002: when ADMIN_SECRET is configured we require the owner to type
-  // it in before issuing a code. This protects against an attacker who
-  // discovers a registered client_id+redirect_uri and walks the consent
-  // page anonymously.
-  const requireOwnerSecret = !!env.ADMIN_SECRET;
-  const ownerSecretField = requireOwnerSecret
-    ? `
+  // QRERUN-001: ADMIN_SECRET is required unconditionally (assertOAuthReady
+  // verifies this at startup), so the form always shows the secret field —
+  // no loopback-fallback branch.
+  const ownerSecretField = `
       <div class="secret">
         <label for="admin_secret">Admin secret</label>
         <input type="password" id="admin_secret" name="admin_secret" autocomplete="current-password" required>
-      </div>`
-    : "";
-  const ownerSecretNote = requireOwnerSecret
-    ? `<p class="info">Enter the workspace ADMIN_SECRET to confirm you are the owner.</p>`
-    : `<p class="info warn">QOOPIA_ADMIN_SECRET is not set; consent is gated by loopback origin only. Set the secret before exposing OAuth via tunnel/LAN.</p>`;
+      </div>`;
+  const ownerSecretNote = `<p class="info">Enter the workspace ADMIN_SECRET to confirm you are the owner.</p>`;
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -691,21 +705,15 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
 }
 
 /**
- * QSEC-002: ensure the consent POST is coming from the workspace owner.
- * Two acceptable proofs:
- *   1. Form field `admin_secret` matches env.ADMIN_SECRET (constant-time).
- *   2. ADMIN_SECRET is unset AND the request originates from a loopback
- *      socket (single-machine dev install with no tunnel/LAN exposure).
+ * QRERUN-001 (supersedes QSEC-002 loopback fallback): owner consent on
+ * /authorize is gated unconditionally on env.ADMIN_SECRET. The previous
+ * loopback fallback was unsafe because cloudflared/nginx/Tailscale tunnels
+ * present as 127.0.0.1 to the Node socket, so the gate could be bypassed
+ * by any tunneled visitor when ADMIN_SECRET was unset.
  *
- * Note: when running behind cloudflared the socket is always 127.0.0.1, so
- * tunnel deployments MUST set QOOPIA_ADMIN_SECRET. This is intentional —
- * we want failure-loud rather than silent auto-approval.
+ * Startup (assertOAuthReady) refuses to register /authorize when
+ * ADMIN_SECRET is empty — fail loud, fail closed, no silent dev mode.
  */
-function isLoopbackSocket(req: IncomingMessage): boolean {
-  const ra = req.socket.remoteAddress || "";
-  return ra === "127.0.0.1" || ra === "::1" || ra === "::ffff:127.0.0.1";
-}
-
 function verifyConsentSecret(formSecret: string | undefined): boolean {
   if (!env.ADMIN_SECRET) return false;
   if (!formSecret) return false;
@@ -758,23 +766,19 @@ function handleAuthorizePost(
     return res.end();
   }
 
-  // QSEC-002: gate the approve path on owner proof.
-  const secretOk = verifyConsentSecret(form.admin_secret);
-  const loopbackOk = !env.ADMIN_SECRET && isLoopbackSocket(req);
-  if (!secretOk && !loopbackOk) {
+  // QRERUN-001: ADMIN_SECRET is the sole accepted owner proof. assertOAuthReady()
+  // at startup guarantees env.ADMIN_SECRET is set whenever this handler is
+  // reachable, so we don't need a "secret unset" branch here.
+  if (!verifyConsentSecret(form.admin_secret)) {
     audit({
       event: "oauth_consent",
       result: "deny",
       ip: clientIp,
-      detail: env.ADMIN_SECRET
-        ? `client=${clientId} reason=admin_secret_missing_or_invalid`
-        : `client=${clientId} reason=non_loopback_no_admin_secret`,
+      detail: `client=${clientId} reason=admin_secret_missing_or_invalid`,
     });
     return json(res, 401, {
       error: "access_denied",
-      error_description: env.ADMIN_SECRET
-        ? "Owner consent required: admin_secret missing or invalid."
-        : "Owner consent required: set QOOPIA_ADMIN_SECRET when serving OAuth from tunnel/LAN.",
+      error_description: "Owner consent required: admin_secret missing or invalid.",
     });
   }
 
@@ -805,7 +809,7 @@ function handleAuthorizePost(
     ip: clientIp,
     workspace_id: ws.workspace_id,
     agent_id: ws.agent_id,
-    detail: `client=${clientId} via=${secretOk ? "admin_secret" : "loopback"}`,
+    detail: `client=${clientId} via=admin_secret`,
   });
   const url = new URL(redirectUri);
   url.searchParams.set("code", code);
