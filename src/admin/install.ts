@@ -231,15 +231,20 @@ export async function install(opts: InstallOpts = {}) {
   let adminSecret: string;
   if (fs.existsSync(adminSecretPath)) {
     adminSecret = fs.readFileSync(adminSecretPath, "utf8").trim();
-    // QTHIRD-002: chmod 0600 on the reuse path too — fs.writeFileSync
-    // sets mode only at create time, so a file that was created with
-    // looser perms (or whose mode drifted) would otherwise stay readable
-    // by other local users.
+    // QTHIRD-002 / QFOURTH-002: chmod 0600 on the reuse path too —
+    // fs.writeFileSync sets mode only at create time, so a file that was
+    // created with looser perms (or whose mode drifted) would otherwise
+    // stay readable by other local users.
+    // Failure here is FATAL: a quiet warning lets the install finish with
+    // a world-readable secret on disk, which is exactly the leak we are
+    // hardening against. Codex 4th review explicitly required throw, not
+    // warn, so the operator sees and fixes the underlying perm issue
+    // before the daemon ever uses the secret.
     try {
       fs.chmodSync(adminSecretPath, 0o600);
     } catch (err) {
-      console.warn(
-        `⚠ chmod 0600 on ${adminSecretPath} failed: ${(err as Error).message}`,
+      throw new Error(
+        `chmod 0600 on ${adminSecretPath} failed: ${(err as Error).message} — refusing to continue with possibly world-readable admin secret`,
       );
     }
     step(`Reusing existing admin secret from ${adminSecretPath} (chmod 0600 enforced)`);
@@ -264,15 +269,18 @@ export async function install(opts: InstallOpts = {}) {
   fs.mkdirSync(plistDir, { recursive: true });
   const plistPath = path.join(plistDir, "com.qoopia.mcp.plist");
   fs.writeFileSync(plistPath, plist, "utf8");
-  // QTHIRD-002: the plist embeds QOOPIA_ADMIN_SECRET — lock it down to
-  // owner-only so other local users can't read the secret out of the
-  // launchd config. fs.writeFileSync uses the process umask by default,
-  // which on a typical Mac leaves it world-readable.
+  // QTHIRD-002 / QFOURTH-002: the plist embeds QOOPIA_ADMIN_SECRET — lock
+  // it down to owner-only so other local users can't read the secret out
+  // of the launchd config. fs.writeFileSync uses the process umask by
+  // default, which on a typical Mac leaves it world-readable.
+  // Failure here is FATAL for the same reason as above: a warn would let
+  // a world-readable plist sit in ~/Library/LaunchAgents until next
+  // reboot. Codex 4th review required throw.
   try {
     fs.chmodSync(plistPath, 0o600);
   } catch (err) {
-    console.warn(
-      `⚠ chmod 0600 on ${plistPath} failed: ${(err as Error).message}`,
+    throw new Error(
+      `chmod 0600 on ${plistPath} failed: ${(err as Error).message} — refusing to continue with possibly world-readable LaunchAgent plist`,
     );
   }
   step(`LaunchAgent plist written: ${plistPath} (chmod 0600)`);
