@@ -9,6 +9,7 @@ import { db } from "../db/connection.ts";
 import { createWorkspace } from "./workspaces.ts";
 import { createAgent } from "./agents.ts";
 import { env } from "../utils/env.ts";
+import { ensureSafeDir } from "../utils/fs-perms.ts";
 import { getRolePreset, ROLE_PRESET_NAMES, listRolePresets } from "./templates.ts";
 import { ulid } from "ulid";
 import { nowIso } from "../utils/errors.ts";
@@ -89,11 +90,10 @@ export async function install(opts: InstallOpts = {}) {
   const start = Date.now();
   banner("Qoopia V3.0 installer");
 
-  // 1. Directories
-  fs.mkdirSync(env.DATA_DIR, { recursive: true });
-  fs.chmodSync(env.DATA_DIR, 0o700);
-  fs.mkdirSync(env.LOG_DIR, { recursive: true });
-  fs.mkdirSync(env.BACKUP_DIR, { recursive: true });
+  // 1. Directories — all three under ~/.qoopia must be 0700; QSEC-003.
+  ensureSafeDir(env.DATA_DIR);
+  ensureSafeDir(env.LOG_DIR);
+  ensureSafeDir(env.BACKUP_DIR);
   step(`Data directory: ${env.DATA_DIR}`);
   step(`Logs directory: ${env.LOG_DIR}`);
   step(`Backups directory: ${env.BACKUP_DIR}`);
