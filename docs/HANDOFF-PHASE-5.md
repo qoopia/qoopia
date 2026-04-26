@@ -368,12 +368,44 @@ bun run scripts/verify-migration.ts
 # → all checks pass
 ```
 
-### Шаг 13: Freeze V2 (read-only)
+### Шаг 13: Quiesce V2 (proper read-only switch)
+
+**Не используем `chmod 444`** — у запущенного V2 процесса уже открыты file descriptors,
+SQLite в WAL mode держит -wal/-shm; chmod не блокирует write через уже открытый fd, а
+если новые writes всё-таки случаются — получаем corruption (WAL расходится с DB на
+read-only inode). Codex security review QSEC-004.
+
+Правильная последовательность:
 
 ```bash
-chmod 444 ~/.openclaw/qoopia/data/qoopia.db
-chmod 444 ~/.openclaw/qoopia/data/qoopia.db-wal 2>/dev/null || true
-chmod 444 ~/.openclaw/qoopia/data/qoopia.db-shm 2>/dev/null || true
+# 1. Stop V2 cleanly — закроет все open fds, флашнет WAL.
+launchctl unload ~/Library/LaunchAgents/com.openclaw.gateway.plist
+# либо специфичный V2 plist если запущен напрямую
+
+# 2. WAL checkpoint в саму DB (на случай если V2 не успел сам).
+sqlite3 ~/.openclaw/qoopia/data/qoopia.db "PRAGMA wal_checkpoint(TRUNCATE);"
+
+# 3. Snapshot для rollback baseline (immutable copy, не трогаем оригинал).
+cp ~/.openclaw/qoopia/data/qoopia.db ~/.openclaw/qoopia/data/qoopia.db.pre-v3-snapshot
+chmod 400 ~/.openclaw/qoopia/data/qoopia.db.pre-v3-snapshot
+
+# 4. Перезапустить V2 с app-level read-only флагом
+#    (V2 поддерживает QOOPIA_READ_ONLY=1 → SQLite open mode SQLITE_OPEN_READONLY,
+#    плюс write-tools возвращают QoopiaError("READ_ONLY")).
+QOOPIA_READ_ONLY=1 launchctl load ~/Library/LaunchAgents/com.openclaw.gateway.plist
+
+# 5. Verify write actually blocked at app layer.
+curl -sf -X POST http://localhost:3737/api/notes \
+  -H "Authorization: Bearer $V2_TEST_KEY" \
+  -d '{"text":"write-block test","type":"memory"}' | jq .
+# Ожидаем: {"error":"READ_ONLY",...}, HTTP 403/409. Если 200 — STOP, не продолжать
+# migration: V2 всё ещё принимает writes, snapshot невалиден.
+```
+
+**Rollback writability** (только для emergency rollback по Шагу 17 ниже):
+```bash
+launchctl unload ~/Library/LaunchAgents/com.openclaw.gateway.plist
+launchctl load   ~/Library/LaunchAgents/com.openclaw.gateway.plist  # без QOOPIA_READ_ONLY
 ```
 
 ### Шаг 14: Migrate agents (в ускоренном режиме — по желанию Askhat)
@@ -514,7 +546,11 @@ gh repo create askhatsoltanov/qoopia-v3 --private --source=. --push
 
 ### 6. V2 DB никогда не модифицируется
 
-После migration start: `chmod 444` на V2 DB. Все operations против V2 строго read-only. Rollback path гарантирован.
+После migration start V2 переводится в **app-level read-only** (`QOOPIA_READ_ONLY=1` env
++ перезапуск процесса с открытием SQLite в `SQLITE_OPEN_READONLY`). НЕ через `chmod 444` —
+это race с открытыми fd / WAL и может привести к corruption (см. QSEC-004 в Codex review,
+runbook в Шаге 13). Snapshot `qoopia.db.pre-v3-snapshot` (`chmod 400`) — иммутабельный
+rollback baseline. Все operations против V2 строго read-only. Rollback path гарантирован.
 
 ### 7. Идемпотентность migration script
 

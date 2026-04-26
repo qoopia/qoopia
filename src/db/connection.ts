@@ -1,11 +1,18 @@
 import { Database } from "bun:sqlite";
-import fs from "node:fs";
 import path from "node:path";
 import { env } from "../utils/env.ts";
+import { auditDirMode, ensureSafeDir } from "../utils/fs-perms.ts";
 
-fs.mkdirSync(env.DATA_DIR, { recursive: true });
-fs.mkdirSync(env.LOG_DIR, { recursive: true });
-fs.mkdirSync(env.BACKUP_DIR, { recursive: true });
+// QSEC-003: data, logs, backups all hold sensitive material — DB rows, audit
+// logs with workspace/agent ids, backup .db files. All three must be 0700.
+ensureSafeDir(env.DATA_DIR);
+ensureSafeDir(env.LOG_DIR);
+ensureSafeDir(env.BACKUP_DIR);
+// Audit pre-existing installs in case dirs were created before this hardening
+// (e.g., upgrades from earlier versions where LOG_DIR/BACKUP_DIR inherited umask).
+auditDirMode(env.DATA_DIR);
+auditDirMode(env.LOG_DIR);
+auditDirMode(env.BACKUP_DIR);
 
 export const DB_PATH = path.join(env.DATA_DIR, "qoopia.db");
 

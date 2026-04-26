@@ -46,7 +46,7 @@ Phase 4 — не код и не design, а **операционный план**
 
 1. **Parallel run V2+V3** на разных портах (V2 3737, V3 3738). Port swap опционален в конце.
 
-2. **V2 → read-only после migration start** через `chmod 444` на SQLite DB файл. Гарантирует consistent rollback point.
+2. **V2 → read-only после migration start** через `chmod 444` на SQLite DB файл. Гарантирует consistent rollback point. (**Superseded 2026-04-25 после Codex security review QSEC-004**: chmod approach небезопасен для запущенного процесса с открытыми fd / WAL — см. updated runbook в `30-migration/02-cutover.md` и `HANDOFF-PHASE-5.md` Шаг 13: quiesce + restart c `QOOPIA_READ_ONLY=1` + immutable snapshot.)
 
 3. **Agent order**: Alan → Aizek → Dan → Claude → **Aidan last**. Aidan последний потому что пишет реальным людям и ошибки имеют external visibility.
 

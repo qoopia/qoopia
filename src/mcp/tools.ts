@@ -75,6 +75,14 @@ function fail(err: unknown) {
 
 const noteTypeEnum = z.enum(NOTE_TYPES);
 
+// QRERUN-003 / ADR-014: agent types that bypass the per-note `private`
+// visibility filter on MCP read paths (recall, brief, note_get, note_list).
+// Mirrors the admin set used by dashboard-api.ts.
+const ADMIN_TYPES = new Set(["steward", "claude-privileged"]);
+function isAdmin(auth: AuthContext): boolean {
+  return ADMIN_TYPES.has(auth.type);
+}
+
 // -------- Tool definitions --------
 
 const tools: ToolDef[] = [
@@ -97,6 +105,8 @@ const tools: ToolDef[] = [
       const privileged = auth.type === "claude-privileged";
       return recall({
         workspace_id: auth.workspace_id,
+        caller_agent_id: auth.agent_id,
+        is_admin: isAdmin(auth),
         query: String(args.query),
         limit: args.limit as number | undefined,
         scope: args.scope as "notes" | "activity" | "all" | undefined,
@@ -122,6 +132,8 @@ const tools: ToolDef[] = [
     handler: (args, auth) =>
       brief({
         workspace_id: auth.workspace_id,
+        caller_agent_id: auth.agent_id,
+        is_admin: isAdmin(auth),
         project: args.project as string | undefined,
         agent: args.agent as string | undefined,
         limit_per_section: args.limit_per_section as number | undefined,
@@ -142,6 +154,12 @@ const tools: ToolDef[] = [
         .describe("Bind this note to a task; auto-purged when task closes."),
       session_id: z.string().optional(),
       tags: z.array(z.string()).optional(),
+      visibility: z
+        .enum(["workspace", "private"])
+        .optional()
+        .describe(
+          "ADR-014: 'workspace' (default) shares note with all agents in this workspace. 'private' restricts reads to this agent and admin types.",
+        ),
     },
     handler: (args, auth) =>
       createNote({
@@ -154,6 +172,7 @@ const tools: ToolDef[] = [
         task_bound_id: args.task_bound_id as string | undefined,
         session_id: args.session_id as string | undefined,
         tags: args.tags as string[] | undefined,
+        visibility: args.visibility as "workspace" | "private" | undefined,
       }),
   },
   {
@@ -162,7 +181,8 @@ const tools: ToolDef[] = [
     rawSchema: {
       id: z.string().min(1),
     },
-    handler: (args, auth) => getNote(auth.workspace_id, String(args.id)),
+    handler: (args, auth) =>
+      getNote(auth.workspace_id, String(args.id), auth.agent_id, isAdmin(auth)),
   },
   {
     name: "note_list",
@@ -186,6 +206,8 @@ const tools: ToolDef[] = [
     handler: (args, auth) =>
       listNotes({
         workspace_id: auth.workspace_id,
+        caller_agent_id: auth.agent_id,
+        is_admin: isAdmin(auth),
         type: args.type as string | undefined,
         project_id: args.project_id as string | undefined,
         agent: args.agent as string | undefined,
@@ -222,6 +244,7 @@ const tools: ToolDef[] = [
       updateNote({
         workspace_id: auth.workspace_id,
         agent_id: auth.agent_id,
+        is_admin: isAdmin(auth),
         id: String(args.id),
         text: args.text as string | undefined,
         metadata: args.metadata as Record<string, unknown> | undefined,
@@ -240,7 +263,12 @@ const tools: ToolDef[] = [
       id: z.string().min(1),
     },
     handler: (args, auth) =>
-      deleteNote(auth.workspace_id, auth.agent_id, String(args.id)),
+      deleteNote(
+        auth.workspace_id,
+        auth.agent_id,
+        String(args.id),
+        isAdmin(auth),
+      ),
   },
   {
     name: "session_save",
@@ -365,6 +393,8 @@ const tools: ToolDef[] = [
     handler: (args, auth) =>
       listActivity({
         workspace_id: auth.workspace_id,
+        caller_agent_id: auth.agent_id,
+        is_admin: isAdmin(auth),
         entity_type: args.entity_type as string | undefined,
         entity_id: args.entity_id as string | undefined,
         project_id: args.project_id as string | undefined,

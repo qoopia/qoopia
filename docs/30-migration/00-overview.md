@@ -82,9 +82,16 @@ bunx qoopia verify-migration
 
 **Цель**: гарантировать что данные V2 **не меняются** после migration start. Это критично для rollback safety.
 
-Механика: temporary patch в V2 code (или через file permissions на SQLite DB). Пример: `chmod 444 ~/.openclaw/qoopia/data/qoopia.db` — агенты получают write errors, но reads работают. Rollback strategy: `chmod 644` вернёт write.
+Механика: app-level read-only через quiesce + restart. Stop V2 (`launchctl unload`),
+WAL checkpoint, immutable snapshot (`cp` + `chmod 400`), restart V2 с
+`QOOPIA_READ_ONLY=1` (SQLite open mode `SQLITE_OPEN_READONLY` + write-tools возвращают
+`READ_ONLY` ошибку до DB layer). Verify через test write — должна вернуться 403/409.
+Полный runbook — в `02-cutover.md` (раздел "V2 → read-only switch").
 
-**Alternative**: установить agent middleware ALL_READS_ONLY flag в V2 конфиге если есть. Если нет — chmod подход работает.
+**НЕ через `chmod 444`**: у запущенного V2 процесса уже открыты file descriptors,
+SQLite в WAL mode держит -wal/-shm, chmod не блокирует write через открытый fd, а
+если новые writes всё-таки случаются — WAL расходится с DB и получаем corruption.
+Codex security review QSEC-004.
 
 ### Step 6: Migrate Alan first (single-agent test)
 

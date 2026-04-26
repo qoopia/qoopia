@@ -24,6 +24,9 @@
         <string>{{BACKUP_DIR}}</string>
         <key>QOOPIA_PUBLIC_URL</key>
         <string>{{QOOPIA_PUBLIC_URL}}</string>
+        <!-- QRERUN-001: required. /oauth/authorize will refuse to start without it. -->
+        <key>QOOPIA_ADMIN_SECRET</key>
+        <string>{{QOOPIA_ADMIN_SECRET}}</string>
     </dict>
     <key>KeepAlive</key>
     <true/>

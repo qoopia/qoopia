@@ -14,6 +14,11 @@ function requireInt(value: string | undefined, name: string, defaultVal: number)
 
 export const env = {
   PORT: requireInt(process.env.QOOPIA_PORT, "QOOPIA_PORT", 3737),
+  // Bind address. Default = loopback only. Production behind cloudflared/nginx
+  // also stays on 127.0.0.1 (the proxy is local). Set QOOPIA_HOST=0.0.0.0 only
+  // when you explicitly want LAN exposure — every auth surface (Bearer + OAuth)
+  // assumes it can trust the network it listens on, so this is opt-in by design.
+  HOST: process.env.QOOPIA_HOST || "127.0.0.1",
   DATA_DIR: process.env.QOOPIA_DATA_DIR || path.join(HOME, ".qoopia/data"),
   LOG_DIR: process.env.QOOPIA_LOG_DIR || path.join(HOME, ".qoopia/logs"),
   BACKUP_DIR: process.env.QOOPIA_BACKUP_DIR || path.join(HOME, ".qoopia/backups"),

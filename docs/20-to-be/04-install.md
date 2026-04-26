@@ -29,7 +29,7 @@ $ bunx qoopia install
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   MCP URL:        http://localhost:3737/mcp
-  Admin API key:  q_vAV7YcH3dRmK8gqF2eLpJ4nN6tWxBsZ
+  Admin API key:  <YOUR_QOOPIA_API_KEY>
 
 Add this to your MCP client config (e.g. ~/.claude/mcp.json):
 
@@ -38,7 +38,7 @@ Add this to your MCP client config (e.g. ~/.claude/mcp.json):
       "type": "streamable-http",
       "url": "http://localhost:3737/mcp",
       "headers": {
-        "Authorization": "Bearer q_vAV7YcH3dRmK8gqF2eLpJ4nN6tWxBsZ"
+        "Authorization": "Bearer <YOUR_QOOPIA_API_KEY>"
       }
     }
   }

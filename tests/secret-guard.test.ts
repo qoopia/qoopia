@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { assertNoSecrets } from "../src/utils/secret-guard.ts";
 import { QoopiaError } from "../src/utils/errors.ts";
 
-const SAMPLE_BODY = "ABCDEFGHIJKLMNOPQRSTUVWX"; // 24 chars, satisfies {16,}
+// Obvious placeholder body, 24 chars to satisfy the {16,} body length on
+// the secret-guard regex. Avoid token-like sample values that scanners and
+// humans could mistake for real credentials (QSEC-007).
+const SAMPLE_BODY = "EXAMPLE_PLACEHOLDER_KEY1";
 
 describe("assertNoSecrets", () => {
   test.each([
@@ -21,7 +24,7 @@ describe("assertNoSecrets", () => {
   });
 
   test("rejects secret with hyphens and underscores in body", () => {
-    const text = "qa_AB-CD_EF-GH_IJ-KL_MN-OP";
+    const text = "qa_EX-AM_PL-EH_OL-DE_KE-Y1";
     expect(() => assertNoSecrets(text, "test")).toThrow(QoopiaError);
   });
 

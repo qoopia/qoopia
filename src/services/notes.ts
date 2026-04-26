@@ -33,10 +33,13 @@ export interface NoteRow {
   session_id: string | null;
   source: string;
   tags: string;
+  visibility: string;
   deleted_at: string | null;
   created_at: string;
   updated_at: string;
 }
+
+export type NoteVisibility = "workspace" | "private";
 
 export interface NoteCreateInput {
   workspace_id: string;
@@ -49,6 +52,13 @@ export interface NoteCreateInput {
   session_id?: string | null;
   tags?: string[];
   source?: string;
+  /**
+   * QRERUN-003 / ADR-014: 'workspace' (default) shares the note across all
+   * agents in this workspace via MCP recall/brief/note_get/note_list.
+   * 'private' restricts reads to the owning agent_id and admin agent
+   * types (steward, claude-privileged).
+   */
+  visibility?: NoteVisibility;
 }
 
 function toNote(r: NoteRow) {
@@ -64,6 +74,7 @@ function toNote(r: NoteRow) {
     session_id: r.session_id,
     source: r.source,
     tags: safeJsonParse(r.tags, [] as string[]),
+    visibility: (r.visibility || "workspace") as NoteVisibility,
     deleted_at: r.deleted_at,
     created_at: r.created_at,
     updated_at: r.updated_at,
@@ -86,6 +97,7 @@ export function createNote(input: NoteCreateInput) {
   }
 
   const type = input.type || "note";
+  const visibility: NoteVisibility = input.visibility === "private" ? "private" : "workspace";
 
   // Validate project_id references an existing project note (M1 fix: enforce type='project')
   if (input.project_id) {
@@ -119,8 +131,8 @@ export function createNote(input: NoteCreateInput) {
   const result = db.transaction(() => {
     db.prepare(
       `INSERT INTO notes
-        (id, workspace_id, agent_id, type, text, metadata, project_id, task_bound_id, session_id, source, tags, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, workspace_id, agent_id, type, text, metadata, project_id, task_bound_id, session_id, source, tags, visibility, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       input.workspace_id,
@@ -133,10 +145,21 @@ export function createNote(input: NoteCreateInput) {
       input.session_id || null,
       input.source || "mcp",
       JSON.stringify(input.tags || []),
+      visibility,
       now,
       now,
     );
 
+    // QTHIRD-001: never embed the text of a private note into the
+    // shared activity log. Workspace-visibility notes keep the 80-char
+    // preview so existing dashboards stay informative; private rows
+    // record only the type, and the row itself is stamped 'private'
+    // so listActivity / recall(scope='activity'|'all') filter it out
+    // for non-owner non-admin callers.
+    const summary =
+      visibility === "private"
+        ? `Created ${type} (private)`
+        : `Created ${type}: ${input.text.slice(0, 80)}`;
     logActivity({
       workspace_id: input.workspace_id,
       agent_id: input.agent_id,
@@ -144,28 +167,58 @@ export function createNote(input: NoteCreateInput) {
       entity_type: "note",
       entity_id: id,
       project_id: input.project_id || null,
-      summary: `Created ${type}: ${input.text.slice(0, 80)}`,
+      summary,
+      visibility,
     });
 
-    return { created: true, id, type, workspace_id: input.workspace_id, created_at: now };
+    return {
+      created: true,
+      id,
+      type,
+      workspace_id: input.workspace_id,
+      visibility,
+      created_at: now,
+    };
   })();
 
   return result;
 }
 
-export function getNote(workspace_id: string, id: string) {
+/**
+ * QRERUN-003 / ADR-014: getNote enforces the visibility boundary.
+ * - 'workspace' notes — visible to any caller in the same workspace.
+ * - 'private' notes — only the owning agent_id can read; admin types
+ *   (steward, claude-privileged) bypass via isAdmin=true.
+ */
+export function getNote(
+  workspace_id: string,
+  id: string,
+  caller_agent_id: string,
+  isAdmin: boolean,
+) {
   // H3 fix: exclude soft-deleted notes
   const r = db
     .prepare(
-      `SELECT * FROM notes WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL LIMIT 1`,
+      `SELECT * FROM notes
+        WHERE id = ?
+          AND workspace_id = ?
+          AND deleted_at IS NULL
+          AND (visibility = 'workspace' OR agent_id = ? OR ? = 1)
+        LIMIT 1`,
     )
-    .get(id, workspace_id) as NoteRow | undefined;
+    .get(id, workspace_id, caller_agent_id, isAdmin ? 1 : 0) as NoteRow | undefined;
   if (!r) throw new QoopiaError("NOT_FOUND", `note ${id} not found`);
   return toNote(r);
 }
 
 export interface NoteListParams {
   workspace_id: string;
+  /** QRERUN-003 / ADR-014: agent_id of the caller — needed to surface
+   *  their own private notes alongside workspace-visibility ones. */
+  caller_agent_id: string;
+  /** QRERUN-003 / ADR-014: true for steward/claude-privileged — bypass
+   *  the private filter and see all notes for ops/audit. */
+  is_admin: boolean;
   type?: string;
   project_id?: string;
   agent?: string;
@@ -185,6 +238,9 @@ export function listNotes(p: NoteListParams) {
   const where: string[] = [`workspace_id = ?`];
   const params: any[] = [p.workspace_id];
   if (!p.include_deleted) where.push(`deleted_at IS NULL`);
+  // QRERUN-003 / ADR-014: hide private notes from non-owners (admins exempt).
+  where.push(`(visibility = 'workspace' OR agent_id = ? OR ? = 1)`);
+  params.push(p.caller_agent_id, p.is_admin ? 1 : 0);
   if (p.type) {
     where.push(`type = ?`);
     params.push(p.type);
@@ -269,6 +325,12 @@ export function listNotes(p: NoteListParams) {
 export interface NoteUpdateInput {
   workspace_id: string;
   agent_id: string;
+  /**
+   * QTHIRD-001: true for steward / claude-privileged. Required to
+   * mutate another agent's `private` note. Standard agents can only
+   * update notes they own or notes with workspace visibility.
+   */
+  is_admin: boolean;
   id: string;
   text?: string;
   metadata?: Record<string, unknown>;
@@ -287,6 +349,18 @@ export function updateNote(input: NoteUpdateInput) {
     .get(input.id, input.workspace_id) as NoteRow | undefined;
   if (!existing)
     throw new QoopiaError("NOT_FOUND", `note ${input.id} not found`);
+
+  // QTHIRD-001: refuse non-owner non-admin mutation of a private note.
+  // Throw NOT_FOUND (not FORBIDDEN) so the caller cannot probe for
+  // existence of private notes belonging to siblings.
+  const existingVisibility = (existing.visibility || "workspace") as NoteVisibility;
+  if (
+    existingVisibility === "private" &&
+    existing.agent_id !== input.agent_id &&
+    !input.is_admin
+  ) {
+    throw new QoopiaError("NOT_FOUND", `note ${input.id} not found`);
+  }
 
   if (input.metadata && input.metadata_replace) {
     throw new QoopiaError(
@@ -386,6 +460,13 @@ export function updateNote(input: NoteUpdateInput) {
     // Use the new project_id if it was changed, otherwise keep the existing one
     const effectiveProjectId =
       input.project_id !== undefined ? input.project_id : existing.project_id;
+    // QTHIRD-001: inherit the note's visibility for the activity row so a
+    // private note's update history isn't surfaced to non-owner non-admin
+    // callers via listActivity / recall(scope='activity').
+    const summaryUpd =
+      existingVisibility === "private"
+        ? `Updated ${existing.type} (private): ${updated.join(", ")}`
+        : `Updated ${existing.type}: ${updated.join(", ")}`;
     logActivity({
       workspace_id: input.workspace_id,
       agent_id: input.agent_id,
@@ -393,8 +474,9 @@ export function updateNote(input: NoteUpdateInput) {
       entity_type: "note",
       entity_id: input.id,
       project_id: effectiveProjectId,
-      summary: `Updated ${existing.type}: ${updated.join(", ")}`,
+      summary: summaryUpd,
       details: { fields_updated: updated },
+      visibility: existingVisibility,
     });
 
     return { updated: true, id: input.id, fields_updated: updated, updated_at: now };
@@ -403,15 +485,43 @@ export function updateNote(input: NoteUpdateInput) {
   return result;
 }
 
-export function deleteNote(workspace_id: string, agent_id: string, id: string) {
+/**
+ * QTHIRD-001: deleteNote enforces the visibility boundary.
+ * Non-owner non-admin callers cannot delete a private note; the call
+ * surfaces NOT_FOUND (not FORBIDDEN) to avoid leaking existence.
+ */
+export function deleteNote(
+  workspace_id: string,
+  agent_id: string,
+  id: string,
+  isAdmin: boolean,
+) {
   const existing = db
     .prepare(
-      `SELECT id, type, project_id FROM notes WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL LIMIT 1`,
+      `SELECT id, type, project_id, agent_id, visibility FROM notes
+        WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL
+        LIMIT 1`,
     )
     .get(id, workspace_id) as
-    | { id: string; type: string; project_id: string | null }
+    | {
+        id: string;
+        type: string;
+        project_id: string | null;
+        agent_id: string | null;
+        visibility: string | null;
+      }
     | undefined;
   if (!existing) throw new QoopiaError("NOT_FOUND", `note ${id} not found`);
+
+  const existingVisibility = (existing.visibility || "workspace") as NoteVisibility;
+  if (
+    existingVisibility === "private" &&
+    existing.agent_id !== agent_id &&
+    !isAdmin
+  ) {
+    // Match the read-side error to avoid leaking existence.
+    throw new QoopiaError("NOT_FOUND", `note ${id} not found`);
+  }
 
   const now = nowIso();
 
@@ -427,6 +537,14 @@ export function deleteNote(workspace_id: string, agent_id: string, id: string) {
       `DELETE FROM notes_fts WHERE rowid = (SELECT rowid FROM notes WHERE id = ?)`,
     ).run(id);
 
+    // QTHIRD-001: inherit the note's visibility for the deletion activity
+    // row, and never embed any text — the row already only carried `id`,
+    // but we also drop the id from the summary for private notes so the
+    // workspace-wide audit can't even reveal the ID.
+    const summaryDel =
+      existingVisibility === "private"
+        ? `Deleted ${existing.type} (private)`
+        : `Deleted ${existing.type} ${id}`;
     logActivity({
       workspace_id,
       agent_id,
@@ -434,7 +552,8 @@ export function deleteNote(workspace_id: string, agent_id: string, id: string) {
       entity_type: "note",
       entity_id: id,
       project_id: existing.project_id,
-      summary: `Deleted ${existing.type} ${id}`,
+      summary: summaryDel,
+      visibility: existingVisibility,
     });
 
     return { deleted: true, id };

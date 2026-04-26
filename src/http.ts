@@ -182,7 +182,27 @@ function nodeReqToFetchRequest(req: IncomingMessage, body?: Buffer): Request {
   return new Request(url, init);
 }
 
+/**
+ * QRERUN-001: refuse to start the HTTP server if /oauth/authorize is reachable
+ * but env.ADMIN_SECRET is empty. Without this gate the consent POST handler
+ * has no owner-proof to verify, and the previous loopback-fallback was unsafe
+ * behind tunnels (cloudflared etc. always present as 127.0.0.1).
+ *
+ * Throws so launchd surfaces the failure in stderr and the install runbook
+ * can prompt the operator to set QOOPIA_ADMIN_SECRET.
+ */
+export function assertOAuthReady(): void {
+  if (env.ADMIN_SECRET) return;
+  const msg =
+    "QOOPIA_ADMIN_SECRET is not set. /oauth/authorize cannot start without it " +
+    "(QRERUN-001 fail-closed). Generate one and add it to your launchd plist " +
+    "or shell env: `openssl rand -base64 32`.";
+  logger.error(msg);
+  throw new Error(msg);
+}
+
 export function startHttpServer() {
+  assertOAuthReady();
   const httpServer = createServer(async (req, res) => {
     try {
       await handleRequest(req as NodeReqWithBody, res);
@@ -199,8 +219,17 @@ export function startHttpServer() {
     }
   });
 
-  httpServer.listen(env.PORT, () => {
-    logger.info(`Qoopia V3.0 listening on http://localhost:${env.PORT}`);
+  httpServer.listen(env.PORT, env.HOST, () => {
+    const addr = httpServer.address();
+    const boundPort =
+      addr && typeof addr === "object" ? addr.port : env.PORT;
+    logger.info(`Qoopia V3.0 listening on http://${env.HOST}:${boundPort}`);
+    if (env.HOST !== "127.0.0.1" && env.HOST !== "::1" && env.HOST !== "localhost") {
+      logger.warn(
+        `QOOPIA_HOST=${env.HOST} — server is reachable beyond loopback. ` +
+          `Ensure firewall/tunnel ACLs are in place; OAuth + Bearer endpoints assume trusted network.`,
+      );
+    }
   });
 
   return httpServer;
@@ -298,7 +327,7 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   if (url === "/oauth/authorize" && method === "POST") {
     if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
     const body = await readBody(req);
-    return handleAuthorizePost(body, res);
+    return handleAuthorizePost(req, body, res, clientIp);
   }
   if (url === "/oauth/token" && method === "POST") {
     if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
@@ -619,6 +648,15 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
   });
 
   const safeName = escapeHtml(client.name || "Unknown Client");
+  // QRERUN-001: ADMIN_SECRET is required unconditionally (assertOAuthReady
+  // verifies this at startup), so the form always shows the secret field —
+  // no loopback-fallback branch.
+  const ownerSecretField = `
+      <div class="secret">
+        <label for="admin_secret">Admin secret</label>
+        <input type="password" id="admin_secret" name="admin_secret" autocomplete="current-password" required>
+      </div>`;
+  const ownerSecretNote = `<p class="info">Enter the workspace ADMIN_SECRET to confirm you are the owner.</p>`;
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -632,6 +670,10 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
     h1 { font-size: 20px; margin: 0 0 8px; }
     .client { color: #7c8aff; font-weight: 600; }
     .info { color: #888; font-size: 14px; margin: 16px 0 24px; }
+    .info.warn { color: #ffb37c; }
+    .secret { margin: 0 0 20px; text-align: left; }
+    .secret label { display:block; font-size: 12px; color:#888; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 1px; }
+    .secret input { width: 100%; padding: 10px 12px; box-sizing: border-box; border-radius: 8px; border: 1px solid #2a2a3e; background: #0f0f1c; color: #e0e0e0; font-size: 14px; }
     .actions { display: flex; gap: 12px; justify-content: center; }
     button { padding: 12px 32px; border-radius: 8px; border: none; font-size: 16px; font-weight: 600; cursor: pointer; }
     button:hover { opacity: 0.85; }
@@ -644,9 +686,9 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
     <div class="logo">🔑</div>
     <h1>Authorize access</h1>
     <p><span class="client">${safeName}</span> wants to connect to Qoopia</p>
-    <p class="info">This will grant access to your notes, tasks, deals, contacts, finances, and session memory.</p>
+    ${ownerSecretNote}
     <form method="POST" action="/oauth/authorize">
-      <input type="hidden" name="nonce" value="${escapeHtml(nonce)}">
+      <input type="hidden" name="nonce" value="${escapeHtml(nonce)}">${ownerSecretField}
       <div class="actions">
         <button type="submit" name="action" value="deny" class="deny">Deny</button>
         <button type="submit" name="action" value="approve" class="approve">Approve</button>
@@ -662,7 +704,31 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
   res.end(html);
 }
 
-function handleAuthorizePost(body: Buffer, res: ServerResponse) {
+/**
+ * QRERUN-001 (supersedes QSEC-002 loopback fallback): owner consent on
+ * /authorize is gated unconditionally on env.ADMIN_SECRET. The previous
+ * loopback fallback was unsafe because cloudflared/nginx/Tailscale tunnels
+ * present as 127.0.0.1 to the Node socket, so the gate could be bypassed
+ * by any tunneled visitor when ADMIN_SECRET was unset.
+ *
+ * Startup (assertOAuthReady) refuses to register /authorize when
+ * ADMIN_SECRET is empty — fail loud, fail closed, no silent dev mode.
+ */
+function verifyConsentSecret(formSecret: string | undefined): boolean {
+  if (!env.ADMIN_SECRET) return false;
+  if (!formSecret) return false;
+  const expected = Buffer.from(env.ADMIN_SECRET);
+  const provided = Buffer.from(formSecret);
+  if (provided.length !== expected.length) return false;
+  return crypto.timingSafeEqual(provided, expected);
+}
+
+function handleAuthorizePost(
+  req: IncomingMessage,
+  body: Buffer,
+  res: ServerResponse,
+  clientIp: string,
+) {
   let form: Record<string, string>;
   try {
     form = parseForm(body);
@@ -672,8 +738,7 @@ function handleAuthorizePost(body: Buffer, res: ServerResponse) {
   const action = form.action || "approve";
   const nonce = form.nonce;
 
-  // Validate one-time nonce — this authenticates the consent POST without
-  // requiring the admin secret header from the browser form.
+  // Validate one-time nonce — protects against CSRF on the consent form.
   if (!nonce) {
     return json(res, 400, { error: "invalid_request", error_description: "Missing nonce" });
   }
@@ -688,6 +753,12 @@ function handleAuthorizePost(body: Buffer, res: ServerResponse) {
   const { clientId, redirectUri, codeChallenge, codeChallengeMethod, state } = pending;
 
   if (action === "deny") {
+    audit({
+      event: "oauth_consent",
+      result: "deny",
+      ip: clientIp,
+      detail: `client=${clientId} action=deny`,
+    });
     const url = new URL(redirectUri);
     url.searchParams.set("error", "access_denied");
     if (state) url.searchParams.set("state", state);
@@ -695,7 +766,23 @@ function handleAuthorizePost(body: Buffer, res: ServerResponse) {
     return res.end();
   }
 
-  // Auto-approve: resolve client → agent → workspace, issue code
+  // QRERUN-001: ADMIN_SECRET is the sole accepted owner proof. assertOAuthReady()
+  // at startup guarantees env.ADMIN_SECRET is set whenever this handler is
+  // reachable, so we don't need a "secret unset" branch here.
+  if (!verifyConsentSecret(form.admin_secret)) {
+    audit({
+      event: "oauth_consent",
+      result: "deny",
+      ip: clientIp,
+      detail: `client=${clientId} reason=admin_secret_missing_or_invalid`,
+    });
+    return json(res, 401, {
+      error: "access_denied",
+      error_description: "Owner consent required: admin_secret missing or invalid.",
+    });
+  }
+
+  // Resolve client → agent → workspace, issue code
   const client = getClient(clientId);
   if (!client) {
     return json(res, 400, { error: "invalid_client" });
@@ -715,6 +802,14 @@ function handleAuthorizePost(body: Buffer, res: ServerResponse) {
     codeChallenge,
     codeChallengeMethod,
     redirectUri,
+  });
+  audit({
+    event: "oauth_consent",
+    result: "allow",
+    ip: clientIp,
+    workspace_id: ws.workspace_id,
+    agent_id: ws.agent_id,
+    detail: `client=${clientId} via=admin_secret`,
   });
   const url = new URL(redirectUri);
   url.searchParams.set("code", code);

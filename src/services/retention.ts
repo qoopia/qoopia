@@ -4,6 +4,7 @@ import { db } from "../db/connection.ts";
 import { env } from "../utils/env.ts";
 import { logger } from "../utils/logger.ts";
 import { nowIso } from "../utils/errors.ts";
+import { ensureSafeDir, ensureSafeFile } from "../utils/fs-perms.ts";
 
 /**
  * Daily maintenance job:
@@ -90,13 +91,15 @@ export function runMaintenance(): { ok: boolean; report: Record<string, unknown>
     report.oauth_expired_deleted = oauthExpired.changes;
     report.oauth_revoked_deleted = oauthRevoked.changes;
 
-    // 5. Backup
+    // 5. Backup — backup file contains the entire DB so it must be 0600,
+    // and BACKUP_DIR must be 0700; QSEC-003.
     const backupName = `qoopia-${new Date().toISOString().slice(0, 10)}.db`;
     const backupPath = path.join(env.BACKUP_DIR, backupName);
     try {
-      fs.mkdirSync(env.BACKUP_DIR, { recursive: true });
+      ensureSafeDir(env.BACKUP_DIR);
       if (fs.existsSync(backupPath)) fs.unlinkSync(backupPath);
       db.prepare(`VACUUM INTO ?`).run(backupPath);
+      ensureSafeFile(backupPath);
       report.backup = backupPath;
 
       // 6. Rotate

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
@@ -9,6 +10,7 @@ import { db } from "../db/connection.ts";
 import { createWorkspace } from "./workspaces.ts";
 import { createAgent } from "./agents.ts";
 import { env } from "../utils/env.ts";
+import { ensureSafeDir } from "../utils/fs-perms.ts";
 import { getRolePreset, ROLE_PRESET_NAMES, listRolePresets } from "./templates.ts";
 import { ulid } from "ulid";
 import { nowIso } from "../utils/errors.ts";
@@ -89,11 +91,10 @@ export async function install(opts: InstallOpts = {}) {
   const start = Date.now();
   banner("Qoopia V3.0 installer");
 
-  // 1. Directories
-  fs.mkdirSync(env.DATA_DIR, { recursive: true });
-  fs.chmodSync(env.DATA_DIR, 0o700);
-  fs.mkdirSync(env.LOG_DIR, { recursive: true });
-  fs.mkdirSync(env.BACKUP_DIR, { recursive: true });
+  // 1. Directories — all three under ~/.qoopia must be 0700; QSEC-003.
+  ensureSafeDir(env.DATA_DIR);
+  ensureSafeDir(env.LOG_DIR);
+  ensureSafeDir(env.BACKUP_DIR);
   step(`Data directory: ${env.DATA_DIR}`);
   step(`Logs directory: ${env.LOG_DIR}`);
   step(`Backups directory: ${env.BACKUP_DIR}`);
@@ -220,6 +221,39 @@ export async function install(opts: InstallOpts = {}) {
     path.join(PROJECT_ROOT, "templates/com.qoopia.mcp.plist"),
     "utf8",
   );
+
+  // QRERUN-001: persist a randomly-generated QOOPIA_ADMIN_SECRET into the
+  // plist so /oauth/authorize is always gated on owner consent. Reuse an
+  // existing one if found (idempotent install) — never silently rotate it,
+  // because that would invalidate any consent flow already trusted by
+  // Claude.ai etc.
+  const adminSecretPath = path.join(env.DATA_DIR, "admin-secret");
+  let adminSecret: string;
+  if (fs.existsSync(adminSecretPath)) {
+    adminSecret = fs.readFileSync(adminSecretPath, "utf8").trim();
+    // QTHIRD-002 / QFOURTH-002: chmod 0600 on the reuse path too —
+    // fs.writeFileSync sets mode only at create time, so a file that was
+    // created with looser perms (or whose mode drifted) would otherwise
+    // stay readable by other local users.
+    // Failure here is FATAL: a quiet warning lets the install finish with
+    // a world-readable secret on disk, which is exactly the leak we are
+    // hardening against. Codex 4th review explicitly required throw, not
+    // warn, so the operator sees and fixes the underlying perm issue
+    // before the daemon ever uses the secret.
+    try {
+      fs.chmodSync(adminSecretPath, 0o600);
+    } catch (err) {
+      throw new Error(
+        `chmod 0600 on ${adminSecretPath} failed: ${(err as Error).message} — refusing to continue with possibly world-readable admin secret`,
+      );
+    }
+    step(`Reusing existing admin secret from ${adminSecretPath} (chmod 0600 enforced)`);
+  } else {
+    adminSecret = crypto.randomBytes(32).toString("base64");
+    fs.writeFileSync(adminSecretPath, adminSecret + "\n", { encoding: "utf8", mode: 0o600 });
+    step(`Generated admin secret → ${adminSecretPath} (chmod 0600)`);
+  }
+
   const plist = plistTemplate
     .replace(/{{BUN_PATH}}/g, bunPath)
     .replace(/{{QOOPIA_ENTRY}}/g, qoopiaEntry)
@@ -228,13 +262,28 @@ export async function install(opts: InstallOpts = {}) {
     .replace(/{{LOG_DIR}}/g, env.LOG_DIR)
     .replace(/{{BACKUP_DIR}}/g, env.BACKUP_DIR)
     .replace(/{{QOOPIA_PUBLIC_URL}}/g, env.PUBLIC_URL)
+    .replace(/{{QOOPIA_ADMIN_SECRET}}/g, adminSecret)
     .replace(/{{WORKING_DIR}}/g, PROJECT_ROOT);
 
   const plistDir = path.join(os.homedir(), "Library/LaunchAgents");
   fs.mkdirSync(plistDir, { recursive: true });
   const plistPath = path.join(plistDir, "com.qoopia.mcp.plist");
   fs.writeFileSync(plistPath, plist, "utf8");
-  step(`LaunchAgent plist written: ${plistPath}`);
+  // QTHIRD-002 / QFOURTH-002: the plist embeds QOOPIA_ADMIN_SECRET — lock
+  // it down to owner-only so other local users can't read the secret out
+  // of the launchd config. fs.writeFileSync uses the process umask by
+  // default, which on a typical Mac leaves it world-readable.
+  // Failure here is FATAL for the same reason as above: a warn would let
+  // a world-readable plist sit in ~/Library/LaunchAgents until next
+  // reboot. Codex 4th review required throw.
+  try {
+    fs.chmodSync(plistPath, 0o600);
+  } catch (err) {
+    throw new Error(
+      `chmod 0600 on ${plistPath} failed: ${(err as Error).message} — refusing to continue with possibly world-readable LaunchAgent plist`,
+    );
+  }
+  step(`LaunchAgent plist written: ${plistPath} (chmod 0600)`);
 
   // 6. Load service (unload first if already loaded)
   try {
