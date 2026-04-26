@@ -199,8 +199,17 @@ export function startHttpServer() {
     }
   });
 
-  httpServer.listen(env.PORT, () => {
-    logger.info(`Qoopia V3.0 listening on http://localhost:${env.PORT}`);
+  httpServer.listen(env.PORT, env.HOST, () => {
+    const addr = httpServer.address();
+    const boundPort =
+      addr && typeof addr === "object" ? addr.port : env.PORT;
+    logger.info(`Qoopia V3.0 listening on http://${env.HOST}:${boundPort}`);
+    if (env.HOST !== "127.0.0.1" && env.HOST !== "::1" && env.HOST !== "localhost") {
+      logger.warn(
+        `QOOPIA_HOST=${env.HOST} — server is reachable beyond loopback. ` +
+          `Ensure firewall/tunnel ACLs are in place; OAuth + Bearer endpoints assume trusted network.`,
+      );
+    }
   });
 
   return httpServer;
