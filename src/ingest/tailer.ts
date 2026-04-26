@@ -431,6 +431,80 @@ function persistCursors() {
   }
 }
 
+/**
+ * QSEC-006: defense against a local attacker that can write under
+ * ~/.claude/projects (or wherever CLAUDE_PROJECTS_DIR points). Without
+ * containment, a symlinked .jsonl could cause the tailer to ingest content
+ * from arbitrary paths into Qoopia memory.
+ *
+ * Rules:
+ *  1. Reject symlinks (lstat — does NOT follow links).
+ *  2. Require regular file.
+ *  3. realpath(file) must live under realpath(CLAUDE_PROJECTS_DIR) + sep.
+ *
+ * Returns true if safe to ingest. Logs and returns false otherwise.
+ */
+let _projectsRootResolved: string | null = null;
+function projectsRootResolved(): string {
+  if (_projectsRootResolved) return _projectsRootResolved;
+  try {
+    _projectsRootResolved = fs.realpathSync(CLAUDE_PROJECTS_DIR);
+  } catch {
+    _projectsRootResolved = path.resolve(CLAUDE_PROJECTS_DIR);
+  }
+  return _projectsRootResolved;
+}
+
+function isSafeWatchPath(p: string): boolean {
+  try {
+    const lst = fs.lstatSync(p);
+    if (lst.isSymbolicLink()) {
+      console.warn(`[tailer] refusing symlink: ${p}`);
+      return false;
+    }
+    if (!lst.isFile()) {
+      // Directories handled separately; this guards file paths only.
+      return false;
+    }
+    const real = fs.realpathSync(p);
+    const root = projectsRootResolved() + path.sep;
+    if (!real.startsWith(root)) {
+      console.warn(
+        `[tailer] refusing out-of-tree path: ${p} -> ${real} (root=${root})`,
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[tailer] isSafeWatchPath check failed for ${p}:`, err);
+    return false;
+  }
+}
+
+function isSafeWatchDir(p: string): boolean {
+  try {
+    const lst = fs.lstatSync(p);
+    if (lst.isSymbolicLink()) {
+      console.warn(`[tailer] refusing symlinked dir: ${p}`);
+      return false;
+    }
+    if (!lst.isDirectory()) return false;
+    const real = fs.realpathSync(p);
+    const root = projectsRootResolved();
+    // Allow root itself OR a subdir of root.
+    if (real !== root && !real.startsWith(root + path.sep)) {
+      console.warn(
+        `[tailer] refusing out-of-tree dir: ${p} -> ${real} (root=${root})`,
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[tailer] isSafeWatchDir check failed for ${p}:`, err);
+    return false;
+  }
+}
+
 async function processNewLines(filePath: string) {
   const allowlist = await fetchAllowlist();
   let fd: fs.promises.FileHandle | null = null;
@@ -485,9 +559,12 @@ const watchers = new Map<string, fs.FSWatcher>();
 
 function watchFile(filePath: string) {
   if (watchers.has(filePath)) return;
-  // Init cursor at current file size (don't replay history)
+  // QSEC-006: refuse symlinks and out-of-tree paths before opening anything.
+  if (!isSafeWatchPath(filePath)) return;
+  // Init cursor at current file size (don't replay history). lstat to avoid
+  // following any symlink that could appear here later.
   try {
-    const size = fs.statSync(filePath).size;
+    const size = fs.lstatSync(filePath).size;
     fileCursors.set(filePath, size);
   } catch {
     fileCursors.set(filePath, 0);
@@ -513,14 +590,10 @@ function watchProjectsDir() {
     return;
   }
 
-  // Watch existing JSONL files
+  // Watch existing JSONL files. QSEC-006: skip symlinked dirs/files.
   for (const projectDir of fs.readdirSync(CLAUDE_PROJECTS_DIR)) {
     const fullProjectDir = path.join(CLAUDE_PROJECTS_DIR, projectDir);
-    try {
-      if (!fs.statSync(fullProjectDir).isDirectory()) continue;
-    } catch {
-      continue;
-    }
+    if (!isSafeWatchDir(fullProjectDir)) continue;
     for (const file of fs.readdirSync(fullProjectDir)) {
       if (file.endsWith(".jsonl")) {
         watchFile(path.join(fullProjectDir, file));
@@ -528,7 +601,8 @@ function watchProjectsDir() {
     }
   }
 
-  // Watch for new project dirs / new JSONL files
+  // Watch for new project dirs / new JSONL files. watchFile() does the
+  // symlink/realpath rejection per-file.
   fs.watch(CLAUDE_PROJECTS_DIR, { recursive: true }, (event, filename) => {
     if (!filename?.endsWith(".jsonl")) return;
     const fullPath = path.join(CLAUDE_PROJECTS_DIR, filename);
