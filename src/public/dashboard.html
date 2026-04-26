@@ -464,7 +464,10 @@ body {
 <script>
 (function () {
   const BASE = window.location.origin;
-  let TOKEN = sessionStorage.getItem('qoopia_admin') || '';
+  // QDASH-COOKIE: token is no longer stored in JS. Auth lives in an
+  // HttpOnly cookie set by POST /api/dashboard/login. Every fetch goes
+  // out with `credentials: 'same-origin'` so the cookie is included on
+  // same-origin requests; the cookie itself is never readable from JS.
   let view = { kind: 'home' }; // home | agent | session
   let agentsCache = null;
   let pollTimer = null;
@@ -476,11 +479,9 @@ body {
   // ---- API ----
   async function api(path) {
     const r = await fetch(BASE + path, {
-      headers: { 'Authorization': 'Bearer ' + TOKEN },
+      credentials: 'same-origin',
     });
     if (r.status === 401) {
-      sessionStorage.removeItem('qoopia_admin');
-      TOKEN = '';
       showLogin();
       throw new Error('unauthorized');
     }
@@ -506,14 +507,21 @@ body {
     if (!t) return;
     btn.disabled = true;
     btn.textContent = 'Checking...';
-    TOKEN = t;
     try {
-      await api('/api/dashboard/agents');
-      sessionStorage.setItem('qoopia_admin', t);
+      // Server validates the Bearer and replies with Set-Cookie. The token
+      // value never enters sessionStorage / localStorage — once the call
+      // returns we discard `t` and rely on the cookie for everything.
+      const r = await fetch(BASE + '/api/dashboard/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Authorization': 'Bearer ' + t },
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      // Wipe the input so the raw token does not linger in the DOM.
+      inp.value = '';
       showApp();
       goHome();
     } catch (e) {
-      TOKEN = '';
       $('#loginErr').style.display = 'block';
       inp.focus();
     } finally {
@@ -525,9 +533,13 @@ body {
     if (e.key === 'Enter') $('#loginBtn').click();
     $('#loginErr').style.display = 'none';
   });
-  $('#logoutBtn').onclick = () => {
-    sessionStorage.removeItem('qoopia_admin');
-    TOKEN = '';
+  $('#logoutBtn').onclick = async () => {
+    try {
+      await fetch(BASE + '/api/dashboard/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+    } catch { /* ignore — logout is best-effort */ }
     showLogin();
   };
 
@@ -924,12 +936,18 @@ body {
   }
 
   // ---- Boot ----
-  if (TOKEN) {
-    showApp();
-    api('/api/dashboard/agents').then(() => goHome()).catch(() => showLogin());
-  } else {
-    showLogin();
-  }
+  // Probe the API to see whether a session cookie is present and valid.
+  // 200 → cookie ok, show the app. 401 → no/expired cookie, show login.
+  fetch(BASE + '/api/dashboard/agents', { credentials: 'same-origin' })
+    .then(r => {
+      if (r.ok) {
+        showApp();
+        goHome();
+      } else {
+        showLogin();
+      }
+    })
+    .catch(() => showLogin());
 })();
 </script>
 </body>
