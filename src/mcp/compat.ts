@@ -349,6 +349,7 @@ function v2Update(args: Record<string, unknown>, auth: AuthContext) {
   return updateNote({
     workspace_id: auth.workspace_id,
     agent_id: auth.agent_id,
+    is_admin: isAdmin(auth),
     id,
     text: textOverride,
     metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
@@ -363,6 +364,8 @@ function v2List(args: Record<string, unknown>, auth: AuthContext) {
   if (entity === "activity") {
     return listActivity({
       workspace_id: auth.workspace_id,
+      caller_agent_id: auth.agent_id,
+      is_admin: isAdmin(auth),
       entity_type: args.entity_type as string | undefined,
       project_id: args.project_id as string | undefined,
       limit,
@@ -421,7 +424,7 @@ function v2Delete(args: Record<string, unknown>, auth: AuthContext) {
     }
   }
 
-  return deleteNote(auth.workspace_id, auth.agent_id, id);
+  return deleteNote(auth.workspace_id, auth.agent_id, id, isAdmin(auth));
 }
 
 function v2Note(args: Record<string, unknown>, auth: AuthContext) {

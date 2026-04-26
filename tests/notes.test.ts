@@ -127,6 +127,7 @@ describe("updateNote", () => {
     updateNote({
       workspace_id: WORKSPACE_ID,
       agent_id: AGENT_ID,
+      is_admin: false,
       id: r.id,
       metadata: { b: 99, c: 3 },
     });
@@ -136,6 +137,7 @@ describe("updateNote", () => {
     updateNote({
       workspace_id: WORKSPACE_ID,
       agent_id: AGENT_ID,
+      is_admin: false,
       id: r.id,
       metadata_replace: { only: "this" },
     });
@@ -153,6 +155,7 @@ describe("updateNote", () => {
       updateNote({
         workspace_id: WORKSPACE_ID,
         agent_id: AGENT_ID,
+        is_admin: false,
         id: r.id,
         metadata: { x: 1 },
         metadata_replace: { y: 2 },
@@ -168,7 +171,7 @@ describe("deleteNote", () => {
       agent_id: AGENT_ID,
       text: "to be deleted",
     });
-    const result = deleteNote(WORKSPACE_ID, AGENT_ID, r.id);
+    const result = deleteNote(WORKSPACE_ID, AGENT_ID, r.id, false);
     expect(result.deleted).toBe(true);
     expect(() => getNote(WORKSPACE_ID, r.id, AGENT_ID, false)).toThrow(/not found/);
   });
@@ -180,7 +183,7 @@ describe("deleteNote", () => {
       text: "hide-after-delete",
       type: "decision",
     });
-    deleteNote(WORKSPACE_ID, AGENT_ID, r.id);
+    deleteNote(WORKSPACE_ID, AGENT_ID, r.id, false);
     const visible = listNotes({
       workspace_id: WORKSPACE_ID,
       caller_agent_id: AGENT_ID,

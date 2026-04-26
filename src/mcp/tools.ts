@@ -244,6 +244,7 @@ const tools: ToolDef[] = [
       updateNote({
         workspace_id: auth.workspace_id,
         agent_id: auth.agent_id,
+        is_admin: isAdmin(auth),
         id: String(args.id),
         text: args.text as string | undefined,
         metadata: args.metadata as Record<string, unknown> | undefined,
@@ -262,7 +263,12 @@ const tools: ToolDef[] = [
       id: z.string().min(1),
     },
     handler: (args, auth) =>
-      deleteNote(auth.workspace_id, auth.agent_id, String(args.id)),
+      deleteNote(
+        auth.workspace_id,
+        auth.agent_id,
+        String(args.id),
+        isAdmin(auth),
+      ),
   },
   {
     name: "session_save",
@@ -387,6 +393,8 @@ const tools: ToolDef[] = [
     handler: (args, auth) =>
       listActivity({
         workspace_id: auth.workspace_id,
+        caller_agent_id: auth.agent_id,
+        is_admin: isAdmin(auth),
         entity_type: args.entity_type as string | undefined,
         entity_id: args.entity_id as string | undefined,
         project_id: args.project_id as string | undefined,

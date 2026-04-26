@@ -138,6 +138,10 @@ export function recall(p: RecallParams) {
       where.push(`workspace_id = ?`);
       params.push(p.workspace_id);
     }
+    // QTHIRD-001: hide activity rows tied to sibling private notes.
+    // Admin types and the owner agent still see them.
+    where.push(`(visibility = 'workspace' OR agent_id = ? OR ? = 1)`);
+    params.push(p.caller_agent_id, p.is_admin ? 1 : 0);
     const sql = `
       SELECT id, 'activity' as type, summary as text, details as metadata, project_id, created_at, workspace_id, 0 as rank
       FROM activity
