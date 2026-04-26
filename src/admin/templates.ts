@@ -46,7 +46,7 @@ const GENERAL_PRESET: RolePreset = {
     },
     {
       type: "context",
-      text: "WORKSPACE CONTEXT:\n- This is a freshly onboarded agent\n- Use recall() to find workspace-specific context\n- Use brief() to see current tasks and activity\n- Your notes are your own — other agents don't see them by default",
+      text: "WORKSPACE CONTEXT:\n- This is a freshly onboarded agent\n- Use recall() to find workspace-specific context\n- Use brief() to see current tasks and activity\n- Notes are shared within the workspace by default — other agents in this workspace can read them\n- Use visibility='private' on note_create when you need a per-agent scratchpad that siblings should not see",
       tags: ["bootstrap", "context"],
     },
   ],
