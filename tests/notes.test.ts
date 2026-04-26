@@ -60,7 +60,7 @@ describe("createNote", () => {
       createNote({
         workspace_id: WORKSPACE_ID,
         agent_id: AGENT_ID,
-        text: "leaked q_ABCDEFGHIJKLMNOPQRSTUVWX",
+        text: "leaked q_EXAMPLE_PLACEHOLDER_KEY",
       }),
     ).toThrow(QoopiaError);
   });

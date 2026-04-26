@@ -112,7 +112,7 @@ const secretTests: Array<{ label: string; jsonl: string; shouldSkip: boolean }> 
     shouldSkip: true,
     jsonl: JSON.stringify({
       type: "assistant", uuid: "test-secret-1", sessionId: "test", cwd: "/test",
-      message: { role: "assistant", content: [{ type: "text", text: "my key is q_FAKEKEYaaaaaaaaaaaaaaaaaaaaaaaa" }] },
+      message: { role: "assistant", content: [{ type: "text", text: "my key is q_EXAMPLE_PLACEHOLDER_DO_NOT_USE" }] },
     }),
   },
   {
@@ -120,7 +120,7 @@ const secretTests: Array<{ label: string; jsonl: string; shouldSkip: boolean }> 
     shouldSkip: true,
     jsonl: JSON.stringify({
       type: "assistant", uuid: "test-secret-2", sessionId: "test", cwd: "/test",
-      message: { role: "assistant", content: [{ type: "text", text: "use sk-ant-fake123456789012345678901234567890 to authenticate" }] },
+      message: { role: "assistant", content: [{ type: "text", text: "use sk-ant-EXAMPLE_PLACEHOLDER_DO_NOT_USE_____ to authenticate" }] },
     }),
   },
   {
@@ -128,7 +128,7 @@ const secretTests: Array<{ label: string; jsonl: string; shouldSkip: boolean }> 
     shouldSkip: true,
     jsonl: JSON.stringify({
       type: "assistant", uuid: "test-secret-3", sessionId: "test", cwd: "/test",
-      message: { role: "assistant", content: [{ type: "text", text: "Authorization: bearer Abcdef1234567890abcdef1234567890" }] },
+      message: { role: "assistant", content: [{ type: "text", text: "Authorization: bearer EXAMPLE_PLACEHOLDER_DO_NOT_USE_____" }] },
     }),
   },
   {
