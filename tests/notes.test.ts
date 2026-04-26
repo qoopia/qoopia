@@ -43,7 +43,7 @@ describe("createNote", () => {
     expect(result.id).toMatch(/^[0-9A-Z]{26}$/); // ULID format
     expect(result.type).toBe("note");
 
-    const fetched = getNote(WORKSPACE_ID, result.id);
+    const fetched = getNote(WORKSPACE_ID, result.id, AGENT_ID, false);
     expect(fetched.text).toBe("first note");
     expect(fetched.workspace_id).toBe(WORKSPACE_ID);
     expect(fetched.deleted_at).toBeNull();
@@ -84,7 +84,7 @@ describe("createNote", () => {
       type: "memory",
       tags: ["chore"],
     });
-    const fetched = getNote(WORKSPACE_ID, r.id);
+    const fetched = getNote(WORKSPACE_ID, r.id, AGENT_ID, false);
     expect(fetched.type).toBe("memory");
     expect(fetched.tags).toEqual(["chore"]);
   });
@@ -103,6 +103,8 @@ describe("listNotes", () => {
 
     const result = listNotes({
       workspace_id: WORKSPACE_ID,
+      caller_agent_id: AGENT_ID,
+      is_admin: false,
       type: "task",
       limit: 2,
     });
@@ -128,7 +130,7 @@ describe("updateNote", () => {
       id: r.id,
       metadata: { b: 99, c: 3 },
     });
-    const merged = getNote(WORKSPACE_ID, r.id);
+    const merged = getNote(WORKSPACE_ID, r.id, AGENT_ID, false);
     expect(merged.metadata).toEqual({ a: 1, b: 99, c: 3 });
 
     updateNote({
@@ -137,7 +139,7 @@ describe("updateNote", () => {
       id: r.id,
       metadata_replace: { only: "this" },
     });
-    const replaced = getNote(WORKSPACE_ID, r.id);
+    const replaced = getNote(WORKSPACE_ID, r.id, AGENT_ID, false);
     expect(replaced.metadata).toEqual({ only: "this" });
   });
 
@@ -168,7 +170,7 @@ describe("deleteNote", () => {
     });
     const result = deleteNote(WORKSPACE_ID, AGENT_ID, r.id);
     expect(result.deleted).toBe(true);
-    expect(() => getNote(WORKSPACE_ID, r.id)).toThrow(/not found/);
+    expect(() => getNote(WORKSPACE_ID, r.id, AGENT_ID, false)).toThrow(/not found/);
   });
 
   test("listNotes hides soft-deleted notes by default", () => {
@@ -179,7 +181,12 @@ describe("deleteNote", () => {
       type: "decision",
     });
     deleteNote(WORKSPACE_ID, AGENT_ID, r.id);
-    const visible = listNotes({ workspace_id: WORKSPACE_ID, type: "decision" });
+    const visible = listNotes({
+      workspace_id: WORKSPACE_ID,
+      caller_agent_id: AGENT_ID,
+      is_admin: false,
+      type: "decision",
+    });
     expect(visible.items.find((n) => n.id === r.id)).toBeUndefined();
   });
 });

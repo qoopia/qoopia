@@ -3,6 +3,12 @@ import { safeJsonParse, nowIso, QoopiaError } from "../utils/errors.ts";
 
 export interface BriefParams {
   workspace_id: string;
+  /** QRERUN-003 / ADR-014: agent_id of the caller — needed to surface
+   *  their own private notes alongside workspace-visibility ones. */
+  caller_agent_id: string;
+  /** QRERUN-003 / ADR-014: true for steward/claude-privileged; bypasses
+   *  the private-note filter. */
+  is_admin: boolean;
   project?: string;
   agent?: string;
   limit_per_section?: number;
@@ -56,6 +62,10 @@ export function brief(p: BriefParams) {
 
   const extra: string[] = [];
   const extraParams: any[] = [];
+  // QRERUN-003 / ADR-014: hide private notes from non-owners (admins exempt).
+  // Always present so every note query in this function inherits the filter.
+  extra.push(`(visibility = 'workspace' OR agent_id = ? OR ? = 1)`);
+  extraParams.push(p.caller_agent_id, p.is_admin ? 1 : 0);
   if (projectId) {
     extra.push(`project_id = ?`);
     extraParams.push(projectId);

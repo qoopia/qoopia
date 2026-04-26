@@ -36,6 +36,13 @@ import {
 } from "../services/notes.ts";
 import { logActivity, listActivity } from "../services/activity.ts";
 
+// QRERUN-003 / ADR-014: same admin set as src/mcp/tools.ts. Kept local to
+// avoid a circular import; both modules trust the same enum.
+const ADMIN_TYPES = new Set(["steward", "claude-privileged"]);
+function isAdmin(auth: AuthContext): boolean {
+  return ADMIN_TYPES.has(auth.type);
+}
+
 // V2 plural entity → V3 singular type
 const ENTITY_TO_TYPE: Record<string, string> = {
   tasks: "task",
@@ -246,7 +253,7 @@ function v2Update(args: Record<string, unknown>, auth: AuthContext) {
   if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
 
   // Entity type check: verify the note's type matches what caller expects
-  const existingForCheck = getNote(auth.workspace_id, id);
+  const existingForCheck = getNote(auth.workspace_id, id, auth.agent_id, isAdmin(auth));
   const expectedType = ENTITY_TO_TYPE[entity] || entity;
   if (existingForCheck.type !== expectedType) {
     throw new QoopiaError(
@@ -266,7 +273,7 @@ function v2Update(args: Record<string, unknown>, auth: AuthContext) {
       // If title or description supplied, recompose text. To do this we need
       // existing description if title alone given (and vice versa). Read note.
       if (args.title !== undefined || args.description !== undefined) {
-        const existing = getNote(auth.workspace_id, id);
+        const existing = getNote(auth.workspace_id, id, auth.agent_id, isAdmin(auth));
         const oldText = existing.text || "";
         const split = oldText.split("\n\n");
         const oldTitle = split[0] || "";
@@ -370,6 +377,8 @@ function v2List(args: Record<string, unknown>, auth: AuthContext) {
   }
   return listNotes({
     workspace_id: auth.workspace_id,
+    caller_agent_id: auth.agent_id,
+    is_admin: isAdmin(auth),
     type,
     project_id: args.project_id as string | undefined,
     status: args.status as string | undefined,
@@ -380,7 +389,7 @@ function v2List(args: Record<string, unknown>, auth: AuthContext) {
 function v2Get(args: Record<string, unknown>, auth: AuthContext) {
   const id = String(args.id || "");
   if (!id) throw new QoopiaError("INVALID_INPUT", "id required");
-  const note = getNote(auth.workspace_id, id);
+  const note = getNote(auth.workspace_id, id, auth.agent_id, isAdmin(auth));
   // M11 fix: verify the fetched note type matches the requested entity discriminator
   const entity = String(args.entity || "");
   if (entity) {
@@ -402,7 +411,7 @@ function v2Delete(args: Record<string, unknown>, auth: AuthContext) {
   // Entity type check: verify the note's type matches what caller expects
   const entity = String(args.entity || "");
   if (entity) {
-    const note = getNote(auth.workspace_id, id);
+    const note = getNote(auth.workspace_id, id, auth.agent_id, isAdmin(auth));
     const expectedType = ENTITY_TO_TYPE[entity] || entity;
     if (note.type !== expectedType) {
       throw new QoopiaError(

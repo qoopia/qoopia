@@ -39,6 +39,13 @@ export function sanitizeFtsQuery(query: string): string {
 
 export interface RecallParams {
   workspace_id: string;
+  /** QRERUN-003 / ADR-014: agent_id of the caller — needed to surface
+   *  their own private notes alongside workspace-visibility ones. */
+  caller_agent_id: string;
+  /** QRERUN-003 / ADR-014: true for steward/claude-privileged; bypasses
+   *  the private-note filter. Distinct from `privileged` below, which
+   *  controls cross-workspace search. */
+  is_admin: boolean;
   query: string;
   limit?: number;
   scope?: "notes" | "activity" | "all";
@@ -74,6 +81,10 @@ export function recall(p: RecallParams) {
       where.push(`n.workspace_id = ?`);
       params.push(p.workspace_id);
     }
+    // QRERUN-003 / ADR-014: filter out private notes that don't belong
+    // to the caller (admins exempt).
+    where.push(`(n.visibility = 'workspace' OR n.agent_id = ? OR ? = 1)`);
+    params.push(p.caller_agent_id, p.is_admin ? 1 : 0);
     if (p.type) {
       where.push(`n.type = ?`);
       params.push(p.type);
