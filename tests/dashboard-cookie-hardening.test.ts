@@ -537,3 +537,83 @@ describe("QDASHCOOKIE-004: Secure flag respects TRUST_PROXY/TRUSTED_PROXIES", ()
     }
   });
 });
+
+// --- QDASHCOOKIE-005: /login binds cookie sv to api_key_hash snapshot ----
+//
+// Codex flagged: the original handler authenticated the Bearer first, then
+// did a separate SELECT session_version before signing. A rotation that
+// commits between those two operations would mint a cookie carrying the
+// new sv from a pre-rotation auth. The fix reads api_key_hash AND
+// session_version in one SELECT and constant-time-compares the row's hash
+// to sha256(presented bearer); if rotation completed mid-flight the hash
+// compare fails and no cookie is issued.
+//
+// We can't deterministically inject a commit between two synchronous
+// bun:sqlite calls in the same process, but we CAN pin the OUTPUT
+// invariants the fix guarantees:
+//
+//   (1) the cookie minted at login carries `sv` equal to the row's
+//       current session_version (i.e. the snapshot read is fresh, not
+//       stale from a cached pre-rotation read), and
+//   (2) login with a stale Bearer (the api_key has since been rotated)
+//       returns 401 and DOES NOT issue Set-Cookie.
+
+describe("QDASHCOOKIE-005: /login binds cookie sv to api_key_hash snapshot", () => {
+  function payloadOf(cookieValue: string): { agent_id: string; sv: number; exp: number } {
+    const dot = cookieValue.indexOf(".");
+    expect(dot).toBeGreaterThan(0);
+    const payloadB64 = cookieValue.slice(0, dot);
+    const json = b64uDecode(payloadB64).toString("utf8");
+    return JSON.parse(json);
+  }
+
+  test("cookie carries the current session_version at login (fresh snapshot)", async () => {
+    // Bump session_version once via rotation — STEWARD_KEY now points to the
+    // new key, so a successful login should see the bumped sv in the cookie.
+    const newKey = rotateAgentKey(STEWARD_NAME, WORKSPACE_SLUG);
+    STEWARD_KEY = newKey;
+    const liveSv = (db
+      .prepare(`SELECT session_version FROM agents WHERE id = ?`)
+      .get(STEWARD_ID) as { session_version: number }).session_version;
+
+    const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${STEWARD_KEY}` },
+    });
+    expect(r.status).toBe(200);
+    const sc = getSetCookie(r, "qoopia_dash")!;
+    const cookieValue = decodeURIComponent(
+      sc.split(";")[0]!.split("=").slice(1).join("="),
+    );
+    const p = payloadOf(cookieValue);
+    expect(p.agent_id).toBe(STEWARD_ID);
+    expect(p.sv).toBe(liveSv);
+  });
+
+  test("login with a stale Bearer (rotated away) → 401, no Set-Cookie", async () => {
+    // Capture the current Bearer, then rotate so that key becomes stale.
+    const staleKey = STEWARD_KEY;
+    const newKey = rotateAgentKey(STEWARD_NAME, WORKSPACE_SLUG);
+    STEWARD_KEY = newKey;
+
+    const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${staleKey}` },
+    });
+    expect(r.status).toBe(401);
+    expect(getSetCookie(r, "qoopia_dash")).toBeNull();
+  });
+
+  test("non-Bearer header shape is rejected without DB access", async () => {
+    // The /login handler strips `Bearer ` case-insensitively before hashing
+    // for the post-authenticate recheck. authenticate() rejects unknown
+    // schemes upstream, so we should never get to the snapshot SELECT;
+    // pin that invariant: 401, no Set-Cookie.
+    const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+      method: "POST",
+      headers: { authorization: `Basic ${STEWARD_KEY}` },
+    });
+    expect(r.status).toBe(401);
+    expect(getSetCookie(r, "qoopia_dash")).toBeNull();
+  });
+});

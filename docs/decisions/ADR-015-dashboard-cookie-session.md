@@ -20,7 +20,12 @@ Browser        →  POST /api/dashboard/login
                   Authorization: Bearer <agent_api_key>
 Server         →  validates Bearer (steward / standard / claude-privileged)
                →  REQUIRES auth.source === "api-key" (OAuth tokens 401)
-               →  signs payload {agent_id, exp = now+24h} with HMAC-SHA256
+               →  re-reads {api_key_hash, session_version} for the same
+                  agent row and constant-time-compares row.api_key_hash
+                  to sha256(presented bearer); a rotation that committed
+                  between authenticate() and this read fails the compare
+                  → 401 (QDASHCOOKIE-005)
+               →  signs payload {agent_id, sv, exp = now+24h} with HMAC-SHA256
                →  Set-Cookie: qoopia_dash=<payloadB64>.<tagB64>;
                   Path=/api/dashboard; HttpOnly; SameSite=Strict;
                   Max-Age=86400; Secure (over HTTPS)

@@ -54,6 +54,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createHmac, randomBytes, timingSafeEqual as cryptoTimingSafeEqual } from "node:crypto";
 import { db } from "./db/connection.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
+import { sha256Hex } from "./auth/api-keys.ts";
 import { env } from "./utils/env.ts";
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -476,21 +477,53 @@ function loginHandler(req: IncomingMessage, res: ServerResponse) {
     type: auth.type,
     isAdmin: ADMIN_TYPES.has(auth.type),
   };
-  // Snapshot session_version at login so the cookie auth path can later
-  // detect rotateAgentKey()/deleteAgent() and fail closed.
-  const svRow = db
-    .prepare(`SELECT session_version FROM agents WHERE id = ?`)
-    .get(dashAuth.agent_id) as { session_version: number } | undefined;
-  if (!svRow) {
+  // QDASHCOOKIE-005: read api_key_hash AND session_version in one SELECT,
+  // then constant-time-compare the row's hash to sha256(presented bearer).
+  // This binds the cookie's `sv` snapshot to the *exact* api_key_hash the
+  // client just proved possession of. If rotateAgentKey() commits between
+  // authenticate() above and this read, the row will carry the new hash and
+  // the new sv together — the hash compare fails and we 401, instead of
+  // signing a cookie with the post-rotation sv from a pre-rotation auth.
+  const bearer = header.trim().replace(/^Bearer\s+/i, "").trim();
+  const presentedHashHex = sha256Hex(bearer);
+  const presentedHashBuf = Buffer.from(presentedHashHex, "hex");
+  const snapshotRow = db
+    .prepare(
+      `SELECT api_key_hash, session_version
+         FROM agents
+        WHERE id = ? AND active = 1`,
+    )
+    .get(dashAuth.agent_id) as
+    | { api_key_hash: string; session_version: number }
+    | undefined;
+  if (!snapshotRow) {
     json(res, 401, {
       error: "unauthorized",
       error_description: "Agent record disappeared between auth and login.",
     });
     return;
   }
+  const rowHashBuf = Buffer.from(snapshotRow.api_key_hash, "hex");
+  if (
+    presentedHashBuf.length !== 32 ||
+    rowHashBuf.length !== 32 ||
+    !buffersEqualConstantTime(presentedHashBuf, rowHashBuf)
+  ) {
+    // The api_key was rotated mid-flight (row.api_key_hash changed between
+    // authenticate() and this re-check). Refuse to mint the cookie — the
+    // client must re-login with the new key. The bumped session_version
+    // would also kill any cookie we did mint, but we'd rather not mint
+    // one at all than rely on the second-line defense.
+    json(res, 401, {
+      error: "unauthorized",
+      error_description:
+        "Bearer token rejected (unknown, inactive, or wrong agent type).",
+    });
+    return;
+  }
   const cookie = buildSessionCookie(
     req,
-    signSession(dashAuth.agent_id, svRow.session_version),
+    signSession(dashAuth.agent_id, snapshotRow.session_version),
   );
   res.writeHead(200, {
     "content-type": "application/json",
