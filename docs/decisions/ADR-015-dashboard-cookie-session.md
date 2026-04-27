@@ -20,7 +20,12 @@ Browser        →  POST /api/dashboard/login
                   Authorization: Bearer <agent_api_key>
 Server         →  validates Bearer (steward / standard / claude-privileged)
                →  REQUIRES auth.source === "api-key" (OAuth tokens 401)
-               →  signs payload {agent_id, exp = now+24h} with HMAC-SHA256
+               →  re-reads {api_key_hash, session_version} for the same
+                  agent row and constant-time-compares row.api_key_hash
+                  to sha256(presented bearer); a rotation that committed
+                  between authenticate() and this read fails the compare
+                  → 401 (QDASHCOOKIE-005)
+               →  signs payload {agent_id, sv, exp = now+24h} with HMAC-SHA256
                →  Set-Cookie: qoopia_dash=<payloadB64>.<tagB64>;
                   Path=/api/dashboard; HttpOnly; SameSite=Strict;
                   Max-Age=86400; Secure (over HTTPS)
@@ -69,8 +74,10 @@ cookie path we're trying to avoid.
 
 ### Cookie value is NOT the Bearer
 
-The cookie carries `base64url(JSON({agent_id, exp})) "." base64url(HMAC)`,
-not the api_key. Three consequences:
+The cookie carries
+`base64url(JSON({agent_id, sv, exp})) "." base64url(HMAC)`, not the
+api_key. (`sv` is the agent's `session_version` at login — see post-#34
+revocation below.) Three consequences:
 
 1. Leaking the cookie does not leak the api_key. An exfiltrated cookie is
    a single 24-hour bearer, not a permanent credential.
@@ -79,21 +86,24 @@ not the api_key. Three consequences:
 3. The cookie payload is opaque to the dashboard JS (HttpOnly), so an
    XSS cannot read it.
 
-**Cookie revocation in this PR is limited to:**
+**Cookie revocation surface (post-#34):**
 
-- Agent deactivation (per-request `active=1` check on the cookie path).
+- Agent deactivation (per-request `active=1` check on the cookie path,
+  plus a `session_version` bump for defense in depth).
+- **api_key rotation** — `rotateAgentKey()` increments
+  `agents.session_version`, and the cookie payload carries the
+  `session_version` snapshot from login as `sv`. Cookie auth requires
+  `payload.sv === agents.session_version`, so a stolen cookie dies on
+  the next request after rotation.
 - Rotation of `QOOPIA_SESSION_SECRET` (or process restart on the
-  ephemeral fallback key) — invalidates every outstanding cookie at once.
+  ephemeral fallback key) — invalidates every outstanding cookie at once,
+  workspace-wide.
 - Cookie expiry (24h Max-Age + payload `exp`).
 - Logout — clears the *browser's* cookie copy only; the signed value
-  remains valid elsewhere until one of the conditions above fires.
-
-**Rotating the agent's `api_key` does NOT, on its own, revoke outstanding
-cookies.** The cookie payload binds to `agent_id`, not to api_key
-material, and `rotateAgentKey()` only updates `api_key_hash`. Operators
-who need instant session kill on key rotation should also deactivate +
-reactivate the agent or rotate the session secret, until the post-merge
-hardening below lands.
+  remains valid elsewhere until one of the conditions above fires. We
+  could add a server-side revocation list later, but that adds DB write
+  load on every logout and does not close any meaningful threat that
+  rotation/expiry doesn't already close.
 
 ### Signing key
 
@@ -104,6 +114,43 @@ hardening below lands.
    domain-separated via `HMAC(admin_secret, "qoopia-dashboard-session-v1")`.
 3. Ephemeral random (32 bytes) — generated once per process. Acceptable
    for dev / single-user deployments; cookies invalidate on restart.
+
+### Proxy / Secure-cookie semantics (QDASHCOOKIE-004)
+
+The `Secure` attribute on `qoopia_dash` is set only when the request
+reached us over HTTPS. `isHttps(req)` decides this:
+
+- If the underlying socket is TLS-encrypted (`socket.encrypted === true`),
+  return true.
+- Otherwise honor `x-forwarded-proto: https` ONLY when both
+  `TRUST_PROXY=true` AND the upstream peer (`req.socket.remoteAddress`)
+  is in `TRUSTED_PROXIES`. An attacker reaching the listener directly
+  cannot spoof the header into Secure.
+- Otherwise return false (no Secure flag).
+
+**Production deployment requirements** (cloudflared / nginx in front of
+the loopback listener):
+
+- `TRUST_PROXY=true` in the LaunchAgent plist environment.
+- `TRUSTED_PROXIES` contains the actual upstream peer address. Default
+  is `127.0.0.1,::1,::ffff:127.0.0.1`, which is correct for the standard
+  cloudflared-on-the-same-host topology.
+- The proxy must set `x-forwarded-proto: https` for HTTPS-terminated
+  requests. cloudflared does this by default.
+
+If any of those is missing, the dashboard cookie ships **without**
+`Secure` even when the public hostname is HTTPS. This is fail-closed (no
+secret leakage) but breaks the principle of defense-in-depth, so a
+deploy-time check should confirm all three are set.
+
+### HMAC tag comparison (QDASHCOOKIE-003)
+
+Tags are compared via `crypto.timingSafeEqual` over fixed-length raw
+HMAC-SHA256 buffers (32 bytes). Tags whose decoded length is not exactly
+32 bytes are rejected before the compare runs; the compare itself never
+sees a length mismatch and never throws. The previous hand-rolled string
+compare worked but was avoidably non-standard; the platform primitive
+is the authoritative implementation.
 
 ### Why HMAC + DB lookup, not JWT-only
 
@@ -129,26 +176,16 @@ reaches the lookup).
   rejected, deactivation kills outstanding cookies, tampered cookies
   return 401, and OAuth access tokens cannot mint a dashboard cookie.
 
-## Post-merge hardening
+## Post-merge hardening (status)
 
-These do not block this PR but should follow:
-
-1. **Instant revocation on api_key rotation** — bind the cookie to
-   either `agents.session_version` (incremented by `rotateAgentKey()` and
-   `deactivateAgent()`) or to `api_key_rotated_at`, and check it during
-   cookie verification. Today rotation requires admin to also flip
-   `active` to kill outstanding cookies.
-2. **OAuth-driven dashboard sessions (separate ADR)** — if/when wanted,
-   bind the cookie's TTL and revocation to the underlying OAuth token
-   row so revoking the OAuth grant kills the cookie.
-3. **`crypto.timingSafeEqual` over fixed-length buffers** instead of the
-   hand-rolled string compare (QDASHCOOKIE-003).
-4. **Stronger Secure-cookie hygiene** — also set `Secure` when
-   `QOOPIA_PUBLIC_URL` is `https://...`, with explicit dev opt-out, so
-   misconfigured `TRUST_PROXY` does not silently downgrade
-   (QDASHCOOKIE-004).
-5. **Explicit tests** for expired cookies, payload-JSON tampering, and
-   `Referer`-only Origin handling.
+| Item | Status |
+|------|--------|
+| QDASHCOOKIE-003: `crypto.timingSafeEqual` on fixed-length buffers | **Done** (post-merge PR) |
+| QDASHCOOKIE-004: TRUST_PROXY/Secure semantics + tests | **Done** (post-merge PR) |
+| #34: instant revocation on api_key rotation (`session_version`) | **Done** (post-merge PR) |
+| #35: expired/malformed/Referer-only/replay-after-logout tests | **Done** (post-merge PR) |
+| OAuth-driven dashboard sessions (separate ADR) | Not started — explicit non-goal |
+| Server-side revocation list / logout-all | Not planned — rotation+expiry covers the threat |
 
 ## Alternatives rejected
 

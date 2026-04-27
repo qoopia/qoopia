@@ -18,6 +18,15 @@ process.env.QOOPIA_BACKUP_DIR = path.join(tmpRoot, "backups");
 process.env.QOOPIA_PORT = process.env.QOOPIA_PORT ?? "0";
 process.env.QOOPIA_LOG_LEVEL = process.env.QOOPIA_LOG_LEVEL ?? "error";
 process.env.QOOPIA_ADMIN_SECRET = process.env.QOOPIA_ADMIN_SECRET ?? "test-admin-secret";
+// Pin a known dashboard session secret in the preload so all test files
+// see the same value regardless of which one bun loads first. Otherwise
+// `_sessionKey` (cached lazily on first request inside dashboard-api) can
+// be resolved against a fallback before a later test file assigns its own
+// QOOPIA_SESSION_SECRET — making cookies signed in that file fail server
+// verification (CI vs local file ordering differs).
+process.env.QOOPIA_SESSION_SECRET =
+  process.env.QOOPIA_SESSION_SECRET ??
+  "qdash-test-session-secret-do-not-ship-2026-04-27";
 
 process.on("exit", () => {
   try {

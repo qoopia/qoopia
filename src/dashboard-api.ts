@@ -29,28 +29,32 @@
  *   is also supplied (curl, scripts) it still wins. POST /logout clears
  *   the cookie.
  *
- *   The cookie value is a server-signed `{agent_id, exp}` payload —
+ *   The cookie value is a server-signed `{agent_id, sv, exp}` payload —
  *   `base64url(JSON) "." base64url(HMAC-SHA256)` — NOT the raw Bearer.
+ *   `sv` is the agent's `session_version` snapshot at login.
  *   Cookie minting is restricted to static `api_key` Bearers (see
  *   loginHandler / QDASHCOOKIE-001 fix). OAuth access tokens are NOT
  *   accepted at /api/dashboard/login: an OAuth token's lifetime and
  *   revocation are managed in `oauth_tokens`, and minting a 24h dashboard
  *   cookie from a 1h OAuth token would silently extend its blast radius.
  *
- *   Cookie revocation in this PR is limited to:
- *     • agent deactivation (per-request `active=1` DB check),
+ *   Cookie revocation surface (post-#34):
+ *     • agent deactivation (per-request `active=1` DB check + sv bump),
+ *     • api_key rotation (`rotateAgentKey()` increments
+ *       `agents.session_version`; outstanding cookies fail the sv check),
  *     • rotation of `QOOPIA_SESSION_SECRET` (or process restart on the
- *       ephemeral fallback key),
+ *       ephemeral fallback key) — invalidates every outstanding cookie,
  *     • cookie expiry (24h Max-Age + payload `exp`).
- *   Rotating the agent's `api_key` does NOT, on its own, revoke
- *   outstanding cookies — the cookie payload does not bind to api_key
- *   material. Instant revocation on key rotation is tracked as post-merge
- *   hardening (see ADR-015 §Consequences).
+ *
+ *   Tag comparison uses `crypto.timingSafeEqual` over fixed-length raw
+ *   HMAC buffers (32 bytes); tags that don't decode to exactly 32 bytes
+ *   are rejected before the compare runs (QDASHCOOKIE-003).
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { createHmac, randomBytes } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual as cryptoTimingSafeEqual } from "node:crypto";
 import { db } from "./db/connection.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
+import { sha256Hex } from "./auth/api-keys.ts";
 import { env } from "./utils/env.ts";
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -100,14 +104,23 @@ export const DASHBOARD_COOKIE = "qoopia_dash";
 /** 24-hour cookie lifetime. */
 const SESSION_TTL_SEC = 86400;
 
-/** Constant-time string compare for the HMAC tag. */
-function timingSafeEqual(a: string, b: string): boolean {
+/**
+ * Length of the HMAC-SHA256 tag in bytes. Pinned so a malformed cookie
+ * (truncated/extended tag) is rejected before reaching `timingSafeEqual`,
+ * which throws on length mismatch.
+ */
+const HMAC_TAG_BYTES = 32;
+
+/**
+ * Constant-time buffer compare wrapper. Returns false for any size
+ * mismatch (instead of throwing, which `crypto.timingSafeEqual` does)
+ * and otherwise delegates to the platform implementation. Length check
+ * is intentionally branch-on-length-only so we don't leak content via
+ * differential timing once we're past it.
+ */
+function buffersEqualConstantTime(a: Buffer, b: Buffer): boolean {
   if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
+  return cryptoTimingSafeEqual(a, b);
 }
 
 /**
@@ -157,19 +170,31 @@ function b64uDecode(s: string): Buffer {
 }
 
 interface SessionPayload {
+  /** Agent the cookie was minted for. */
   agent_id: string;
-  exp: number; // unix seconds
+  /** session_version snapshot at login. Bumped by rotateAgentKey() and
+   *  deleteAgent(). Mismatch with the live row → 401 (QDASHCOOKIE-002). */
+  sv: number;
+  /** Expiry (unix seconds). Validated against system clock. */
+  exp: number;
 }
 
 /**
- * Build a signed session cookie value for `agent_id`. Format:
- *   base64url(JSON({agent_id, exp})) "." base64url(HMAC-SHA256(payload))
+ * Build a signed session cookie value. Format:
+ *   base64url(JSON({agent_id, sv, exp})) "." base64url(HMAC-SHA256(payload))
  *
+ * The HMAC is computed over the base64url-encoded payload (not the raw
+ * JSON), so a verifier never has to re-canonicalise JSON before comparing.
  * No raw Bearer token is ever stored in or derivable from this value.
  */
-function signSession(agent_id: string, ttlSec = SESSION_TTL_SEC): string {
+function signSession(
+  agent_id: string,
+  session_version: number,
+  ttlSec = SESSION_TTL_SEC,
+): string {
   const payload: SessionPayload = {
     agent_id,
+    sv: session_version,
     exp: Math.floor(Date.now() / 1000) + ttlSec,
   };
   const payloadB64 = b64uEncode(JSON.stringify(payload));
@@ -179,32 +204,59 @@ function signSession(agent_id: string, ttlSec = SESSION_TTL_SEC): string {
 }
 
 /**
- * Verify a signed session cookie. Returns the agent_id on success, null on
- * any failure (malformed, bad HMAC, expired). Does NOT consult the DB — the
- * caller still resolves the agent record so a deactivated/deleted agent
- * cannot ride a stale-but-still-signed cookie.
+ * Verify a signed session cookie. Returns the parsed payload on success,
+ * null on any failure (malformed, bad HMAC, expired, bad shape). Does NOT
+ * consult the DB — the caller still resolves the agent row so a
+ * deactivated/deleted/rotated agent cannot ride a stale-but-signed cookie.
+ *
+ * QDASHCOOKIE-003: tag comparison goes through `crypto.timingSafeEqual`
+ * over fixed-length raw HMAC buffers, not a hand-rolled string compare.
+ * Tags that don't decode to exactly 32 bytes are rejected before the
+ * compare runs.
  */
-function verifySession(value: string): string | null {
+function verifySession(value: string): { agent_id: string; sv: number } | null {
   if (!value) return null;
   const dot = value.indexOf(".");
   if (dot <= 0 || dot === value.length - 1) return null;
   const payloadB64 = value.slice(0, dot);
   const tagB64 = value.slice(dot + 1);
-  const expectedTag = b64uEncode(
-    createHmac("sha256", sessionKey()).update(payloadB64).digest(),
-  );
-  if (!timingSafeEqual(tagB64, expectedTag)) return null;
+
+  // Decode the supplied tag; reject anything that is not exactly 32 bytes.
+  let actualTag: Buffer;
+  try {
+    actualTag = b64uDecode(tagB64);
+  } catch {
+    return null;
+  }
+  if (actualTag.length !== HMAC_TAG_BYTES) return null;
+
+  // Recompute the expected tag and compare in constant time.
+  const expectedTag = createHmac("sha256", sessionKey())
+    .update(payloadB64)
+    .digest();
+  if (!buffersEqualConstantTime(expectedTag, actualTag)) return null;
+
+  // Signature is valid — now decode and shape-check the payload.
   let payload: SessionPayload;
   try {
     payload = JSON.parse(b64uDecode(payloadB64).toString("utf8"));
   } catch {
     return null;
   }
-  if (typeof payload.agent_id !== "string" || typeof payload.exp !== "number") {
+  if (
+    !payload ||
+    typeof payload.agent_id !== "string" ||
+    typeof payload.sv !== "number" ||
+    typeof payload.exp !== "number" ||
+    !Number.isFinite(payload.exp) ||
+    !Number.isFinite(payload.sv) ||
+    !Number.isInteger(payload.sv) ||
+    payload.sv < 0
+  ) {
     return null;
   }
   if (payload.exp <= Math.floor(Date.now() / 1000)) return null;
-  return payload.agent_id;
+  return { agent_id: payload.agent_id, sv: payload.sv };
 }
 
 /**
@@ -258,22 +310,29 @@ function authFromSessionCookie(req: IncomingMessage): DashboardAuth | null {
   const cookies = parseCookies(req.headers["cookie"] as string | undefined);
   const value = cookies[DASHBOARD_COOKIE];
   if (!value) return null;
-  const agent_id = verifySession(value);
-  if (!agent_id) return null;
+  const verified = verifySession(value);
+  if (!verified) return null;
   const row = db
     .prepare(
-      `SELECT id, workspace_id, type, active FROM agents WHERE id = ?`,
+      `SELECT id, workspace_id, type, active, session_version
+         FROM agents
+        WHERE id = ?`,
     )
-    .get(agent_id) as
+    .get(verified.agent_id) as
     | {
         id: string;
         workspace_id: string;
         type: string;
         active: number;
+        session_version: number;
       }
     | undefined;
   if (!row || !row.active) return null;
   if (!ALLOWED_TYPES.has(row.type)) return null;
+  // QDASHCOOKIE-002: cookie's session_version snapshot must still match
+  // the live row. rotateAgentKey() and deleteAgent() bump this, so
+  // outstanding cookies fail closed on the next request.
+  if (row.session_version !== verified.sv) return null;
   return {
     workspace_id: row.workspace_id,
     agent_id: row.id,
@@ -418,7 +477,54 @@ function loginHandler(req: IncomingMessage, res: ServerResponse) {
     type: auth.type,
     isAdmin: ADMIN_TYPES.has(auth.type),
   };
-  const cookie = buildSessionCookie(req, signSession(dashAuth.agent_id));
+  // QDASHCOOKIE-005: read api_key_hash AND session_version in one SELECT,
+  // then constant-time-compare the row's hash to sha256(presented bearer).
+  // This binds the cookie's `sv` snapshot to the *exact* api_key_hash the
+  // client just proved possession of. If rotateAgentKey() commits between
+  // authenticate() above and this read, the row will carry the new hash and
+  // the new sv together — the hash compare fails and we 401, instead of
+  // signing a cookie with the post-rotation sv from a pre-rotation auth.
+  const bearer = header.trim().replace(/^Bearer\s+/i, "").trim();
+  const presentedHashHex = sha256Hex(bearer);
+  const presentedHashBuf = Buffer.from(presentedHashHex, "hex");
+  const snapshotRow = db
+    .prepare(
+      `SELECT api_key_hash, session_version
+         FROM agents
+        WHERE id = ? AND active = 1`,
+    )
+    .get(dashAuth.agent_id) as
+    | { api_key_hash: string; session_version: number }
+    | undefined;
+  if (!snapshotRow) {
+    json(res, 401, {
+      error: "unauthorized",
+      error_description: "Agent record disappeared between auth and login.",
+    });
+    return;
+  }
+  const rowHashBuf = Buffer.from(snapshotRow.api_key_hash, "hex");
+  if (
+    presentedHashBuf.length !== 32 ||
+    rowHashBuf.length !== 32 ||
+    !buffersEqualConstantTime(presentedHashBuf, rowHashBuf)
+  ) {
+    // The api_key was rotated mid-flight (row.api_key_hash changed between
+    // authenticate() and this re-check). Refuse to mint the cookie — the
+    // client must re-login with the new key. The bumped session_version
+    // would also kill any cookie we did mint, but we'd rather not mint
+    // one at all than rely on the second-line defense.
+    json(res, 401, {
+      error: "unauthorized",
+      error_description:
+        "Bearer token rejected (unknown, inactive, or wrong agent type).",
+    });
+    return;
+  }
+  const cookie = buildSessionCookie(
+    req,
+    signSession(dashAuth.agent_id, snapshotRow.session_version),
+  );
   res.writeHead(200, {
     "content-type": "application/json",
     "cache-control": "no-store",
