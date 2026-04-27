@@ -71,10 +71,15 @@ export function rotateAgentKey(name: string, workspaceSlug: string): string {
     .get(name, ws.id) as { id: string } | undefined;
   if (!a) throw new QoopiaError("NOT_FOUND", `agent ${name} not found`);
   const newKey = generateApiKey();
-  db.prepare(`UPDATE agents SET api_key_hash = ? WHERE id = ?`).run(
-    sha256Hex(newKey),
-    a.id,
-  );
+  // QDASHCOOKIE-002: bump session_version so any outstanding dashboard
+  // cookie minted under the previous api_key fails its sv check on the
+  // next request (see authFromSessionCookie). ADR-015 §Consequences.
+  db.prepare(
+    `UPDATE agents
+        SET api_key_hash    = ?,
+            session_version = session_version + 1
+      WHERE id = ?`,
+  ).run(sha256Hex(newKey), a.id);
   return newKey;
 }
 
@@ -107,7 +112,16 @@ export function deleteAgent(name: string, workspaceSlug: string) {
     .get(name, ws.id) as { id: string } | undefined;
   if (!agent) throw new QoopiaError("NOT_FOUND", `agent ${name} not found`);
 
-  db.prepare(`UPDATE agents SET active = 0 WHERE id = ?`).run(agent.id);
+  // QDASHCOOKIE-002: bump session_version on deactivation as well, so the
+  // sv check kills outstanding dashboard cookies even if the active=0 row
+  // is somehow reactivated later — defense-in-depth, not a real exploit
+  // surface today (cookie auth already rejects active=0 unconditionally).
+  db.prepare(
+    `UPDATE agents
+        SET active          = 0,
+            session_version = session_version + 1
+      WHERE id = ?`,
+  ).run(agent.id);
 
   // C2 fix: revoke all OAuth tokens on deactivation
   const revoked = revokeAllAgentTokens(agent.id);

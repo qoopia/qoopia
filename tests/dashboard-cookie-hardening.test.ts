@@ -1,0 +1,539 @@
+/**
+ * QDASHCOOKIE-003/004 + #34/#35 follow-up tests for the dashboard
+ * session cookie. Pins these invariants:
+ *
+ *  - signSession() embeds the agent's session_version as `sv`, and
+ *    rotateAgentKey() / deleteAgent() bump session_version so
+ *    outstanding cookies fail the next request (#34).
+ *  - verifySession() goes through crypto.timingSafeEqual over fixed-
+ *    length raw HMAC buffers; tags whose decoded length is not exactly
+ *    32 bytes are rejected before the compare (QDASHCOOKIE-003).
+ *  - Expired / malformed-JSON / invalid-shape payloads → 401 (#35).
+ *  - Origin guard accepts a request that carries only a Referer (no
+ *    Origin) and rejects it when the Referer does not match (#35).
+ *  - Logout cookie repeats the login cookie's attribute shape (HttpOnly,
+ *    SameSite=Strict, Path=/api/dashboard) with Max-Age=0 (#35).
+ *  - "Replay after logout": logout only clears the *browser's* copy of
+ *    the cookie. The signed cookie value is still valid until expiry,
+ *    rotation, or session-secret change. ADR-015 documents this; this
+ *    test pins the documented behavior so a future change becomes a
+ *    deliberate decision (#35).
+ *  - Secure flag is set only when the request is HTTPS (real TLS) or
+ *    came through a TRUSTED_PROXIES peer with x-forwarded-proto: https
+ *    (QDASHCOOKIE-004). Spoofed x-forwarded-proto from an untrusted
+ *    peer must NOT trigger Secure.
+ *
+ * The tests sign their own cookies using the same QOOPIA_SESSION_SECRET
+ * the server uses, set at the top of this file before module imports
+ * trigger sessionKey() resolution.
+ */
+
+// IMPORTANT: set the session secret BEFORE the dashboard module's
+// sessionKey() is ever called. The server imports dashboard-api lazily
+// via http.ts, but the cache is populated on first request — so as long
+// as this assignment runs before startHttpServer(), tests sign cookies
+// with the same key the server will verify against.
+process.env.QOOPIA_SESSION_SECRET =
+  "qdash-test-session-secret-do-not-ship-2026-04-27";
+
+import crypto from "node:crypto";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import type { AddressInfo } from "node:net";
+import type { Server } from "node:http";
+import { runMigrations } from "../src/db/migrate.ts";
+import { createWorkspace } from "../src/admin/workspaces.ts";
+import { createAgent, rotateAgentKey, deleteAgent } from "../src/admin/agents.ts";
+import { startHttpServer } from "../src/http.ts";
+import { db } from "../src/db/connection.ts";
+import { env } from "../src/utils/env.ts";
+
+let server: Server;
+let baseUrl = "";
+let host = "";
+
+let WORKSPACE_SLUG = "";
+let WORKSPACE_ID = "";
+let STEWARD_NAME = "";
+let STEWARD_KEY = "";
+let STEWARD_ID = "";
+
+beforeAll(async () => {
+  runMigrations();
+  const ws = createWorkspace({
+    name: "QDASH Hardening Test",
+    slug: "qdash-hardening-test",
+  });
+  WORKSPACE_SLUG = ws.slug;
+  WORKSPACE_ID = ws.id;
+
+  const steward = createAgent({
+    name: "qdash-hardening-steward",
+    workspaceSlug: ws.slug,
+    type: "steward",
+  });
+  STEWARD_NAME = steward.name;
+  STEWARD_KEY = steward.api_key;
+  STEWARD_ID = steward.id;
+
+  server = startHttpServer();
+  await new Promise<void>((resolve) => {
+    if (server.listening) return resolve();
+    server.once("listening", () => resolve());
+  });
+  const addr = server.address() as AddressInfo;
+  baseUrl = `http://127.0.0.1:${addr.port}`;
+  host = `127.0.0.1:${addr.port}`;
+});
+
+afterAll(async () => {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+// --- helpers ---------------------------------------------------------
+
+const SECRET = process.env.QOOPIA_SESSION_SECRET!;
+
+function b64uEncode(buf: Buffer | string): string {
+  const b = typeof buf === "string" ? Buffer.from(buf, "utf8") : buf;
+  return b
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function b64uDecode(s: string): Buffer {
+  const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+  return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/") + pad, "base64");
+}
+
+/** Sign an arbitrary payload using the same secret + algorithm the server
+ *  uses, so we can mint expired / malformed / out-of-shape cookies. */
+function signCookie(payload: object): string {
+  const payloadB64 = b64uEncode(JSON.stringify(payload));
+  const tag = crypto
+    .createHmac("sha256", Buffer.from(SECRET, "utf8"))
+    .update(payloadB64)
+    .digest();
+  return `${payloadB64}.${b64uEncode(tag)}`;
+}
+
+function getSetCookie(r: Response, name: string): string | null {
+  const all =
+    typeof (r.headers as { getSetCookie?: () => string[] }).getSetCookie ===
+    "function"
+      ? (r.headers as { getSetCookie: () => string[] }).getSetCookie()
+      : [r.headers.get("set-cookie") || ""];
+  for (const c of all) {
+    if (!c) continue;
+    if (c.split(";")[0]!.trim().startsWith(`${name}=`)) return c;
+  }
+  return null;
+}
+
+async function login(): Promise<{ cookieValue: string; setCookie: string }> {
+  const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${STEWARD_KEY}` },
+  });
+  expect(r.status).toBe(200);
+  const sc = getSetCookie(r, "qoopia_dash")!;
+  const value = decodeURIComponent(sc.split(";")[0]!.split("=").slice(1).join("="));
+  return { cookieValue: value, setCookie: sc };
+}
+
+// --- #34: session_version revocation ---------------------------------
+
+describe("QDASHCOOKIE-#34: api_key rotation invalidates outstanding cookies", () => {
+  test("baseline: cookie minted with current sv works", async () => {
+    const { cookieValue } = await login();
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(cookieValue)}` },
+    });
+    expect(r.status).toBe(200);
+  });
+
+  test("rotateAgentKey() bumps session_version and kills outstanding cookies", async () => {
+    const { cookieValue } = await login();
+
+    // sanity — works before rotation
+    const before = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(cookieValue)}` },
+    });
+    expect(before.status).toBe(200);
+
+    rotateAgentKey(STEWARD_NAME, WORKSPACE_SLUG);
+
+    const after = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(cookieValue)}` },
+    });
+    expect(after.status).toBe(401);
+  });
+
+  test("login with the new api_key issues a new working cookie", async () => {
+    // The previous test rotated the steward's key, so STEWARD_KEY is dead.
+    // Rotate again and grab the new key explicitly.
+    const newKey = rotateAgentKey(STEWARD_NAME, WORKSPACE_SLUG);
+    const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${newKey}` },
+    });
+    expect(r.status).toBe(200);
+    const sc = getSetCookie(r, "qoopia_dash");
+    expect(sc).not.toBeNull();
+    const cookieValue = decodeURIComponent(
+      sc!.split(";")[0]!.split("=").slice(1).join("="),
+    );
+
+    const verify = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(cookieValue)}` },
+    });
+    expect(verify.status).toBe(200);
+
+    // keep STEWARD_KEY for any later tests
+    STEWARD_KEY = newKey;
+  });
+
+  test("manually crafted cookie with stale sv is rejected", async () => {
+    // Read current session_version, then craft a cookie with sv = current - 1.
+    const row = db
+      .prepare(`SELECT session_version FROM agents WHERE id = ?`)
+      .get(STEWARD_ID) as { session_version: number };
+    const stale = signCookie({
+      agent_id: STEWARD_ID,
+      sv: row.session_version - 1,
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(stale)}` },
+    });
+    expect(r.status).toBe(401);
+  });
+
+  test("deleteAgent() bumps sv too (defense in depth)", async () => {
+    // Use a throwaway agent so we don't kill the steward.
+    const throwaway = createAgent({
+      name: "qdash-hardening-throwaway",
+      workspaceSlug: WORKSPACE_SLUG,
+      type: "claude-privileged",
+    });
+
+    // Mint a cookie at the throwaway's current sv.
+    const row1 = db
+      .prepare(`SELECT session_version FROM agents WHERE id = ?`)
+      .get(throwaway.id) as { session_version: number };
+    const fresh = signCookie({
+      agent_id: throwaway.id,
+      sv: row1.session_version,
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+
+    const before = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(fresh)}` },
+    });
+    expect(before.status).toBe(200);
+
+    deleteAgent(throwaway.name, WORKSPACE_SLUG);
+
+    const after = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(fresh)}` },
+    });
+    // active=0 alone would already kill it; this also pins that sv was bumped.
+    expect(after.status).toBe(401);
+    const row2 = db
+      .prepare(`SELECT session_version FROM agents WHERE id = ?`)
+      .get(throwaway.id) as { session_version: number };
+    expect(row2.session_version).toBe(row1.session_version + 1);
+  });
+});
+
+// --- QDASHCOOKIE-003: timingSafeEqual on fixed-length buffers --------
+
+describe("QDASHCOOKIE-003: tag compare uses crypto.timingSafeEqual on 32-byte buffers", () => {
+  test("truncated tag (31 bytes) → 401, no throw", async () => {
+    const payload = {
+      agent_id: STEWARD_ID,
+      sv: (db
+        .prepare(`SELECT session_version FROM agents WHERE id = ?`)
+        .get(STEWARD_ID) as { session_version: number }).session_version,
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    };
+    const payloadB64 = b64uEncode(JSON.stringify(payload));
+    // Real tag, then strip a byte off the raw HMAC so the decoded length is 31.
+    const fullTag = crypto
+      .createHmac("sha256", Buffer.from(SECRET, "utf8"))
+      .update(payloadB64)
+      .digest();
+    const truncated = b64uEncode(fullTag.subarray(0, 31));
+    const value = `${payloadB64}.${truncated}`;
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(value)}` },
+    });
+    expect(r.status).toBe(401);
+  });
+
+  test("oversize tag (40 bytes) → 401, no throw", async () => {
+    const payload = {
+      agent_id: STEWARD_ID,
+      sv: (db
+        .prepare(`SELECT session_version FROM agents WHERE id = ?`)
+        .get(STEWARD_ID) as { session_version: number }).session_version,
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    };
+    const payloadB64 = b64uEncode(JSON.stringify(payload));
+    const padded = b64uEncode(Buffer.alloc(40, 0xab));
+    const value = `${payloadB64}.${padded}`;
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(value)}` },
+    });
+    expect(r.status).toBe(401);
+  });
+
+  test("tampered (same length, wrong bytes) tag → 401", async () => {
+    const payload = {
+      agent_id: STEWARD_ID,
+      sv: (db
+        .prepare(`SELECT session_version FROM agents WHERE id = ?`)
+        .get(STEWARD_ID) as { session_version: number }).session_version,
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    };
+    const payloadB64 = b64uEncode(JSON.stringify(payload));
+    const tampered = b64uEncode(Buffer.alloc(32, 0xcd));
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(`${payloadB64}.${tampered}`)}` },
+    });
+    expect(r.status).toBe(401);
+  });
+});
+
+// --- #35: expired / malformed / invalid-shape payloads ---------------
+
+describe("QDASHCOOKIE-#35: expired / malformed / invalid payloads → 401", () => {
+  function currentSv(): number {
+    return (db
+      .prepare(`SELECT session_version FROM agents WHERE id = ?`)
+      .get(STEWARD_ID) as { session_version: number }).session_version;
+  }
+
+  test("expired cookie (exp in past) → 401", async () => {
+    const value = signCookie({
+      agent_id: STEWARD_ID,
+      sv: currentSv(),
+      exp: Math.floor(Date.now() / 1000) - 1,
+    });
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(value)}` },
+    });
+    expect(r.status).toBe(401);
+  });
+
+  test("malformed JSON in payload half → 401", async () => {
+    const broken = b64uEncode("not-json{");
+    const tag = crypto
+      .createHmac("sha256", Buffer.from(SECRET, "utf8"))
+      .update(broken)
+      .digest();
+    const value = `${broken}.${b64uEncode(tag)}`;
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(value)}` },
+    });
+    expect(r.status).toBe(401);
+  });
+
+  test("invalid exp shape (NaN) → 401", async () => {
+    const value = signCookie({
+      agent_id: STEWARD_ID,
+      sv: currentSv(),
+      exp: "tomorrow",
+    });
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(value)}` },
+    });
+    expect(r.status).toBe(401);
+  });
+
+  test("missing sv field → 401", async () => {
+    const value = signCookie({
+      agent_id: STEWARD_ID,
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(value)}` },
+    });
+    expect(r.status).toBe(401);
+  });
+
+  test("negative sv → 401", async () => {
+    const value = signCookie({
+      agent_id: STEWARD_ID,
+      sv: -1,
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(value)}` },
+    });
+    expect(r.status).toBe(401);
+  });
+
+  test("non-integer sv → 401", async () => {
+    const value = signCookie({
+      agent_id: STEWARD_ID,
+      sv: 1.5,
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(value)}` },
+    });
+    expect(r.status).toBe(401);
+  });
+
+  test("missing dot separator (just signed payload) → 401", async () => {
+    const r = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=onlypayloadnodot` },
+    });
+    expect(r.status).toBe(401);
+  });
+});
+
+// --- #35: Origin guard with Referer-only -----------------------------
+
+describe("QDASHCOOKIE-#35: Origin guard accepts Referer-only when matching", () => {
+  test("Referer matching request Host (no Origin) → /login allowed", async () => {
+    // Server's PUBLIC_URL is localhost:3737 by default; but the originAllowed
+    // helper also accepts the request's own Host header. We use that here
+    // because the test server binds to a random ephemeral port.
+    const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${STEWARD_KEY}`,
+        referer: `http://${host}/dashboard/`,
+      },
+    });
+    expect(r.status).toBe(200);
+    expect(getSetCookie(r, "qoopia_dash")).not.toBeNull();
+  });
+
+  test("Referer pointing at attacker.example (no Origin) → /login forbidden", async () => {
+    const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${STEWARD_KEY}`,
+        referer: "https://attacker.example/path",
+      },
+    });
+    expect(r.status).toBe(403);
+    expect(getSetCookie(r, "qoopia_dash")).toBeNull();
+  });
+});
+
+// --- #35: logout cookie attribute shape + replay-after-logout --------
+
+describe("QDASHCOOKIE-#35: logout cookie attributes and replay semantics", () => {
+  test("/logout Set-Cookie carries the same attribute shape with Max-Age=0", async () => {
+    const r = await fetch(`${baseUrl}/api/dashboard/logout`, {
+      method: "POST",
+    });
+    expect(r.status).toBe(200);
+    const sc = getSetCookie(r, "qoopia_dash")!;
+    expect(sc).toContain("HttpOnly");
+    expect(sc).toContain("SameSite=Strict");
+    expect(sc).toContain("Path=/api/dashboard");
+    expect(sc).toContain("Max-Age=0");
+  });
+
+  test("replay after logout: stateless cookie still works (documented in ADR-015)", async () => {
+    // This test pins ADR-015's documented semantics: logout clears the
+    // browser's cookie copy only, and the signed value remains valid
+    // until rotation / deactivation / session-secret rotation / expiry.
+    // If we ever introduce a server-side revocation list, this test
+    // should be updated deliberately, not silently.
+    const { cookieValue } = await login();
+
+    // logout (server-side stateless — does nothing to the value).
+    await fetch(`${baseUrl}/api/dashboard/logout`, { method: "POST" });
+
+    const replay = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(cookieValue)}` },
+    });
+    expect(replay.status).toBe(200);
+  });
+});
+
+// --- QDASHCOOKIE-004: Secure flag + proxy semantics ------------------
+
+describe("QDASHCOOKIE-004: Secure flag respects TRUST_PROXY/TRUSTED_PROXIES", () => {
+  test("plain HTTP request with no proxy trust → no Secure", async () => {
+    const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${STEWARD_KEY}` },
+    });
+    expect(r.status).toBe(200);
+    const sc = getSetCookie(r, "qoopia_dash")!;
+    expect(sc).not.toContain("Secure");
+  });
+
+  test("trusted proxy + x-forwarded-proto: https → Secure flag set", async () => {
+    const prevTrust = env.TRUST_PROXY;
+    const prevList = env.TRUSTED_PROXIES;
+    env.TRUST_PROXY = true;
+    env.TRUSTED_PROXIES = ["127.0.0.1", "::1", "::ffff:127.0.0.1"];
+    try {
+      const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${STEWARD_KEY}`,
+          "x-forwarded-proto": "https",
+        },
+      });
+      expect(r.status).toBe(200);
+      const sc = getSetCookie(r, "qoopia_dash")!;
+      expect(sc).toContain("Secure");
+    } finally {
+      env.TRUST_PROXY = prevTrust;
+      env.TRUSTED_PROXIES = prevList;
+    }
+  });
+
+  test("untrusted peer spoofing x-forwarded-proto: https → Secure NOT set", async () => {
+    const prevTrust = env.TRUST_PROXY;
+    const prevList = env.TRUSTED_PROXIES;
+    // Trust enabled but localhost is NOT in the whitelist — simulates an
+    // attacker reaching the listener directly while a proxy lives elsewhere.
+    env.TRUST_PROXY = true;
+    env.TRUSTED_PROXIES = ["10.10.10.10"];
+    try {
+      const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${STEWARD_KEY}`,
+          "x-forwarded-proto": "https",
+        },
+      });
+      expect(r.status).toBe(200);
+      const sc = getSetCookie(r, "qoopia_dash")!;
+      expect(sc).not.toContain("Secure");
+    } finally {
+      env.TRUST_PROXY = prevTrust;
+      env.TRUSTED_PROXIES = prevList;
+    }
+  });
+
+  test("TRUST_PROXY=false ignores x-forwarded-proto entirely", async () => {
+    const prevTrust = env.TRUST_PROXY;
+    env.TRUST_PROXY = false;
+    try {
+      const r = await fetch(`${baseUrl}/api/dashboard/login`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${STEWARD_KEY}`,
+          "x-forwarded-proto": "https",
+        },
+      });
+      expect(r.status).toBe(200);
+      const sc = getSetCookie(r, "qoopia_dash")!;
+      expect(sc).not.toContain("Secure");
+    } finally {
+      env.TRUST_PROXY = prevTrust;
+    }
+  });
+});
