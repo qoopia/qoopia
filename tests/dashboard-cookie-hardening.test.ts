@@ -28,13 +28,12 @@
  * trigger sessionKey() resolution.
  */
 
-// IMPORTANT: set the session secret BEFORE the dashboard module's
-// sessionKey() is ever called. The server imports dashboard-api lazily
-// via http.ts, but the cache is populated on first request — so as long
-// as this assignment runs before startHttpServer(), tests sign cookies
-// with the same key the server will verify against.
-process.env.QOOPIA_SESSION_SECRET =
-  "qdash-test-session-secret-do-not-ship-2026-04-27";
+// The session secret is pinned in tests/setup.ts (bunfig preload) so it
+// is set before ANY test file's imports run, regardless of which file bun
+// happens to schedule first. Setting it here would race with other test
+// files that trigger dashboard-api.sessionKey() ahead of us — `_sessionKey`
+// is module-level and caches the first resolution. CI hit this exact bug
+// before the secret was hoisted into setup.ts.
 
 import crypto from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
