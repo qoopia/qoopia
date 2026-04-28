@@ -229,6 +229,10 @@ export interface NoteListParams {
   session_id?: string;
   task_bound_id?: string;
   include_deleted?: boolean;
+  /** Include notes whose metadata.status = 'archived'. Default false.
+   *  Archived rows stay queryable for audit/restore but are hidden from
+   *  default list/recall calls so dashboards don't drown in stale state. */
+  include_archived?: boolean;
   limit?: number;
   offset?: number;
   order?: "created_desc" | "created_asc" | "updated_desc";
@@ -266,6 +270,12 @@ export function listNotes(p: NoteListParams) {
   if (p.status) {
     where.push(`json_extract(metadata, '$.status') = ?`);
     params.push(p.status);
+  } else if (!p.include_archived) {
+    // Default: hide archived rows. Caller can still ask for them
+    // explicitly via status='archived' (above) or include_archived=true.
+    where.push(
+      `(json_extract(metadata, '$.status') IS NULL OR json_extract(metadata, '$.status') != 'archived')`,
+    );
   }
   if (p.tags && p.tags.length > 0) {
     for (const tag of p.tags) {

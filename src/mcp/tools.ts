@@ -89,17 +89,28 @@ const tools: ToolDef[] = [
   {
     name: "recall",
     description:
-      "Full-text search across notes (and optionally activity). Returns results with complete text (no truncation). Keyword-based, not semantic.",
+      "Full-text search across notes, activity log, and session messages. Returns results with complete text (no truncation). Keyword-based, not semantic. Use scope='all' to query every layer.",
     rawSchema: {
       query: z.string().min(1).max(1000).describe("Full-text keywords. Use multiple terms to narrow."),
       limit: z.number().int().min(1).max(50).optional(),
-      scope: z.enum(["notes", "activity", "all"]).optional(),
+      scope: z
+        .enum(["notes", "activity", "sessions", "all"])
+        .optional()
+        .describe(
+          "notes (default) | activity (audit log) | sessions (conversation messages) | all (union of the three).",
+        ),
       type: noteTypeEnum.optional(),
       project_id: z.string().optional(),
       cross_workspace: z
         .boolean()
         .optional()
         .describe("Honored only for privileged agents (Claude)."),
+      include_archived: z
+        .boolean()
+        .optional()
+        .describe(
+          "Include notes whose metadata.status='archived'. Default false — archived rows hidden to keep results focused.",
+        ),
     },
     handler: (args, auth) => {
       const privileged = auth.type === "claude-privileged";
@@ -109,11 +120,17 @@ const tools: ToolDef[] = [
         is_admin: isAdmin(auth),
         query: String(args.query),
         limit: args.limit as number | undefined,
-        scope: args.scope as "notes" | "activity" | "all" | undefined,
+        scope: args.scope as
+          | "notes"
+          | "activity"
+          | "sessions"
+          | "all"
+          | undefined,
         type: args.type as string | undefined,
         project_id: args.project_id as string | undefined,
         cross_workspace: args.cross_workspace as boolean | undefined,
         privileged,
+        include_archived: args.include_archived as boolean | undefined,
       });
     },
   },
@@ -199,6 +216,7 @@ const tools: ToolDef[] = [
       session_id: z.string().optional(),
       task_bound_id: z.string().optional(),
       include_deleted: z.boolean().optional(),
+      include_archived: z.boolean().optional(),
       limit: z.number().int().min(1).max(500).optional(),
       offset: z.number().int().min(0).optional(),
       order: z.enum(["created_desc", "created_asc", "updated_desc"]).optional(),
@@ -218,6 +236,7 @@ const tools: ToolDef[] = [
         session_id: args.session_id as string | undefined,
         task_bound_id: args.task_bound_id as string | undefined,
         include_deleted: args.include_deleted as boolean | undefined,
+        include_archived: args.include_archived as boolean | undefined,
         limit: args.limit as number | undefined,
         offset: args.offset as number | undefined,
         order: args.order as
