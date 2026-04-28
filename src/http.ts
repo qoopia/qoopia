@@ -6,7 +6,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import crypto from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server.ts";
-import { handleDashboardApi } from "./dashboard-api.ts";
+import { handleDashboardApi, isHttps } from "./dashboard-api.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
 import { getAllowlist } from "./admin/claude-agents.ts";
 import { saveMessage } from "./services/sessions.ts";
@@ -308,7 +308,7 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
 
   // --- Dashboard ---
   if (url === "/dashboard") {
-    return serveDashboard(res);
+    return serveDashboard(req, res);
   }
 
   // --- OAuth discovery ---
@@ -457,7 +457,55 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
 
 let dashboardHtml: string | null = null;
 
-function serveDashboard(res: ServerResponse) {
+/**
+ * QSA-G / Codex QSA-007: HTML responses (dashboard + OAuth consent) must
+ * carry a hardened CSP and HSTS-on-https so a successful XSS in the rendered
+ * page can't exfiltrate or redirect, and downgrade attacks are refused by
+ * the browser on subsequent loads.
+ *
+ * Notes on the policy choices:
+ *   - 'unsafe-inline' for script and style is required because dashboard.html
+ *     and the consent page both ship a single inline <script> / <style> block.
+ *     We trade the script-src strictness for keeping the dashboard a single
+ *     self-contained file (no nonces, no extra build step). frame-ancestors
+ *     'none' still blocks clickjacking, and form-action 'self' contains
+ *     POST exfil via injected <form>.
+ *   - HSTS only when isHttps(req) — emitting it on plain http would either
+ *     be ignored (per RFC 6797) or, worse, "stick" if the request was
+ *     proxied by a TLS-terminating tunnel and break local debugging.
+ */
+function securityHeaders(req: IncomingMessage): Record<string, string> {
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    // CSP Level 3 navigation restriction. Browsers that don't implement
+    // it ignore the directive (per CSP spec); browsers that do block
+    // top-level window.location-style redirects from injected inline
+    // script. This is defense-in-depth — the real fix for inline-script
+    // XSS is nonce-based CSP, tracked as a follow-up to QSA-G that needs
+    // dashboard.html restructuring.
+    "navigate-to 'self'",
+  ].join("; ");
+  const headers: Record<string, string> = {
+    "content-security-policy": csp,
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+  };
+  if (isHttps(req)) {
+    headers["strict-transport-security"] =
+      "max-age=15552000; includeSubDomains";
+  }
+  return headers;
+}
+
+function serveDashboard(req: IncomingMessage, res: ServerResponse) {
   if (!dashboardHtml) {
     try {
       // Resolve path relative to this source file
@@ -474,6 +522,7 @@ function serveDashboard(res: ServerResponse) {
   res.writeHead(200, {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-cache",
+    ...securityHeaders(req),
   });
   res.end(dashboardHtml);
 }
@@ -700,6 +749,7 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
   res.writeHead(200, {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
+    ...securityHeaders(req),
   });
   res.end(html);
 }
