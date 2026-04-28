@@ -525,3 +525,54 @@ cookie-scope changes.
   consent under DELTA cookie, exchanges code → token, calls
   `tools/list` and `brief` from claude.ai web Custom Connector. Confirm
   no BRAVO / CHARLIE visibility.
+
+## QSA-H — codex review findings (2026-04-28)
+
+Independent gpt-5.4 review caught four real issues in the v2 draft. All
+fixed in the same PR before merge; tests pinned in
+`tests/oauth-bridge-eligibility.test.ts` (11 cases, all pass).
+
+1. **CRITICAL — `/oauth/register` accepted OAuth access tokens.**
+   `authenticate()` resolves both static api_keys and OAuth access tokens.
+   The first version of `assertCanRegisterOAuth` only checked agent type,
+   so any valid OAuth bearer issued to a steward could mint new clients
+   forever — one approved connector becomes self-replicating OAuth sprawl.
+   **Fix:** `assertCanRegisterOAuth` now also requires `auth.source === "api-key"`.
+   Registration is api-key only.
+
+2. **CRITICAL — consent surface accepted OAuth bearers.**
+   `checkDashboardAuth()` falls back to Bearer when no cookie is present, and
+   the Bearer path goes through `authenticate()`, which accepts OAuth tokens.
+   That meant a third-party app holding any active OAuth access token in the
+   workspace could `GET /api/dashboard/oauth-consent`, read the rotated nonce,
+   and `POST /approve` — defeating the bridge pattern entirely.
+   **Fix:** propagate `source` ("api-key" | "oauth" | "cookie") into
+   `DashboardAuth`, and have all three consent handlers (GET, approve POST,
+   deny POST) call `oauthConsentRejection(auth)` first. OAuth source → 403.
+
+3. **HIGH — consent allowed any dashboard-eligible agent type, including
+   `standard`.** Registration was admin-only, but consent was not. A standard
+   agent in the same workspace could approve a pending ticket and mint OAuth
+   tokens bound to itself.
+   **Fix:** `oauthConsentRejection` also requires `isAdmin` (steward or
+   claude-privileged). Consent is strictly admin-tier, symmetric with
+   registration.
+
+4. **HIGH — finalize re-checked the wrong workspace.** The defense-in-depth
+   re-check called `clientWorkspace(ticket.client_id)`, which resolves the
+   *registering client owner's* workspace. The actual drift case is the
+   *approving agent's* workspace changing between approve and finalize, which
+   that lookup doesn't cover.
+   **Fix:** finalize now SELECTs the approving agent's current
+   `workspace_id` and `active` flag and refuses if either drifted from the
+   ticket. Audit row written on mismatch.
+
+5. **MED — cross-workspace `deny` was not audited.** GET/approve mismatches
+   wrote a `workspace_mismatch` audit row; deny did not.
+   **Fix:** parity audit row added on the deny path.
+
+6. **MED — ticket GC anchored on `created_at`.** Retention drifted with how
+   long the operator took to approve.
+   **Fix:** `pruneConsentTickets` now anchors on `expires_at`. Retention is
+   deterministic: TTL + grace from creation, regardless of when the ticket
+   transitioned to a terminal state. No schema churn.

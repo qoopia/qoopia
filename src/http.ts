@@ -12,6 +12,7 @@ import {
   isHttps,
   checkDashboardAuth,
   originAllowed as dashboardOriginAllowed,
+  type DashboardAuth,
 } from "./dashboard-api.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
 import { getAllowlist } from "./admin/claude-agents.ts";
@@ -26,7 +27,6 @@ import {
   registerClient,
   assertCanRegisterOAuth,
   getClient,
-  clientWorkspace,
   createConsentTicket,
   getConsentTicket,
   consentTicketStatus,
@@ -875,28 +875,45 @@ function handleAuthorizeFinalize(
   if (!client) {
     return json(res, 400, { error: "invalid_client" });
   }
-  // Defense-in-depth: re-verify workspace match between the approving
-  // agent and the ticket. If somehow they diverged (e.g. agent moved
-  // workspaces), refuse rather than mint a cross-workspace token.
-  const ws = clientWorkspace(ticket.client_id);
-  if (!ws) {
-    return json(res, 500, {
-      error: "server_error",
-      error_description: "Client has no associated active agent",
+  // Codex HIGH #1 (2026-04-28): re-verify the *approving agent's current
+  // workspace* still matches the ticket's workspace, not the registering
+  // client owner's. The previous version called clientWorkspace(client_id),
+  // which resolves the registrar — that doesn't catch the actual drift case
+  // (approver moves workspaces between approve and finalize). Also reject
+  // if the approver was deactivated in the gap.
+  const approver = db
+    .prepare(
+      `SELECT id, workspace_id, active FROM agents WHERE id = ?`,
+    )
+    .get(ticket.approved_by_agent_id) as
+    | { id: string; workspace_id: string; active: number }
+    | undefined;
+  if (!approver || !approver.active) {
+    audit({
+      event: "oauth_consent",
+      result: "deny",
+      ip: clientIp,
+      workspace_id: ticket.workspace_id,
+      agent_id: ticket.approved_by_agent_id,
+      detail: `finalize: approver missing/inactive ticket=${ticket.id}`,
+    });
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "approving agent is no longer active",
     });
   }
-  if (ws.workspace_id !== ticket.workspace_id) {
+  if (approver.workspace_id !== ticket.workspace_id) {
     audit({
       event: "workspace_mismatch",
       result: "deny",
       ip: clientIp,
       workspace_id: ticket.workspace_id,
       agent_id: ticket.approved_by_agent_id,
-      detail: `finalize: ticket workspace ${ticket.workspace_id} != client workspace ${ws.workspace_id}`,
+      detail: `finalize: approver moved workspaces ticket=${ticket.workspace_id} approver_now=${approver.workspace_id}`,
     });
-    return json(res, 500, {
-      error: "server_error",
-      error_description: "ticket/client workspace mismatch",
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "approving agent's workspace no longer matches the ticket",
     });
   }
 
@@ -999,6 +1016,32 @@ function escapeHtmlSafe(s: string): string {
 }
 
 /**
+ * Codex QSA-H (2026-04-28): the consent surface must reject:
+ *
+ *   1) OAuth access tokens — checkDashboardAuth() falls back to Bearer when
+ *      the cookie is absent, and authenticate() accepts both api-key bearers
+ *      AND OAuth access tokens. If we let an OAuth bearer in here, an existing
+ *      OAuth client could fetch the consent page, read the rotated nonce, and
+ *      self-approve a new ticket — defeating the bridge pattern entirely.
+ *
+ *   2) standard agents — registration is restricted to steward/claude-priv
+ *      (assertCanRegisterOAuth), so consent (which trusts a connector with the
+ *      caller's full agent surface) must be at least as restrictive. A standard
+ *      agent in the same workspace approving a ticket would mint OAuth tokens
+ *      bound to itself.
+ *
+ * Returns null if eligible, else a short reason code for the caller to
+ * translate into the right HTTP shape.
+ */
+function oauthConsentRejection(
+  auth: DashboardAuth,
+): "oauth_token_not_accepted" | "consent_requires_admin" | null {
+  if (auth.source === "oauth") return "oauth_token_not_accepted";
+  if (!auth.isAdmin) return "consent_requires_admin";
+  return null;
+}
+
+/**
  * GET /api/dashboard/oauth-consent?ticket=<id>
  *
  * The browser was 302'd here from /oauth/authorize. The dashboard cookie
@@ -1044,6 +1087,24 @@ function handleDashboardOAuthConsentGet(
     const target = `/dashboard?next=${encodeURIComponent(next)}`;
     res.writeHead(302, { location: target, "cache-control": "no-store" });
     return res.end();
+  }
+  // QSA-H: reject OAuth bearers and standard agents — see oauthConsentRejection().
+  const reject = oauthConsentRejection(auth);
+  if (reject) {
+    audit({
+      event: "oauth_consent",
+      result: "deny",
+      workspace_id: auth.workspace_id,
+      agent_id: auth.agent_id,
+      detail: `oauth-consent GET rejected reason=${reject} source=${auth.source} type=${auth.type}`,
+    });
+    return json(res, 403, {
+      error: "forbidden",
+      error_description:
+        reject === "oauth_token_not_accepted"
+          ? "OAuth access tokens are not accepted on the consent surface; sign in to the dashboard with a static API key."
+          : "OAuth client consent requires a steward or claude-privileged agent.",
+    });
   }
 
   const t = ticket!;
@@ -1188,6 +1249,25 @@ function handleDashboardOAuthConsentApprove(
       error_description: "Dashboard session required.",
     });
   }
+  // QSA-H: reject OAuth bearers and standard agents BEFORE any state read.
+  const reject = oauthConsentRejection(auth);
+  if (reject) {
+    audit({
+      event: "oauth_consent",
+      result: "deny",
+      ip: clientIp,
+      workspace_id: auth.workspace_id,
+      agent_id: auth.agent_id,
+      detail: `oauth-consent approve rejected reason=${reject} source=${auth.source} type=${auth.type}`,
+    });
+    return json(res, 403, {
+      error: "forbidden",
+      error_description:
+        reject === "oauth_token_not_accepted"
+          ? "OAuth access tokens are not accepted on the consent surface."
+          : "OAuth client consent requires a steward or claude-privileged agent.",
+    });
+  }
   const ticket = getConsentTicket(ticketId);
   const status = consentTicketStatus(ticket);
   if (status === "not_found") {
@@ -1295,6 +1375,27 @@ function handleDashboardOAuthConsentDeny(
       error_description: "Dashboard session required.",
     });
   }
+  // QSA-H: same eligibility gate as approve. A standard agent / OAuth bearer
+  // can't approve, so they shouldn't be able to deny either — denying still
+  // burns the ticket and signals intent into the audit log.
+  const reject = oauthConsentRejection(auth);
+  if (reject) {
+    audit({
+      event: "oauth_consent",
+      result: "deny",
+      ip: clientIp,
+      workspace_id: auth.workspace_id,
+      agent_id: auth.agent_id,
+      detail: `oauth-consent deny rejected reason=${reject} source=${auth.source} type=${auth.type}`,
+    });
+    return json(res, 403, {
+      error: "forbidden",
+      error_description:
+        reject === "oauth_token_not_accepted"
+          ? "OAuth access tokens are not accepted on the consent surface."
+          : "OAuth client consent requires a steward or claude-privileged agent.",
+    });
+  }
   const ticket = getConsentTicket(ticketId);
   const status = consentTicketStatus(ticket);
   if (status === "not_found") {
@@ -1310,6 +1411,17 @@ function handleDashboardOAuthConsentDeny(
     });
   }
   if (auth.workspace_id !== ticket!.workspace_id) {
+    // Codex MED #5 (2026-04-28): audit cross-workspace deny attempts the same
+    // way GET/approve mismatches are audited. A wrong-workspace deny is
+    // security-relevant — it could be reconnaissance or a confused agent.
+    audit({
+      event: "workspace_mismatch",
+      result: "deny",
+      ip: clientIp,
+      workspace_id: auth.workspace_id,
+      agent_id: auth.agent_id,
+      detail: `oauth-consent deny cookie=${auth.workspace_id} ticket=${ticket!.workspace_id}`,
+    });
     return json(res, 403, {
       error: "forbidden",
       error_description: "Workspace mismatch.",

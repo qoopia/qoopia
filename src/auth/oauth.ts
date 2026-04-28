@@ -269,8 +269,19 @@ export function revokeTokenForClient(
  * clients. Standard-agent-creates-connector is a quiet privilege escalation:
  * a compromised standard agent could mint an OAuth surface targeting its own
  * workspace data.
+ *
+ * Codex QSA-H (2026-04-28): registration must also be unreachable via OAuth
+ * access tokens. Otherwise a single approved connector becomes a self-replicating
+ * surface — the bearer can /oauth/register a new client, never expiring as long
+ * as the original token lives. /oauth/register is api-key-only.
  */
 export function assertCanRegisterOAuth(auth: AuthContext): void {
+  if (auth.source !== "api-key") {
+    throw new QoopiaError(
+      "FORBIDDEN",
+      "OAuth client registration requires a static API key (Bearer api_*); OAuth access tokens are not accepted on /oauth/register.",
+    );
+  }
   if (auth.type !== "steward" && auth.type !== "claude-privileged") {
     throw new QoopiaError(
       "FORBIDDEN",
@@ -680,20 +691,32 @@ export function redeemConsentTicket(ticketId: string): boolean {
 }
 
 /**
- * Hard-delete tickets that are terminally done (expired / redeemed / denied)
- * AND past the audit-trail grace window. Safe to call from a periodic GC.
- * Returns the number of rows pruned.
+ * Hard-delete tickets whose audit retention window has elapsed.
+ *
+ * Codex MED #6 (2026-04-28): the prior version anchored the grace window on
+ * `created_at`, so redeemed/denied tickets could be deleted only `grace - δ`
+ * after the terminal event (where δ = "how long approval took"). Retention
+ * effectively varied with operator latency, weakening the audit trail.
+ *
+ * Schema-light fix: anchor on `expires_at` instead. Every ticket — pending,
+ * redeemed, denied, or expired — is retained for at least `expires_at +
+ * CONSENT_TICKET_PRUNE_AFTER_SEC`. That gives:
+ *   - predictable retention (TTL + grace from creation, deterministic),
+ *   - no tightening of the window when an operator approves quickly,
+ *   - no schema churn (no `redeemed_at`/`denied_at` columns needed).
+ *
+ * The `redeemed = 1 OR denied = 1` branch is dropped — we already wait for
+ * `expires_at < cutoff`, which is a strict superset (TTL is always finite).
  */
 export function pruneConsentTickets(): number {
-  const cutoff = new Date(Date.now() - CONSENT_TICKET_PRUNE_AFTER_SEC * 1000)
+  const cutoffIso = new Date(Date.now() - CONSENT_TICKET_PRUNE_AFTER_SEC * 1000)
     .toISOString()
     .replace(/\.\d{3}Z$/, "Z");
   const info = db
     .prepare(
       `DELETE FROM consent_tickets
-        WHERE created_at < ?
-          AND (expires_at < ? OR redeemed = 1 OR denied = 1)`,
+        WHERE expires_at < ?`,
     )
-    .run(cutoff, nowIso());
+    .run(cutoffIso);
   return info.changes;
 }
