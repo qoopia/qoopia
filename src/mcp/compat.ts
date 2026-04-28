@@ -35,6 +35,11 @@ import {
   deleteNote,
 } from "../services/notes.ts";
 import { logActivity, listActivity } from "../services/activity.ts";
+import {
+  isToolAllowedForProfile,
+  type AgentToolProfile,
+  type RiskClass,
+} from "./tools.ts";
 
 // QRERUN-003 / ADR-014: same admin set as src/mcp/tools.ts. Kept local to
 // avoid a circular import; both modules trust the same enum.
@@ -491,9 +496,17 @@ function v2Note(args: Record<string, unknown>, auth: AuthContext) {
 export function registerCompatTools(
   server: McpServer,
   authProvider: () => AuthContext | null,
+  agentProfile: AgentToolProfile = "full",
 ) {
+  // QSA-F / ADR-016: V2 alias risk classification. Each alias gates on
+  // the same risk class as its V3 canonical handler — otherwise a
+  // 'read-only' agent could bypass the profile by calling `create` /
+  // `update` / `delete` instead of `note_*`.
+  const allow = (risk: RiskClass) =>
+    isToolAllowedForProfile(risk, agentProfile);
+
   // Generic CRUD with `entity` discriminator
-  server.tool(
+  if (allow("write-low")) server.tool(
     "create",
     "[V2 compat] Create entity by type. entity ∈ tasks|deals|contacts|finances|activity. Use note_create for V3-native API.",
     {
@@ -535,7 +548,7 @@ export function registerCompatTools(
     wrap(v2Create, authProvider),
   );
 
-  server.tool(
+  if (allow("write-low")) server.tool(
     "update",
     "[V2 compat] Update entity by id. Provide entity + id + fields to change.",
     {
@@ -573,7 +586,7 @@ export function registerCompatTools(
     wrap(v2Update, authProvider),
   );
 
-  server.tool(
+  if (allow("write-destructive")) server.tool(
     "delete",
     "[V2 compat] Soft-delete an entity. entity ∈ tasks|deals|contacts|finances|projects.",
     {
@@ -583,7 +596,7 @@ export function registerCompatTools(
     wrap(v2Delete, authProvider),
   );
 
-  server.tool(
+  if (allow("read")) server.tool(
     "list",
     "[V2 compat] List entities by type. Supported filters: project_id, status, entity_type (for activity), limit.",
     {
@@ -603,7 +616,7 @@ export function registerCompatTools(
     wrap(v2List, authProvider),
   );
 
-  server.tool(
+  if (allow("read")) server.tool(
     "get",
     "[V2 compat] Get a single entity by id.",
     {
@@ -613,7 +626,7 @@ export function registerCompatTools(
     wrap(v2Get, authProvider),
   );
 
-  server.tool(
+  if (allow("write-low")) server.tool(
     "note",
     "[V2 compat] Record a memory note. Maps to note_create with type=memory by default.",
     {

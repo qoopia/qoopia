@@ -8,6 +8,13 @@ export interface AuthContext {
   workspace_id: string;
   type: "standard" | "claude-privileged" | string;
   source: "api-key" | "oauth";
+  // QSA-F / ADR-016: per-agent MCP tool risk profile, propagated from
+  // agents.tool_profile. Raw string here; src/mcp/tools.ts normalizes it
+  // to a known enum and falls back to 'read-only' if it's unknown
+  // (fail-closed). Optional in the type so legacy code that constructs
+  // AuthContext in tests doesn't have to set it; runtime treats undefined
+  // as 'read-only'.
+  tool_profile?: string | null;
 }
 
 /**
@@ -47,5 +54,6 @@ function agentToContext(a: AgentRecord, source: "api-key" | "oauth"): AuthContex
     workspace_id: a.workspace_id,
     type: a.type,
     source,
+    tool_profile: a.tool_profile ?? null,
   };
 }
