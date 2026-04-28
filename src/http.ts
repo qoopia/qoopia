@@ -485,6 +485,13 @@ function securityHeaders(req: IncomingMessage): Record<string, string> {
     "base-uri 'none'",
     "frame-ancestors 'none'",
     "form-action 'self'",
+    // CSP Level 3 navigation restriction. Browsers that don't implement
+    // it ignore the directive (per CSP spec); browsers that do block
+    // top-level window.location-style redirects from injected inline
+    // script. This is defense-in-depth — the real fix for inline-script
+    // XSS is nonce-based CSP, tracked as a follow-up to QSA-G that needs
+    // dashboard.html restructuring.
+    "navigate-to 'self'",
   ].join("; ");
   const headers: Record<string, string> = {
     "content-security-policy": csp,

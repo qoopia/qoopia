@@ -90,6 +90,9 @@ function expectHardenedCsp(csp: string | null) {
   expect(c).toContain("object-src 'none'");
   expect(c).toContain("base-uri 'none'");
   expect(c).toContain("form-action 'self'");
+  // CSP-3 navigation restriction (defense-in-depth against window.location
+  // exfiltration from any injected inline script).
+  expect(c).toContain("navigate-to 'self'");
   // Inline scripts are allowed (the dashboard ships a single inline block);
   // but external script hosts must NOT be permitted.
   expect(c).not.toContain("script-src *");
