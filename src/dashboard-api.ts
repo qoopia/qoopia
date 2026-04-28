@@ -543,10 +543,30 @@ function loginHandler(req: IncomingMessage, res: ServerResponse) {
 }
 
 /**
- * POST /api/dashboard/logout — unconditionally clears the session cookie.
- * Idempotent and unauthenticated by design (worst case is an attacker logs
- * the user out — annoyance, not breach). Origin guard still applies so a
- * cross-site form submission cannot trigger it silently.
+ * POST /api/dashboard/logout — clears the session cookie AND, when the
+ * caller presented a verifiable cookie, bumps that agent's
+ * `session_version` so any pre-logout copy of the cookie fails the sv
+ * check on its next request (server-side revocation).
+ *
+ * QSA-E / Codex QSA-005 (2026-04-28): the prior implementation only
+ * cleared the browser's cookie copy. A copy of the cookie made before
+ * logout (e.g. exfiltrated via XSS or a malicious extension) remained
+ * valid until expiry / api_key rotation / agent deactivation /
+ * session-secret rotation. With this change, a single logout call
+ * revokes every outstanding cookie for that agent immediately.
+ *
+ * Behavior:
+ *   - Origin guard still applies (cross-site form submission blocked).
+ *   - If the request carries a cookie that we can verify
+ *     (signature ok, agent active, sv matches), bump session_version.
+ *     The bumped value invalidates the cookie we just verified, plus
+ *     any other copy in flight.
+ *   - If the cookie is missing, tampered, expired, or already revoked,
+ *     we cannot identify the agent and skip the bump. The browser
+ *     cookie is still cleared — logout remains idempotent and a 200.
+ *   - Unauthenticated by design: an attacker who can replay a valid
+ *     cookie to /logout can log the owner out, but that was already
+ *     true and is the whole point of revocation.
  */
 function logoutHandler(req: IncomingMessage, res: ServerResponse) {
   if (!originAllowed(req)) {
@@ -556,6 +576,14 @@ function logoutHandler(req: IncomingMessage, res: ServerResponse) {
     });
     return;
   }
+
+  const auth = authFromSessionCookie(req);
+  if (auth) {
+    db.prepare(
+      `UPDATE agents SET session_version = session_version + 1 WHERE id = ?`,
+    ).run(auth.agent_id);
+  }
+
   res.writeHead(200, {
     "content-type": "application/json",
     "cache-control": "no-store",
