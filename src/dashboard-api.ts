@@ -378,7 +378,7 @@ export function checkDashboardAuth(req: IncomingMessage): DashboardAuth | null {
  * forcing CSRF tokens on a non-browser caller would just push people back
  * onto the cookie path we are trying to harden.
  */
-function originAllowed(req: IncomingMessage): boolean {
+export function originAllowed(req: IncomingMessage): boolean {
   const origin = (req.headers["origin"] as string | undefined) || "";
   const referer = (req.headers["referer"] as string | undefined) || "";
   if (!origin && !referer) return true;

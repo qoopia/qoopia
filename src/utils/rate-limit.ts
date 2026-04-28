@@ -49,6 +49,17 @@ export class RateLimiter {
     return Math.max(1, Math.ceil((unlockAt - Date.now()) / 1000));
   }
 
+  /**
+   * Test helper: clear all per-IP buckets so a parallel test file's prior
+   * traffic does not poison the next file. Not exposed to runtime callers
+   * (no HTTP path uses it). Intended only for `beforeAll`/`afterAll` hooks
+   * in tests/*.
+   */
+  resetForTests(): void {
+    this.buckets.clear();
+    this.lastCleanup = Date.now();
+  }
+
   private cleanup(cutoff: number) {
     for (const [key, bucket] of this.buckets) {
       bucket.hits = bucket.hits.filter((t) => t > cutoff);

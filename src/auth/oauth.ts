@@ -1,8 +1,9 @@
 import crypto from "node:crypto";
 import { db } from "../db/connection.ts";
 import { sha256Hex } from "./api-keys.ts";
-import { nowIso } from "../utils/errors.ts";
+import { nowIso, QoopiaError } from "../utils/errors.ts";
 import { env } from "../utils/env.ts";
+import type { AuthContext } from "./middleware.ts";
 
 /**
  * OAuth 2.1 PKCE code flow with opaque tokens.
@@ -264,18 +265,42 @@ export function revokeTokenForClient(
 }
 
 /**
- * RFC 7591 dynamic client registration.
- * Single-user assumption: associates new client with the first active agent
- * (workspace owner). Public clients (token_endpoint_auth_method='none') get
- * no client_secret. Confidential clients get a generated client_secret.
+ * ADR-017 §1: only steward and claude-privileged agents may register OAuth
+ * clients. Standard-agent-creates-connector is a quiet privilege escalation:
+ * a compromised standard agent could mint an OAuth surface targeting its own
+ * workspace data.
  */
-export function registerClient(input: {
-  client_name?: string;
-  redirect_uris: string[];
-  token_endpoint_auth_method?: string;
-  grant_types?: string[];
-  response_types?: string[];
-}): {
+export function assertCanRegisterOAuth(auth: AuthContext): void {
+  if (auth.type !== "steward" && auth.type !== "claude-privileged") {
+    throw new QoopiaError(
+      "FORBIDDEN",
+      "Only steward or claude-privileged agents may register OAuth clients.",
+    );
+  }
+}
+
+/**
+ * RFC 7591 dynamic client registration (ADR-017 multi-tenant variant).
+ *
+ * The new client is bound to the calling agent's `agent_id` and to that
+ * agent's `workspace_id` (snapshotted into oauth_clients.workspace_id by
+ * migration 011). The legacy "first active agent in the default workspace"
+ * inference is gone, as is the wsCount > 1 guard — multi-tenant is the
+ * supported shape now.
+ *
+ * Caller must pre-authenticate the AuthContext and run
+ * `assertCanRegisterOAuth(auth)` (the HTTP handler does this).
+ */
+export function registerClient(
+  input: {
+    client_name?: string;
+    redirect_uris: string[];
+    token_endpoint_auth_method?: string;
+    grant_types?: string[];
+    response_types?: string[];
+  },
+  auth: AuthContext,
+): {
   client_id: string;
   client_secret?: string;
   client_name: string;
@@ -301,33 +326,6 @@ export function registerClient(input: {
       throw new Error(`Invalid redirect URI scheme: ${uri} (only http/https allowed)`);
     }
   }
-  // Guard: if multiple workspaces exist, explicit workspace binding is required.
-  // This prevents implicit binding to the wrong workspace in multi-workspace deployments.
-  const wsCount = (db
-    .prepare(`SELECT COUNT(*) as c FROM workspaces`)
-    .get() as { c: number }).c;
-  if (wsCount > 1) {
-    throw new Error(
-      "Multi-workspace OAuth registration requires explicit workspace binding — contact admin",
-    );
-  }
-
-  // C1 fix: restrict to agents in the default workspace (single-user assumption).
-  // Prefer claude-privileged for Claude.ai connector; fall back to first active.
-  const defaultWs = db
-    .prepare(`SELECT id FROM workspaces ORDER BY created_at ASC LIMIT 1`)
-    .get() as { id: string } | undefined;
-  if (!defaultWs) throw new Error("No workspace configured");
-
-  const agent = (db
-    .prepare(
-      `SELECT id, workspace_id FROM agents
-       WHERE active = 1 AND workspace_id = ?
-       ORDER BY (type = 'claude-privileged') DESC, created_at ASC
-       LIMIT 1`,
-    )
-    .get(defaultWs.id) as { id: string; workspace_id: string } | undefined);
-  if (!agent) throw new Error("No active agent available");
 
   const authMethod = input.token_endpoint_auth_method || "none";
   if (authMethod !== "none" && authMethod !== "client_secret_post") {
@@ -344,12 +342,14 @@ export function registerClient(input: {
   }
 
   db.prepare(
-    `INSERT INTO oauth_clients (id, name, agent_id, client_secret_hash, redirect_uris, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO oauth_clients
+       (id, name, agent_id, workspace_id, client_secret_hash, redirect_uris, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     client_id,
     input.client_name || "Unnamed Client",
-    agent.id,
+    auth.agent_id,
+    auth.workspace_id,
     secretHash,
     JSON.stringify(input.redirect_uris),
     nowIso(),
@@ -368,11 +368,18 @@ export function registerClient(input: {
 
 /**
  * Look up a registered client by id. Returns the row or null.
+ *
+ * `workspace_id` was added by migration 011 (ADR-017) and may be NULL for
+ * pre-existing rows that were created by older code paths and somehow
+ * escaped the migration's backfill (e.g. an orphan agent_id). Callers that
+ * need workspace-isolation checks must treat NULL as "wrong workspace" /
+ * fail closed.
  */
 export function getClient(client_id: string): {
   id: string;
   name: string;
   agent_id: string;
+  workspace_id: string | null;
   client_secret_hash: string;
   redirect_uris: string[];
 } | null {
@@ -383,6 +390,7 @@ export function getClient(client_id: string): {
         id: string;
         name: string;
         agent_id: string;
+        workspace_id: string | null;
         client_secret_hash: string;
         redirect_uris: string;
       }
@@ -443,4 +451,249 @@ export function wellKnownProtectedResource() {
     authorization_servers: [env.OAUTH_ISSUER],
     bearer_methods_supported: ["header"],
   };
+}
+
+// ---------- Consent tickets (ADR-017 cookie-bridge) ----------
+//
+// Each /oauth/authorize hit lands an in-flight ticket here. The ticket is the
+// only state the dashboard side has to honor when finalizing — the OAuth
+// surface itself never reads the dashboard cookie. The ticket id IS the
+// browser-carried state; everything else is server-side.
+
+const CONSENT_TICKET_TTL_SEC = 600; // 10 minutes (ADR-017 §2 "TTL")
+/** Hard-delete grace window for finalized/expired/denied tickets. */
+const CONSENT_TICKET_PRUNE_AFTER_SEC = 60 * 60; // 1h
+
+export interface ConsentTicket {
+  id: string;
+  client_id: string;
+  workspace_id: string;
+  redirect_uri: string;
+  code_challenge: string;
+  code_challenge_method: string;
+  scope: string;
+  state: string;
+  approved_by_agent_id: string | null;
+  denied: number;
+  redeemed: number;
+  approve_nonce: string;
+  created_at: string;
+  expires_at: string;
+}
+
+/**
+ * Create a fresh consent ticket. Caller is responsible for having validated
+ * the OAuth params + client + redirect_uri allowlist before reaching here —
+ * this function does not re-validate. `workspace_id` MUST be passed in and
+ * MUST equal the client's workspace_id; the http handler reads it from
+ * `getClient()` so that a NULL `oauth_clients.workspace_id` (legacy row)
+ * still requires the caller to make a deliberate choice.
+ */
+export function createConsentTicket(opts: {
+  clientId: string;
+  workspaceId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  codeChallengeMethod: string;
+  scope: string;
+  state: string;
+}): ConsentTicket {
+  const id = `qct_${crypto.randomBytes(16).toString("base64url")}`;
+  const approve_nonce = `qcn_${crypto.randomBytes(16).toString("base64url")}`;
+  const created_at = nowIso();
+  const expires_at = plusSec(CONSENT_TICKET_TTL_SEC);
+  db.prepare(
+    `INSERT INTO consent_tickets
+      (id, client_id, workspace_id, redirect_uri, code_challenge,
+       code_challenge_method, scope, state, approve_nonce, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    opts.clientId,
+    opts.workspaceId,
+    opts.redirectUri,
+    opts.codeChallenge,
+    opts.codeChallengeMethod,
+    opts.scope,
+    opts.state,
+    approve_nonce,
+    created_at,
+    expires_at,
+  );
+  return {
+    id,
+    client_id: opts.clientId,
+    workspace_id: opts.workspaceId,
+    redirect_uri: opts.redirectUri,
+    code_challenge: opts.codeChallenge,
+    code_challenge_method: opts.codeChallengeMethod,
+    scope: opts.scope,
+    state: opts.state,
+    approved_by_agent_id: null,
+    denied: 0,
+    redeemed: 0,
+    approve_nonce,
+    created_at,
+    expires_at,
+  };
+}
+
+export function getConsentTicket(id: string): ConsentTicket | null {
+  const row = db
+    .prepare(`SELECT * FROM consent_tickets WHERE id = ?`)
+    .get(id) as ConsentTicket | undefined;
+  return row || null;
+}
+
+export type ConsentTicketState =
+  | "ok"
+  | "not_found"
+  | "expired"
+  | "redeemed"
+  | "denied"
+  | "already_finalized";
+
+/**
+ * Returns a string describing the ticket's terminal status, or "ok" if the
+ * ticket is still in-flight (whether or not approved). Expiry is checked
+ * against system clock.
+ */
+export function consentTicketStatus(t: ConsentTicket | null): ConsentTicketState {
+  if (!t) return "not_found";
+  if (t.redeemed) return "redeemed";
+  if (t.denied) return "denied";
+  if (t.expires_at <= nowIso()) return "expired";
+  return "ok";
+}
+
+/**
+ * Mark the ticket approved by the supplied agent. Atomic: only succeeds if
+ * the ticket exists, is not already approved/denied/redeemed, and is not
+ * expired. Callers SHOULD also have already verified the approve_nonce and
+ * (defense-in-depth) that the agent's workspace matches the ticket.
+ *
+ * Returns true on success, false on any not-found / wrong-state / expired
+ * condition.
+ */
+export function approveConsentTicket(
+  ticketId: string,
+  agentId: string,
+): boolean {
+  const info = db
+    .prepare(
+      `UPDATE consent_tickets
+          SET approved_by_agent_id = ?
+        WHERE id = ?
+          AND approved_by_agent_id IS NULL
+          AND denied = 0
+          AND redeemed = 0
+          AND expires_at > ?`,
+    )
+    .run(agentId, ticketId, nowIso());
+  return info.changes === 1;
+}
+
+/**
+ * Atomically rotate the approve_nonce on a still-in-flight ticket. Used by
+ * the dashboard consent GET handler so each render of the consent UI hands
+ * the operator a fresh, single-use nonce. Returns the new nonce on success
+ * or null if the ticket is missing / expired / already finalized.
+ */
+export function rotateConsentNonce(ticketId: string): string | null {
+  const fresh = `qcn_${crypto.randomBytes(16).toString("base64url")}`;
+  const info = db
+    .prepare(
+      `UPDATE consent_tickets
+          SET approve_nonce = ?
+        WHERE id = ?
+          AND approved_by_agent_id IS NULL
+          AND denied = 0
+          AND redeemed = 0
+          AND expires_at > ?`,
+    )
+    .run(fresh, ticketId, nowIso());
+  return info.changes === 1 ? fresh : null;
+}
+
+/**
+ * Atomically consume a ticket's approve_nonce. Single-use: the row's
+ * approve_nonce is rotated to a fresh random string after a successful
+ * compare so the same nonce cannot be replayed even if it leaks.
+ *
+ * Note: this is purely best-effort defense-in-depth. The dashboard handler
+ * still has to verify the cookie, the Origin, and the workspace match.
+ */
+export function consumeConsentNonce(ticketId: string, nonce: string): boolean {
+  const replacement = `qcn_${crypto.randomBytes(16).toString("base64url")}`;
+  const info = db
+    .prepare(
+      `UPDATE consent_tickets
+          SET approve_nonce = ?
+        WHERE id = ?
+          AND approve_nonce = ?
+          AND approved_by_agent_id IS NULL
+          AND denied = 0
+          AND redeemed = 0
+          AND expires_at > ?`,
+    )
+    .run(replacement, ticketId, nonce, nowIso());
+  return info.changes === 1;
+}
+
+/**
+ * Mark the ticket denied. Atomic: only succeeds for an in-flight ticket
+ * (not already approved/denied/redeemed/expired).
+ */
+export function denyConsentTicket(ticketId: string): boolean {
+  const info = db
+    .prepare(
+      `UPDATE consent_tickets
+          SET denied = 1
+        WHERE id = ?
+          AND approved_by_agent_id IS NULL
+          AND denied = 0
+          AND redeemed = 0
+          AND expires_at > ?`,
+    )
+    .run(ticketId, nowIso());
+  return info.changes === 1;
+}
+
+/**
+ * Single-use redeem on the finalize path. Atomic: only succeeds if the
+ * ticket has been approved, has not been redeemed yet, has not been denied,
+ * and has not expired. Replay attempts return false.
+ */
+export function redeemConsentTicket(ticketId: string): boolean {
+  const info = db
+    .prepare(
+      `UPDATE consent_tickets
+          SET redeemed = 1
+        WHERE id = ?
+          AND approved_by_agent_id IS NOT NULL
+          AND denied = 0
+          AND redeemed = 0
+          AND expires_at > ?`,
+    )
+    .run(ticketId, nowIso());
+  return info.changes === 1;
+}
+
+/**
+ * Hard-delete tickets that are terminally done (expired / redeemed / denied)
+ * AND past the audit-trail grace window. Safe to call from a periodic GC.
+ * Returns the number of rows pruned.
+ */
+export function pruneConsentTickets(): number {
+  const cutoff = new Date(Date.now() - CONSENT_TICKET_PRUNE_AFTER_SEC * 1000)
+    .toISOString()
+    .replace(/\.\d{3}Z$/, "Z");
+  const info = db
+    .prepare(
+      `DELETE FROM consent_tickets
+        WHERE created_at < ?
+          AND (expires_at < ? OR redeemed = 1 OR denied = 1)`,
+    )
+    .run(cutoff, nowIso());
+  return info.changes;
 }

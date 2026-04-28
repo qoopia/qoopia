@@ -7,7 +7,12 @@ import crypto from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server.ts";
 import { normalizeAgentProfile, riskOf } from "./mcp/tools.ts";
-import { handleDashboardApi, isHttps } from "./dashboard-api.ts";
+import {
+  handleDashboardApi,
+  isHttps,
+  checkDashboardAuth,
+  originAllowed as dashboardOriginAllowed,
+} from "./dashboard-api.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
 import { getAllowlist } from "./admin/claude-agents.ts";
 import { saveMessage } from "./services/sessions.ts";
@@ -19,9 +24,20 @@ import {
   refreshTokens,
   revokeTokenForClient,
   registerClient,
+  assertCanRegisterOAuth,
   getClient,
   clientWorkspace,
+  createConsentTicket,
+  getConsentTicket,
+  consentTicketStatus,
+  approveConsentTicket,
+  denyConsentTicket,
+  redeemConsentTicket,
+  consumeConsentNonce,
+  rotateConsentNonce,
+  pruneConsentTickets,
 } from "./auth/oauth.ts";
+import { QoopiaError } from "./utils/errors.ts";
 import { db } from "./db/connection.ts";
 import { env } from "./utils/env.ts";
 import { logger } from "./utils/logger.ts";
@@ -35,25 +51,31 @@ import {
 } from "./utils/rate-limit.ts";
 import { audit } from "./utils/audit.ts";
 
-// --- OAuth consent nonces ---
-// Server-generated one-time nonces for the consent form POST.
-// Keyed by nonce string, value holds the pending authorization parameters.
-interface ConsentNonce {
-  clientId: string;
-  redirectUri: string;
-  codeChallenge: string;
-  codeChallengeMethod: string;
-  state: string;
-  scope: string;
-  expires: number; // unix ms
-}
-const consentNonces = new Map<string, ConsentNonce>();
-const NONCE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+// ADR-017: in-memory consentNonces is gone. Consent is brokered through
+// the consent_tickets table; nonces live as `approve_nonce` columns and are
+// rotated atomically. The dashboard-side approve POST uses
+// consumeConsentNonce() for one-time semantics.
 
-function pruneNonces() {
-  const now = Date.now();
-  for (const [k, v] of consentNonces) {
-    if (v.expires < now) consentNonces.delete(k);
+// Periodic GC for finalized/expired/denied consent_tickets. Runs on the
+// process's main interval; cheap because the SQL is indexed on expires_at.
+let _consentTicketGc: ReturnType<typeof setInterval> | null = null;
+function startConsentTicketGc(): void {
+  if (_consentTicketGc) return;
+  _consentTicketGc = setInterval(() => {
+    try {
+      pruneConsentTickets();
+    } catch (err) {
+      logger.warn("pruneConsentTickets failed", { error: String(err) });
+    }
+  }, 60_000);
+  // Don't keep the process alive for the GC alone — when the http server
+  // closes, the timer should not block test exit.
+  if (typeof _consentTicketGc.unref === "function") _consentTicketGc.unref();
+}
+function stopConsentTicketGc(): void {
+  if (_consentTicketGc) {
+    clearInterval(_consentTicketGc);
+    _consentTicketGc = null;
   }
 }
 
@@ -204,6 +226,7 @@ export function assertOAuthReady(): void {
 
 export function startHttpServer() {
   assertOAuthReady();
+  startConsentTicketGc();
   const httpServer = createServer(async (req, res) => {
     try {
       await handleRequest(req as NodeReqWithBody, res);
@@ -218,6 +241,10 @@ export function startHttpServer() {
         }
       }
     }
+  });
+
+  httpServer.on("close", () => {
+    stopConsentTicketGc();
   });
 
   httpServer.listen(env.PORT, env.HOST, () => {
@@ -321,14 +348,27 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   }
 
   // --- OAuth endpoints (stricter: 20 req/min per IP) ---
+  // ADR-017: /oauth/authorize is now a thin redirect target. It validates
+  // params + client + redirect_uri, creates a server-side consent_ticket,
+  // and 302s to the dashboard-scoped consent UI. The /oauth/* surface
+  // never reads the dashboard cookie (ADR-015 §"the cookie is never
+  // attached outside dashboard routes" preserved).
+  if (url.startsWith("/oauth/authorize/finalize") && method === "GET") {
+    if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
+    return handleAuthorizeFinalize(req, res, clientIp);
+  }
   if (url.startsWith("/oauth/authorize") && method === "GET") {
     if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
-    return handleAuthorizeGet(req, res);
+    return handleAuthorizeRedirect(req, res, clientIp);
   }
   if (url === "/oauth/authorize" && method === "POST") {
-    if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
-    const body = await readBody(req);
-    return handleAuthorizePost(req, body, res, clientIp);
+    // ADR-017: POST /oauth/authorize is gone. Approval lives on the
+    // dashboard surface. Explicitly 405 so a stale Claude.ai client or a
+    // crawler hitting the old path gets a deterministic error rather than
+    // a 404.
+    res.writeHead(405, { "content-type": "application/json", allow: "GET" });
+    res.end(JSON.stringify({ error: "method_not_allowed" }));
+    return;
   }
   if (url === "/oauth/token" && method === "POST") {
     if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
@@ -337,14 +377,44 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
   }
   if (url === "/oauth/register" && method === "POST") {
     if (rateLimit429(authLimiter, "auth", clientIp, res)) return;
-    // Require admin secret for client registration (prevents anonymous self-service)
-    if (!checkAdminSecret(req)) {
-      audit({ event: "admin_secret_fail", result: "deny", ip: clientIp, scope: "/oauth/register" });
-      return json(res, 401, { error: "unauthorized", error_description: "Admin secret required for client registration" });
-    }
-    audit({ event: "oauth_register", result: "allow", ip: clientIp });
     const body = await readBody(req);
-    return handleRegister(body, res);
+    const fetchReq = nodeReqToFetchRequest(req, body);
+    const auth = authenticate(fetchReq);
+    if (!auth) {
+      audit({ event: "auth_failure", result: "deny", ip: clientIp, scope: "/oauth/register" });
+      return json(res, 401, {
+        error: "unauthorized",
+        error_description:
+          "Bearer api_key required (steward or claude-privileged scope).",
+      });
+    }
+    try {
+      assertCanRegisterOAuth(auth);
+    } catch (err) {
+      if (err instanceof QoopiaError && err.code === "FORBIDDEN") {
+        audit({
+          event: "oauth_register",
+          result: "deny",
+          ip: clientIp,
+          workspace_id: auth.workspace_id,
+          agent_id: auth.agent_id,
+          detail: `agent type=${auth.type} cannot register OAuth clients`,
+        });
+        return json(res, 403, {
+          error: "forbidden",
+          error_description: err.message,
+        });
+      }
+      throw err;
+    }
+    audit({
+      event: "oauth_register",
+      result: "allow",
+      ip: clientIp,
+      workspace_id: auth.workspace_id,
+      agent_id: auth.agent_id,
+    });
+    return handleRegister(body, res, auth);
   }
   if (url === "/oauth/revoke" && method === "POST") {
     const body = await readBody(req);
@@ -437,6 +507,31 @@ async function handleRequest(req: NodeReqWithBody, res: ServerResponse) {
       if (e.code === "INVALID_INPUT") return json(res, 400, { error: "invalid_input", detail: e.message }, req);
       throw err;
     }
+  }
+
+  // --- Dashboard-scoped OAuth consent bridge (ADR-017) ---
+  // These endpoints intentionally live under /api/dashboard so they pick up
+  // the qoopia_dash cookie's Path scope. They are intercepted BEFORE
+  // handleDashboardApi() because that dispatcher would 404 unknown paths
+  // and is not aware of the OAuth-bridge ones.
+  if (url.startsWith("/api/dashboard/oauth-consent") && method === "GET") {
+    if (rateLimit429(dashboardLimiter, "dashboard", clientIp, res)) return;
+    return handleDashboardOAuthConsentGet(req, res);
+  }
+  if (url === "/api/dashboard/oauth-consent/approve" && method === "POST") {
+    if (rateLimit429(dashboardLimiter, "dashboard", clientIp, res)) return;
+    const body = await readBody(req);
+    return handleDashboardOAuthConsentApprove(req, body, res, clientIp);
+  }
+  if (url === "/api/dashboard/oauth-consent/deny" && method === "POST") {
+    if (rateLimit429(dashboardLimiter, "dashboard", clientIp, res)) return;
+    const body = await readBody(req);
+    return handleDashboardOAuthConsentDeny(req, body, res, clientIp);
+  }
+  if (url === "/api/dashboard/oauth/clients" && method === "POST") {
+    if (rateLimit429(dashboardLimiter, "dashboard", clientIp, res)) return;
+    const body = await readBody(req);
+    return handleDashboardRegisterClient(req, body, res, clientIp);
   }
 
   // --- Dashboard API (read-only, 200 req/min per IP) ---
@@ -604,28 +699,10 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
 
 // ---------- OAuth handlers ----------
 
-/**
- * Check that the request carries the admin secret (Bearer or X-Admin-Secret header).
- * If ADMIN_SECRET is not configured, returns false (deny-by-default).
- */
-function checkAdminSecret(req: IncomingMessage): boolean {
-  if (!env.ADMIN_SECRET) return false;
-  const expected = Buffer.from(env.ADMIN_SECRET);
-  const authHeader = req.headers["authorization"] as string | undefined;
-  if (authHeader) {
-    const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    if (bearer) {
-      const provided = Buffer.from(bearer);
-      if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return true;
-    }
-  }
-  const xSecret = req.headers["x-admin-secret"] as string | undefined;
-  if (xSecret) {
-    const provided = Buffer.from(xSecret);
-    if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return true;
-  }
-  return false;
-}
+// ADR-017: checkAdminSecret() and verifyConsentSecret() are deleted along
+// with the consent HTML form. Approval is brokered through a dashboard-side
+// POST authenticated by the qoopia_dash cookie (per ADR-015), and OAuth
+// client registration is gated on Bearer api_key + steward/claude-priv type.
 
 function parseForm(body: Buffer): Record<string, string> {
   const out: Record<string, string> = {};
@@ -648,17 +725,23 @@ function parseForm(body: Buffer): Record<string, string> {
 }
 
 /**
- * Single-user OAuth flow:
- *  GET /oauth/authorize  →  validate params + show consent HTML.
- *  POST /oauth/authorize →  on approve, issue code (auto-approve since
- *                           the only "user" of this server is the workspace
- *                           owner — no login UI).
+ * ADR-017: GET /oauth/authorize.
  *
- * No agent_key needed: the client must be registered first via
- * POST /oauth/register (RFC 7591). On consent we look up which agent the
- * client belongs to and issue tokens for that agent's workspace.
+ * The /oauth/* surface trusts no browser-carried state beyond an opaque
+ * ticket id. This handler:
+ *   - validates OAuth params + the registered client + the redirect_uri
+ *     allowlist (same as before),
+ *   - snapshots the parameters into a server-side consent_ticket row,
+ *   - 302s the browser to /api/dashboard/oauth-consent?ticket=<id>.
+ *
+ * The dashboard-scoped consent UI then handles cookie auth, workspace
+ * matching, and approval. No HTML is rendered here, no cookies are read.
  */
-async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
+function handleAuthorizeRedirect(
+  req: IncomingMessage,
+  res: ServerResponse,
+  clientIp: string,
+) {
   const u = new URL(req.url || "/", env.PUBLIC_URL);
   const clientId = u.searchParams.get("client_id");
   const redirectUri = u.searchParams.get("redirect_uri");
@@ -695,189 +778,159 @@ async function handleAuthorizeGet(req: IncomingMessage, res: ServerResponse) {
       error_description: "redirect_uri not registered for this client",
     });
   }
-
-  // Generate a one-time nonce that authenticates the consent POST without
-  // requiring the admin secret in the browser form (fix for audit issue #1).
-  pruneNonces();
-  const nonce = crypto.randomUUID();
-  consentNonces.set(nonce, {
-    clientId,
-    redirectUri,
-    codeChallenge,
-    codeChallengeMethod,
-    state,
-    scope,
-    expires: Date.now() + NONCE_TTL_MS,
-  });
-
-  const safeName = escapeHtml(client.name || "Unknown Client");
-  // QRERUN-001: ADMIN_SECRET is required unconditionally (assertOAuthReady
-  // verifies this at startup), so the form always shows the secret field —
-  // no loopback-fallback branch.
-  const ownerSecretField = `
-      <div class="secret">
-        <label for="admin_secret">Admin secret</label>
-        <input type="password" id="admin_secret" name="admin_secret" autocomplete="current-password" required>
-      </div>`;
-  const ownerSecretNote = `<p class="info">Enter the workspace ADMIN_SECRET to confirm you are the owner.</p>`;
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Authorize — Qoopia</title>
-  <style>
-    body { font-family: -apple-system, system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #0a0a0f; color: #e0e0e0; }
-    .card { background: #1a1a2e; border-radius: 16px; padding: 40px; max-width: 420px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
-    .logo { font-size: 32px; margin-bottom: 16px; }
-    h1 { font-size: 20px; margin: 0 0 8px; }
-    .client { color: #7c8aff; font-weight: 600; }
-    .info { color: #888; font-size: 14px; margin: 16px 0 24px; }
-    .info.warn { color: #ffb37c; }
-    .secret { margin: 0 0 20px; text-align: left; }
-    .secret label { display:block; font-size: 12px; color:#888; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 1px; }
-    .secret input { width: 100%; padding: 10px 12px; box-sizing: border-box; border-radius: 8px; border: 1px solid #2a2a3e; background: #0f0f1c; color: #e0e0e0; font-size: 14px; }
-    .actions { display: flex; gap: 12px; justify-content: center; }
-    button { padding: 12px 32px; border-radius: 8px; border: none; font-size: 16px; font-weight: 600; cursor: pointer; }
-    button:hover { opacity: 0.85; }
-    .approve { background: #7c8aff; color: #fff; }
-    .deny { background: #2a2a3e; color: #888; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="logo">🔑</div>
-    <h1>Authorize access</h1>
-    <p><span class="client">${safeName}</span> wants to connect to Qoopia</p>
-    ${ownerSecretNote}
-    <form method="POST" action="/oauth/authorize">
-      <input type="hidden" name="nonce" value="${escapeHtml(nonce)}">${ownerSecretField}
-      <div class="actions">
-        <button type="submit" name="action" value="deny" class="deny">Deny</button>
-        <button type="submit" name="action" value="approve" class="approve">Approve</button>
-      </div>
-    </form>
-  </div>
-</body>
-</html>`;
-  res.writeHead(200, {
-    "content-type": "text/html; charset=utf-8",
-    "cache-control": "no-store",
-    ...securityHeaders(req),
-  });
-  res.end(html);
-}
-
-/**
- * QRERUN-001 (supersedes QSEC-002 loopback fallback): owner consent on
- * /authorize is gated unconditionally on env.ADMIN_SECRET. The previous
- * loopback fallback was unsafe because cloudflared/nginx/Tailscale tunnels
- * present as 127.0.0.1 to the Node socket, so the gate could be bypassed
- * by any tunneled visitor when ADMIN_SECRET was unset.
- *
- * Startup (assertOAuthReady) refuses to register /authorize when
- * ADMIN_SECRET is empty — fail loud, fail closed, no silent dev mode.
- */
-function verifyConsentSecret(formSecret: string | undefined): boolean {
-  if (!env.ADMIN_SECRET) return false;
-  if (!formSecret) return false;
-  const expected = Buffer.from(env.ADMIN_SECRET);
-  const provided = Buffer.from(formSecret);
-  if (provided.length !== expected.length) return false;
-  return crypto.timingSafeEqual(provided, expected);
-}
-
-function handleAuthorizePost(
-  req: IncomingMessage,
-  body: Buffer,
-  res: ServerResponse,
-  clientIp: string,
-) {
-  let form: Record<string, string>;
-  try {
-    form = parseForm(body);
-  } catch {
-    return json(res, 400, { error: "invalid_request", error_description: "malformed form body" });
-  }
-  const action = form.action || "approve";
-  const nonce = form.nonce;
-
-  // Validate one-time nonce — protects against CSRF on the consent form.
-  if (!nonce) {
-    return json(res, 400, { error: "invalid_request", error_description: "Missing nonce" });
-  }
-  pruneNonces();
-  const pending = consentNonces.get(nonce);
-  if (!pending) {
-    return json(res, 400, { error: "invalid_request", error_description: "Invalid or expired nonce" });
-  }
-  // Consume nonce immediately (one-time use)
-  consentNonces.delete(nonce);
-
-  const { clientId, redirectUri, codeChallenge, codeChallengeMethod, state } = pending;
-
-  if (action === "deny") {
-    audit({
-      event: "oauth_consent",
-      result: "deny",
-      ip: clientIp,
-      detail: `client=${clientId} action=deny`,
-    });
-    const url = new URL(redirectUri);
-    url.searchParams.set("error", "access_denied");
-    if (state) url.searchParams.set("state", state);
-    res.writeHead(302, { location: url.toString() });
-    return res.end();
-  }
-
-  // QRERUN-001: ADMIN_SECRET is the sole accepted owner proof. assertOAuthReady()
-  // at startup guarantees env.ADMIN_SECRET is set whenever this handler is
-  // reachable, so we don't need a "secret unset" branch here.
-  if (!verifyConsentSecret(form.admin_secret)) {
-    audit({
-      event: "oauth_consent",
-      result: "deny",
-      ip: clientIp,
-      detail: `client=${clientId} reason=admin_secret_missing_or_invalid`,
-    });
-    return json(res, 401, {
-      error: "access_denied",
-      error_description: "Owner consent required: admin_secret missing or invalid.",
-    });
-  }
-
-  // Resolve client → agent → workspace, issue code
-  const client = getClient(clientId);
-  if (!client) {
-    return json(res, 400, { error: "invalid_client" });
-  }
-  const ws = clientWorkspace(clientId);
-  if (!ws) {
+  if (!client.workspace_id) {
+    // Legacy oauth_clients row that escaped migration 011's backfill.
+    // Refuse rather than silently bind to whatever workspace getClient()
+    // would have inferred — fail-closed per ADR-017 §Migration.
     return json(res, 500, {
       error: "server_error",
-      error_description: "Client has no associated agent",
+      error_description:
+        "OAuth client is not bound to a workspace. Re-register the client.",
     });
   }
 
-  const code = createAuthorizationCode({
+  const ticket = createConsentTicket({
     clientId,
-    agentId: ws.agent_id,
-    workspaceId: ws.workspace_id,
+    workspaceId: client.workspace_id,
+    redirectUri,
     codeChallenge,
     codeChallengeMethod,
-    redirectUri,
+    scope,
+    state,
   });
+
   audit({
     event: "oauth_consent",
     result: "allow",
     ip: clientIp,
-    workspace_id: ws.workspace_id,
-    agent_id: ws.agent_id,
-    detail: `client=${clientId} via=admin_secret`,
+    workspace_id: client.workspace_id,
+    detail: `client=${clientId} ticket_created=${ticket.id}`,
   });
-  const url = new URL(redirectUri);
+
+  const target = new URL("/api/dashboard/oauth-consent", env.PUBLIC_URL);
+  target.searchParams.set("ticket", ticket.id);
+  res.writeHead(302, {
+    location: target.toString(),
+    "cache-control": "no-store",
+  });
+  res.end();
+}
+
+/**
+ * ADR-017: GET /oauth/authorize/finalize?ticket=...
+ *
+ * Reads the consent_ticket, requires it to be approved-but-not-redeemed-and-
+ * not-expired-and-not-denied, atomically marks redeemed=1, emits the OAuth
+ * code, and 302s to client.redirect_uri. Single-use: replaying the URL
+ * returns 400.
+ *
+ * Cookies are NOT read here. The only state trusted is the ticket row,
+ * whose `approved_by_agent_id` was set by the dashboard-side approve POST.
+ */
+function handleAuthorizeFinalize(
+  req: IncomingMessage,
+  res: ServerResponse,
+  clientIp: string,
+) {
+  const u = new URL(req.url || "/", env.PUBLIC_URL);
+  const ticketId = u.searchParams.get("ticket") || "";
+  if (!ticketId) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "Missing ticket parameter",
+    });
+  }
+  const ticket = getConsentTicket(ticketId);
+  if (!ticket) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "ticket not found",
+    });
+  }
+  if (ticket.redeemed) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "ticket already redeemed",
+    });
+  }
+  if (ticket.denied) {
+    return json(res, 400, {
+      error: "access_denied",
+      error_description: "ticket denied",
+    });
+  }
+  if (ticket.expires_at <= nowIsoUtc()) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "ticket expired",
+    });
+  }
+  if (!ticket.approved_by_agent_id) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "ticket not approved",
+    });
+  }
+  const client = getClient(ticket.client_id);
+  if (!client) {
+    return json(res, 400, { error: "invalid_client" });
+  }
+  // Defense-in-depth: re-verify workspace match between the approving
+  // agent and the ticket. If somehow they diverged (e.g. agent moved
+  // workspaces), refuse rather than mint a cross-workspace token.
+  const ws = clientWorkspace(ticket.client_id);
+  if (!ws) {
+    return json(res, 500, {
+      error: "server_error",
+      error_description: "Client has no associated active agent",
+    });
+  }
+  if (ws.workspace_id !== ticket.workspace_id) {
+    audit({
+      event: "workspace_mismatch",
+      result: "deny",
+      ip: clientIp,
+      workspace_id: ticket.workspace_id,
+      agent_id: ticket.approved_by_agent_id,
+      detail: `finalize: ticket workspace ${ticket.workspace_id} != client workspace ${ws.workspace_id}`,
+    });
+    return json(res, 500, {
+      error: "server_error",
+      error_description: "ticket/client workspace mismatch",
+    });
+  }
+
+  // Atomic redeem; fails if a parallel request already redeemed.
+  if (!redeemConsentTicket(ticket.id)) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "ticket already redeemed",
+    });
+  }
+
+  const code = createAuthorizationCode({
+    clientId: ticket.client_id,
+    // Bind the OAuth code to the *approving* agent's id so the resulting
+    // token is workspace-scoped to the operator who approved (ADR-017 §4).
+    agentId: ticket.approved_by_agent_id,
+    workspaceId: ticket.workspace_id,
+    codeChallenge: ticket.code_challenge,
+    codeChallengeMethod: ticket.code_challenge_method,
+    redirectUri: ticket.redirect_uri,
+  });
+
+  audit({
+    event: "oauth_consent",
+    result: "allow",
+    ip: clientIp,
+    workspace_id: ticket.workspace_id,
+    agent_id: ticket.approved_by_agent_id,
+    detail: `client=${ticket.client_id} ticket=${ticket.id} finalized`,
+  });
+
+  const url = new URL(ticket.redirect_uri);
   url.searchParams.set("code", code);
-  if (state) url.searchParams.set("state", state);
+  if (ticket.state) url.searchParams.set("state", ticket.state);
   res.writeHead(302, {
     location: url.toString(),
     "cache-control": "no-store",
@@ -885,7 +938,11 @@ function handleAuthorizePost(
   res.end();
 }
 
-function handleRegister(body: Buffer, res: ServerResponse) {
+function handleRegister(
+  body: Buffer,
+  res: ServerResponse,
+  auth: AuthContext,
+) {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(body.toString("utf8"));
@@ -896,16 +953,19 @@ function handleRegister(body: Buffer, res: ServerResponse) {
     });
   }
   try {
-    const out = registerClient({
-      client_name: parsed.client_name as string | undefined,
-      redirect_uris: parsed.redirect_uris as string[],
-      token_endpoint_auth_method:
-        parsed.token_endpoint_auth_method as string | undefined,
-      grant_types: parsed.grant_types as string[] | undefined,
-      response_types: parsed.response_types as string[] | undefined,
-    });
+    const out = registerClient(
+      {
+        client_name: parsed.client_name as string | undefined,
+        redirect_uris: parsed.redirect_uris as string[],
+        token_endpoint_auth_method:
+          parsed.token_endpoint_auth_method as string | undefined,
+        grant_types: parsed.grant_types as string[] | undefined,
+        response_types: parsed.response_types as string[] | undefined,
+      },
+      auth,
+    );
     logger.info(
-      `OAuth register client_id=${out.client_id} name="${out.client_name}" auth=${out.token_endpoint_auth_method}`,
+      `OAuth register client_id=${out.client_id} name="${out.client_name}" auth=${out.token_endpoint_auth_method} workspace=${auth.workspace_id}`,
     );
     res.writeHead(201, {
       "content-type": "application/json",
@@ -924,6 +984,432 @@ function handleRegister(body: Buffer, res: ServerResponse) {
       error_description: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+// nowIsoUtc trims sub-second precision to align with `nowIso()` in
+// auth/oauth.ts so SQL string compares (`expires_at <= ?`) match.
+function nowIsoUtc(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+// ---------- Dashboard-scoped OAuth consent bridge (ADR-017) ----------
+
+function escapeHtmlSafe(s: string): string {
+  return escapeHtml(s);
+}
+
+/**
+ * GET /api/dashboard/oauth-consent?ticket=<id>
+ *
+ * The browser was 302'd here from /oauth/authorize. The dashboard cookie
+ * auto-attaches because the path is /api/dashboard/*. We:
+ *   - look up the ticket; reject if missing/expired/finalized,
+ *   - require a verified dashboard cookie (no Bearer fallback) — the
+ *     primary user is a browser session,
+ *   - check cookie.workspace_id === ticket.workspace_id; mismatch renders
+ *     a "wrong workspace" page with no approve button,
+ *   - else rotate `approve_nonce` and render the consent UI.
+ */
+function handleDashboardOAuthConsentGet(
+  req: IncomingMessage,
+  res: ServerResponse,
+) {
+  const u = new URL(req.url || "/", env.PUBLIC_URL);
+  const ticketId = u.searchParams.get("ticket") || "";
+  if (!ticketId) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "Missing ticket parameter",
+    });
+  }
+  const ticket = getConsentTicket(ticketId);
+  const status = consentTicketStatus(ticket);
+  if (status === "not_found") {
+    return json(res, 404, {
+      error: "not_found",
+      error_description: "ticket not found",
+    });
+  }
+  if (status !== "ok") {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: `ticket ${status}`,
+    });
+  }
+
+  const auth = checkDashboardAuth(req);
+  if (!auth) {
+    // Not logged into dashboard → bounce through /dashboard?next=...
+    const next = `/api/dashboard/oauth-consent?ticket=${encodeURIComponent(ticketId)}`;
+    const target = `/dashboard?next=${encodeURIComponent(next)}`;
+    res.writeHead(302, { location: target, "cache-control": "no-store" });
+    return res.end();
+  }
+
+  const t = ticket!;
+  const client = getClient(t.client_id);
+  const safeClientName = escapeHtmlSafe(client?.name || "Unknown client");
+
+  const sharedCss = `
+    body { font-family: -apple-system, system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #0a0a0f; color: #e0e0e0; }
+    .card { background: #1a1a2e; border-radius: 16px; padding: 40px; max-width: 480px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+    .logo { font-size: 32px; margin-bottom: 16px; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    .client { color: #7c8aff; font-weight: 600; }
+    .info { color: #888; font-size: 14px; margin: 16px 0 24px; }
+    .info.warn { color: #ffb37c; }
+    .actions { display: flex; gap: 12px; justify-content: center; margin-top: 16px; }
+    button, .btn { padding: 12px 32px; border-radius: 8px; border: none; font-size: 16px; font-weight: 600; cursor: pointer; }
+    .approve { background: #7c8aff; color: #fff; }
+    .deny { background: #2a2a3e; color: #888; }
+    form { display: inline; }
+  `;
+
+  if (auth.workspace_id !== t.workspace_id) {
+    audit({
+      event: "workspace_mismatch",
+      result: "deny",
+      workspace_id: auth.workspace_id,
+      agent_id: auth.agent_id,
+      detail: `oauth-consent GET cookie=${auth.workspace_id} ticket=${t.workspace_id}`,
+    });
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Wrong workspace — Qoopia</title>
+  <style>${sharedCss}</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">⛔</div>
+    <h1>Wrong workspace</h1>
+    <p class="info warn">You are signed in to one workspace, but <span class="client">${safeClientName}</span> belongs to a different workspace.</p>
+    <p class="info">Sign out, then sign in as the agent that registered this connector.</p>
+  </div>
+</body>
+</html>`;
+    res.writeHead(403, {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      ...securityHeaders(req),
+    });
+    return res.end(html);
+  }
+
+  // Match — rotate the approve_nonce so each render gets a fresh value.
+  const fresh = rotateConsentNonce(t.id);
+  if (!fresh) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "ticket no longer in-flight",
+    });
+  }
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorize — Qoopia</title>
+  <style>${sharedCss}</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">🔑</div>
+    <h1>Authorize access</h1>
+    <p><span class="client">${safeClientName}</span> wants to connect to your workspace.</p>
+    <p class="info">Approving will let this client read and act through your agent.</p>
+    <div class="actions">
+      <form method="POST" action="/api/dashboard/oauth-consent/deny">
+        <input type="hidden" name="ticket" value="${escapeHtmlSafe(t.id)}">
+        <input type="hidden" name="nonce" value="${escapeHtmlSafe(fresh)}">
+        <button type="submit" class="deny">Deny</button>
+      </form>
+      <form method="POST" action="/api/dashboard/oauth-consent/approve">
+        <input type="hidden" name="ticket" value="${escapeHtmlSafe(t.id)}">
+        <input type="hidden" name="nonce" value="${escapeHtmlSafe(fresh)}">
+        <button type="submit" class="approve">Approve</button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>`;
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    ...securityHeaders(req),
+  });
+  res.end(html);
+}
+
+/**
+ * POST /api/dashboard/oauth-consent/approve
+ *
+ * Cookie auth + Origin/Referer match + nonce one-time consume + workspace
+ * re-check (defense in depth even though the GET hides the button on
+ * mismatch). On success, marks ticket approved by cookie.agent_id and 302s
+ * to /oauth/authorize/finalize?ticket=...
+ */
+function handleDashboardOAuthConsentApprove(
+  req: IncomingMessage,
+  body: Buffer,
+  res: ServerResponse,
+  clientIp: string,
+) {
+  if (!dashboardOriginAllowed(req)) {
+    return json(res, 403, {
+      error: "forbidden",
+      error_description: "Origin not allowed.",
+    });
+  }
+  let form: Record<string, string>;
+  try {
+    form = parseForm(body);
+  } catch {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "malformed form body",
+    });
+  }
+  const ticketId = form.ticket || "";
+  const nonce = form.nonce || "";
+  if (!ticketId || !nonce) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "ticket and nonce required",
+    });
+  }
+
+  const auth = checkDashboardAuth(req);
+  if (!auth) {
+    return json(res, 401, {
+      error: "unauthorized",
+      error_description: "Dashboard session required.",
+    });
+  }
+  const ticket = getConsentTicket(ticketId);
+  const status = consentTicketStatus(ticket);
+  if (status === "not_found") {
+    return json(res, 404, {
+      error: "not_found",
+      error_description: "ticket not found",
+    });
+  }
+  if (status !== "ok") {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: `ticket ${status}`,
+    });
+  }
+  if (auth.workspace_id !== ticket!.workspace_id) {
+    audit({
+      event: "workspace_mismatch",
+      result: "deny",
+      ip: clientIp,
+      workspace_id: auth.workspace_id,
+      agent_id: auth.agent_id,
+      detail: `oauth-consent approve cookie=${auth.workspace_id} ticket=${ticket!.workspace_id}`,
+    });
+    return json(res, 403, {
+      error: "forbidden",
+      error_description: "Workspace mismatch.",
+    });
+  }
+
+  // Atomic single-use nonce consume.
+  if (!consumeConsentNonce(ticket!.id, nonce)) {
+    return json(res, 403, {
+      error: "forbidden",
+      error_description: "Invalid or expired nonce.",
+    });
+  }
+
+  if (!approveConsentTicket(ticket!.id, auth.agent_id)) {
+    // Lost the race — ticket was approved/denied/redeemed/expired between
+    // status check and approve.
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "ticket no longer in-flight",
+    });
+  }
+
+  audit({
+    event: "oauth_consent",
+    result: "allow",
+    ip: clientIp,
+    workspace_id: auth.workspace_id,
+    agent_id: auth.agent_id,
+    detail: `client=${ticket!.client_id} ticket=${ticket!.id} approved`,
+  });
+
+  const target = new URL("/oauth/authorize/finalize", env.PUBLIC_URL);
+  target.searchParams.set("ticket", ticket!.id);
+  res.writeHead(302, {
+    location: target.toString(),
+    "cache-control": "no-store",
+  });
+  res.end();
+}
+
+/**
+ * POST /api/dashboard/oauth-consent/deny
+ *
+ * Cookie auth + Origin + nonce. Sets denied=1; 302s to client.redirect_uri
+ * with error=access_denied&state=... so the OAuth client sees a clean RFC
+ * 6749 §4.1.2.1 deny.
+ */
+function handleDashboardOAuthConsentDeny(
+  req: IncomingMessage,
+  body: Buffer,
+  res: ServerResponse,
+  clientIp: string,
+) {
+  if (!dashboardOriginAllowed(req)) {
+    return json(res, 403, {
+      error: "forbidden",
+      error_description: "Origin not allowed.",
+    });
+  }
+  let form: Record<string, string>;
+  try {
+    form = parseForm(body);
+  } catch {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "malformed form body",
+    });
+  }
+  const ticketId = form.ticket || "";
+  const nonce = form.nonce || "";
+  if (!ticketId || !nonce) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "ticket and nonce required",
+    });
+  }
+  const auth = checkDashboardAuth(req);
+  if (!auth) {
+    return json(res, 401, {
+      error: "unauthorized",
+      error_description: "Dashboard session required.",
+    });
+  }
+  const ticket = getConsentTicket(ticketId);
+  const status = consentTicketStatus(ticket);
+  if (status === "not_found") {
+    return json(res, 404, {
+      error: "not_found",
+      error_description: "ticket not found",
+    });
+  }
+  if (status !== "ok") {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: `ticket ${status}`,
+    });
+  }
+  if (auth.workspace_id !== ticket!.workspace_id) {
+    return json(res, 403, {
+      error: "forbidden",
+      error_description: "Workspace mismatch.",
+    });
+  }
+  if (!consumeConsentNonce(ticket!.id, nonce)) {
+    return json(res, 403, {
+      error: "forbidden",
+      error_description: "Invalid or expired nonce.",
+    });
+  }
+  if (!denyConsentTicket(ticket!.id)) {
+    return json(res, 400, {
+      error: "invalid_request",
+      error_description: "ticket no longer in-flight",
+    });
+  }
+  audit({
+    event: "oauth_consent",
+    result: "deny",
+    ip: clientIp,
+    workspace_id: auth.workspace_id,
+    agent_id: auth.agent_id,
+    detail: `client=${ticket!.client_id} ticket=${ticket!.id} denied`,
+  });
+
+  const url = new URL(ticket!.redirect_uri);
+  url.searchParams.set("error", "access_denied");
+  if (ticket!.state) url.searchParams.set("state", ticket!.state);
+  res.writeHead(302, {
+    location: url.toString(),
+    "cache-control": "no-store",
+  });
+  res.end();
+}
+
+/**
+ * POST /api/dashboard/oauth/clients
+ *
+ * Browser-initiated client registration. Cookie auth required; delegates to
+ * registerClient() with the cookie's AuthContext. Pure ergonomic shim — same
+ * steward/claude-priv check as /oauth/register.
+ */
+function handleDashboardRegisterClient(
+  req: IncomingMessage,
+  body: Buffer,
+  res: ServerResponse,
+  clientIp: string,
+) {
+  if (!dashboardOriginAllowed(req)) {
+    return json(res, 403, {
+      error: "forbidden",
+      error_description: "Origin not allowed.",
+    });
+  }
+  const dauth = checkDashboardAuth(req);
+  if (!dauth) {
+    return json(res, 401, {
+      error: "unauthorized",
+      error_description: "Dashboard session required.",
+    });
+  }
+  // Build a minimal AuthContext to feed registerClient. We only need
+  // {agent_id, workspace_id, type} for the registerClient + assertCanRegister
+  // path — the dashboard cookie auth carries exactly those fields.
+  const auth: AuthContext = {
+    agent_id: dauth.agent_id,
+    agent_name: "",
+    workspace_id: dauth.workspace_id,
+    type: dauth.type,
+    source: "api-key",
+  };
+  try {
+    assertCanRegisterOAuth(auth);
+  } catch (err) {
+    if (err instanceof QoopiaError && err.code === "FORBIDDEN") {
+      audit({
+        event: "oauth_register",
+        result: "deny",
+        ip: clientIp,
+        workspace_id: auth.workspace_id,
+        agent_id: auth.agent_id,
+        detail: `dashboard register: agent type=${auth.type}`,
+      });
+      return json(res, 403, {
+        error: "forbidden",
+        error_description: err.message,
+      });
+    }
+    throw err;
+  }
+  audit({
+    event: "oauth_register",
+    result: "allow",
+    ip: clientIp,
+    workspace_id: auth.workspace_id,
+    agent_id: auth.agent_id,
+    detail: "via dashboard",
+  });
+  return handleRegister(body, res, auth);
 }
 
 function jsonToken(res: ServerResponse, status: number, body: unknown) {
