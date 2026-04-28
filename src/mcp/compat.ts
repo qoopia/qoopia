@@ -162,7 +162,8 @@ function buildProjectMetadata(args: Record<string, unknown>) {
 }
 
 // Build V2-style "create" → routes by entity discriminator
-function v2Create(args: Record<string, unknown>, auth: AuthContext) {
+// QSA-C: exported for direct unit testing of the admin-only activity gate.
+export function v2Create(args: Record<string, unknown>, auth: AuthContext) {
   const entity = String(args.entity || "");
   switch (entity) {
     case "tasks": {
@@ -227,6 +228,18 @@ function v2Create(args: Record<string, unknown>, auth: AuthContext) {
       });
     }
     case "activity": {
+      // QSA-C / Codex QSA-002 (2026-04-28): activity is the audit log.
+      // Allowing any full-profile agent to forge entries (arbitrary action,
+      // entity_type, entity_id, summary, details) destroys integrity. The
+      // V2 compat 'create activity' is therefore restricted to admin types
+      // (steward / claude-privileged); standard agents must use the
+      // workspace tools that emit activity through the service layer.
+      if (!isAdmin(auth)) {
+        throw new QoopiaError(
+          "FORBIDDEN",
+          "compat 'create activity' is admin-only — standard agents emit activity implicitly via note_create/update/delete",
+        );
+      }
       const id = logActivity({
         workspace_id: auth.workspace_id,
         agent_id: auth.agent_id,
