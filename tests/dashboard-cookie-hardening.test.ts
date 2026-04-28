@@ -440,21 +440,56 @@ describe("QDASHCOOKIE-#35: logout cookie attributes and replay semantics", () =>
     expect(sc).toContain("Max-Age=0");
   });
 
-  test("replay after logout: stateless cookie still works (documented in ADR-015)", async () => {
-    // This test pins ADR-015's documented semantics: logout clears the
-    // browser's cookie copy only, and the signed value remains valid
-    // until rotation / deactivation / session-secret rotation / expiry.
-    // If we ever introduce a server-side revocation list, this test
-    // should be updated deliberately, not silently.
+  test("replay after logout: cookie is revoked server-side (QSA-E)", async () => {
+    // QSA-E / Codex QSA-005 (2026-04-28): logout now bumps the agent's
+    // session_version, so any copy of the pre-logout cookie fails the
+    // sv check and gets 401 on its next request. Previously the
+    // stateless cookie remained valid until rotation/deactivation/
+    // session-secret rotation/expiry — see ADR-015 update.
     const { cookieValue } = await login();
 
-    // logout (server-side stateless — does nothing to the value).
-    await fetch(`${baseUrl}/api/dashboard/logout`, { method: "POST" });
+    // Authenticated logout: send the cookie so the server can identify
+    // the agent and bump session_version. (The browser does this
+    // automatically because the logout button lives behind the same
+    // cookie scope.)
+    const lr = await fetch(`${baseUrl}/api/dashboard/logout`, {
+      method: "POST",
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(cookieValue)}` },
+    });
+    expect(lr.status).toBe(200);
 
     const replay = await fetch(`${baseUrl}/api/dashboard/agents`, {
       headers: { cookie: `qoopia_dash=${encodeURIComponent(cookieValue)}` },
     });
-    expect(replay.status).toBe(200);
+    expect(replay.status).toBe(401);
+  });
+
+  test("logout without cookie: still 200 and idempotent (no agent to revoke)", async () => {
+    // Idempotence: calling /logout with no cookie must remain a 200 so
+    // the browser logout flow stays smooth even on stale state.
+    const r = await fetch(`${baseUrl}/api/dashboard/logout`, {
+      method: "POST",
+    });
+    expect(r.status).toBe(200);
+  });
+
+  test("logout with tampered cookie: still 200, no other agent affected", async () => {
+    // If the cookie can't be verified, we can't identify the agent and
+    // therefore must not bump anyone's session_version.
+    const { cookieValue: legitCookie } = await login();
+
+    // Send garbage cookie — server can't verify it; should not affect
+    // the legit cookie's validity.
+    const lr = await fetch(`${baseUrl}/api/dashboard/logout`, {
+      method: "POST",
+      headers: { cookie: "qoopia_dash=tampered.value.here" },
+    });
+    expect(lr.status).toBe(200);
+
+    const probe = await fetch(`${baseUrl}/api/dashboard/agents`, {
+      headers: { cookie: `qoopia_dash=${encodeURIComponent(legitCookie)}` },
+    });
+    expect(probe.status).toBe(200);
   });
 });
 
