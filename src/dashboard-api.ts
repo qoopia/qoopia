@@ -77,6 +77,17 @@ export interface DashboardAuth {
   agent_id: string;
   type: string;
   isAdmin: boolean;
+  /**
+   * Codex QSA-H (2026-04-28): how this dashboard auth was established.
+   * - "api-key": static Bearer api_* (curl, scripts, login flow, tests)
+   * - "oauth": OAuth access token reaching the dashboard via the Bearer fallback
+   * - "cookie": signed qoopia_dash session (the browser dashboard)
+   *
+   * The OAuth bridge consent surface uses this to fail closed on OAuth tokens —
+   * otherwise an OAuth bearer could fetch the consent page, read the nonce, and
+   * self-approve new tickets, defeating the whole bridge pattern.
+   */
+  source: "api-key" | "oauth" | "cookie";
 }
 
 /** Parse a Cookie header into a name→value map. Empty/missing → {}. */
@@ -340,6 +351,7 @@ function authFromSessionCookie(req: IncomingMessage): DashboardAuth | null {
     agent_id: row.id,
     type: row.type,
     isAdmin: ADMIN_TYPES.has(row.type),
+    source: "cookie",
   };
 }
 
@@ -363,6 +375,9 @@ export function checkDashboardAuth(req: IncomingMessage): DashboardAuth | null {
       agent_id: auth.agent_id,
       type: auth.type,
       isAdmin: ADMIN_TYPES.has(auth.type),
+      // QSA-H: propagate underlying source so OAuth-sensitive surfaces
+      // (the consent bridge) can fail closed on OAuth bearers.
+      source: auth.source,
     };
   }
   // No Authorization header — fall back to the signed session cookie.
@@ -378,7 +393,7 @@ export function checkDashboardAuth(req: IncomingMessage): DashboardAuth | null {
  * forcing CSRF tokens on a non-browser caller would just push people back
  * onto the cookie path we are trying to harden.
  */
-function originAllowed(req: IncomingMessage): boolean {
+export function originAllowed(req: IncomingMessage): boolean {
   const origin = (req.headers["origin"] as string | undefined) || "";
   const referer = (req.headers["referer"] as string | undefined) || "";
   if (!origin && !referer) return true;
@@ -478,6 +493,7 @@ function loginHandler(req: IncomingMessage, res: ServerResponse) {
     agent_id: auth.agent_id,
     type: auth.type,
     isAdmin: ADMIN_TYPES.has(auth.type),
+    source: auth.source,
   };
   // QDASHCOOKIE-005: read api_key_hash AND session_version in one SELECT,
   // then constant-time-compare the row's hash to sha256(presented bearer).

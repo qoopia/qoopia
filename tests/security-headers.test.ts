@@ -4,7 +4,10 @@
  * surfaces in the server:
  *
  *   1. GET /dashboard — the dashboard page.
- *   2. GET /oauth/authorize — the OAuth consent page.
+ *   2. GET /api/dashboard/oauth-consent — the OAuth consent page (under
+ *      ADR-017 the OAuth consent UI lives on the dashboard surface; the
+ *      legacy GET /oauth/authorize is now a thin 302 redirect with no
+ *      HTML body so it does not need CSP).
  *
  * The plain-http test loopback CANNOT exercise HSTS — Strict-Transport-
  * Security must only be emitted on HTTPS, and the test server is plain
@@ -35,6 +38,8 @@ import { nowIso } from "../src/utils/errors.ts";
 let server: Server;
 let baseUrl = "";
 let CLIENT_ID = "";
+let AGENT_KEY = "";
+let TICKET_ID = "";
 const REDIRECT_URI = "https://example.com/cb";
 
 beforeAll(async () => {
@@ -46,18 +51,23 @@ beforeAll(async () => {
   const agent = createAgent({
     name: "qsa-g-target",
     workspaceSlug: ws.slug,
+    type: "steward",
   });
+  AGENT_KEY = agent.api_key;
 
-  // Register a public OAuth client directly via SQL — same pattern as
-  // oauth-consent.test.ts to avoid the multi-workspace guard.
+  // ADR-017: oauth_clients carries workspace_id directly. We INSERT here
+  // (instead of going through registerClient) to keep this test focused
+  // on CSP — the registration path is exercised by oauth-register.test.
   CLIENT_ID = `qc_${crypto.randomBytes(16).toString("base64url")}`;
   db.prepare(
-    `INSERT INTO oauth_clients (id, name, agent_id, client_secret_hash, redirect_uris, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO oauth_clients
+       (id, name, agent_id, workspace_id, client_secret_hash, redirect_uris, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     CLIENT_ID,
     "qsa-g-test",
     agent.id,
+    ws.id,
     "",
     JSON.stringify([REDIRECT_URI]),
     nowIso(),
@@ -70,6 +80,20 @@ beforeAll(async () => {
   });
   const addr = server.address() as AddressInfo;
   baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  // Mint a consent_ticket so the consent UI has something to render. We
+  // hit /oauth/authorize as the friend would; the redirect carries the
+  // ticket id.
+  const url = new URL(`${baseUrl}/oauth/authorize`);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("client_id", CLIENT_ID);
+  url.searchParams.set("redirect_uri", REDIRECT_URI);
+  url.searchParams.set("code_challenge", "x".repeat(43));
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("state", "csp");
+  const r = await fetch(url.toString(), { redirect: "manual" });
+  const loc = r.headers.get("location") || "";
+  TICKET_ID = new URL(loc, baseUrl).searchParams.get("ticket") || "";
 });
 
 afterAll(async () => {
@@ -125,29 +149,29 @@ describe("QSA-G / Codex QSA-007: dashboard CSP + HSTS-on-https", () => {
 });
 
 describe("QSA-G / Codex QSA-007: OAuth consent page CSP", () => {
-  test("GET /oauth/authorize returns hardened CSP", async () => {
-    const url = new URL(`${baseUrl}/oauth/authorize`);
-    url.searchParams.set("response_type", "code");
-    url.searchParams.set("client_id", CLIENT_ID);
-    url.searchParams.set("redirect_uri", REDIRECT_URI);
-    url.searchParams.set("code_challenge", "x".repeat(43));
-    url.searchParams.set("code_challenge_method", "S256");
-    url.searchParams.set("state", "s1");
-    const r = await fetch(url.toString());
+  test("GET /api/dashboard/oauth-consent returns hardened CSP", async () => {
+    expect(TICKET_ID).not.toBe("");
+    const r = await fetch(
+      `${baseUrl}/api/dashboard/oauth-consent?ticket=${encodeURIComponent(TICKET_ID)}`,
+      {
+        headers: { authorization: `Bearer ${AGENT_KEY}` },
+        redirect: "manual",
+      },
+    );
     expect(r.status).toBe(200);
     expect(r.headers.get("content-type") || "").toContain("text/html");
     expectHardenedCsp(r.headers.get("content-security-policy"));
   });
 
-  test("GET /oauth/authorize does NOT emit HSTS on plain http", async () => {
-    const url = new URL(`${baseUrl}/oauth/authorize`);
-    url.searchParams.set("response_type", "code");
-    url.searchParams.set("client_id", CLIENT_ID);
-    url.searchParams.set("redirect_uri", REDIRECT_URI);
-    url.searchParams.set("code_challenge", "x".repeat(43));
-    url.searchParams.set("code_challenge_method", "S256");
-    url.searchParams.set("state", "s2");
-    const r = await fetch(url.toString());
+  test("GET /api/dashboard/oauth-consent does NOT emit HSTS on plain http", async () => {
+    expect(TICKET_ID).not.toBe("");
+    const r = await fetch(
+      `${baseUrl}/api/dashboard/oauth-consent?ticket=${encodeURIComponent(TICKET_ID)}`,
+      {
+        headers: { authorization: `Bearer ${AGENT_KEY}` },
+        redirect: "manual",
+      },
+    );
     expect(r.headers.get("strict-transport-security")).toBeNull();
   });
 });
