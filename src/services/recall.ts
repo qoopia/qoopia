@@ -48,11 +48,14 @@ export interface RecallParams {
   is_admin: boolean;
   query: string;
   limit?: number;
-  scope?: "notes" | "activity" | "all";
+  scope?: "notes" | "activity" | "sessions" | "all";
   type?: string;
   project_id?: string;
   cross_workspace?: boolean;
   privileged?: boolean;
+  /** Include notes whose metadata.status = 'archived'. Default false — archived
+   *  rows are hidden from recall to keep results focused on live state. */
+  include_archived?: boolean;
 }
 
 export function recall(p: RecallParams) {
@@ -60,6 +63,7 @@ export function recall(p: RecallParams) {
   const sanitized = sanitizeFtsQuery(p.query);
   const scope = p.scope || "notes";
   const canCrossWorkspace = !!(p.cross_workspace && p.privileged);
+  const includeArchived = !!p.include_archived;
 
   const results: Array<{
     id: string;
@@ -70,6 +74,7 @@ export function recall(p: RecallParams) {
     created_at: string;
     workspace_id: string;
     rank: number;
+    source?: "notes" | "activity" | "sessions";
   }> = [];
 
   let tokensReturned = 0;
@@ -92,6 +97,11 @@ export function recall(p: RecallParams) {
     if (p.project_id) {
       where.push(`n.project_id = ?`);
       params.push(p.project_id);
+    }
+    if (!includeArchived) {
+      // Default: hide archived notes from recall. Caller can opt back in
+      // via include_archived=true (used by audit/cleanup tooling).
+      where.push(`(json_extract(n.metadata, '$.status') IS NULL OR json_extract(n.metadata, '$.status') != 'archived')`);
     }
 
     const sql = `
@@ -124,29 +134,33 @@ export function recall(p: RecallParams) {
         created_at: r.created_at,
         workspace_id: r.workspace_id,
         rank: r.rank,
+        source: "notes",
       });
       tokensReturned += Math.ceil(r.text.length / 4);
     }
   }
 
   if (scope === "activity" || scope === "all") {
-    // Activity has no FTS5 (Phase 2 Finding 7) — we do a LIKE fallback on
-    // `summary` for small scale. For 2k rows this is fine.
-    const where: string[] = [`summary LIKE ?`];
-    const params: any[] = [`%${p.query.slice(0, 100)}%`];
+    // Migration 009 added activity_fts (mirrors notes_fts pattern).
+    // FTS5 MATCH replaces the old `summary LIKE ?` fallback that
+    // started to slow down past ~2k rows.
+    const where: string[] = [`activity_fts MATCH ?`];
+    const params: any[] = [sanitized];
     if (!canCrossWorkspace) {
-      where.push(`workspace_id = ?`);
+      where.push(`a.workspace_id = ?`);
       params.push(p.workspace_id);
     }
     // QTHIRD-001: hide activity rows tied to sibling private notes.
     // Admin types and the owner agent still see them.
-    where.push(`(visibility = 'workspace' OR agent_id = ? OR ? = 1)`);
+    where.push(`(a.visibility = 'workspace' OR a.agent_id = ? OR ? = 1)`);
     params.push(p.caller_agent_id, p.is_admin ? 1 : 0);
     const sql = `
-      SELECT id, 'activity' as type, summary as text, details as metadata, project_id, created_at, workspace_id, 0 as rank
-      FROM activity
+      SELECT a.id, 'activity' as type, a.summary as text, a.details as metadata,
+             a.project_id, a.created_at, a.workspace_id, rank
+      FROM activity_fts f
+      JOIN activity a ON a.rowid = f.rowid
       WHERE ${where.join(" AND ")}
-      ORDER BY created_at DESC
+      ORDER BY rank
       LIMIT ?
     `;
     const rows = db.prepare(sql).all(...params, limit) as Array<{
@@ -169,6 +183,64 @@ export function recall(p: RecallParams) {
         created_at: r.created_at,
         workspace_id: r.workspace_id,
         rank: r.rank,
+        source: "activity",
+      });
+      tokensReturned += Math.ceil(r.text.length / 4);
+    }
+  }
+
+  if (scope === "sessions" || scope === "all") {
+    // session_messages_fts has existed since 001-initial-schema.sql but
+    // was not previously wired into recall(). Closes the "shared memory
+    // layer" gap where conversation content was findable only via the
+    // dashboard / session_search and not from agent recall().
+    //
+    // Visibility: messages are tied to sessions (workspace-scoped) and
+    // tagged with agent_id. We surface only the caller's own messages
+    // unless is_admin (steward/audit). This matches the private-note
+    // boundary policy.
+    const where: string[] = [`session_messages_fts MATCH ?`];
+    const params: any[] = [sanitized];
+    if (!canCrossWorkspace) {
+      where.push(`m.workspace_id = ?`);
+      params.push(p.workspace_id);
+    }
+    where.push(`(m.agent_id = ? OR ? = 1)`);
+    params.push(p.caller_agent_id, p.is_admin ? 1 : 0);
+    const sql = `
+      SELECT m.id, m.role as type, m.content as text, m.metadata, NULL as project_id,
+             m.created_at, m.workspace_id, m.session_id, rank
+      FROM session_messages_fts f
+      JOIN session_messages m ON m.id = f.rowid
+      WHERE ${where.join(" AND ")}
+      ORDER BY rank
+      LIMIT ?
+    `;
+    const rows = db.prepare(sql).all(...params, limit) as Array<{
+      id: number;
+      type: string;
+      text: string;
+      metadata: string;
+      project_id: null;
+      created_at: string;
+      workspace_id: string;
+      session_id: string;
+      rank: number;
+    }>;
+    for (const r of rows) {
+      const metadata = safeJsonParse(r.metadata, {} as Record<string, unknown>);
+      // Surface session_id alongside the message so callers can drill in.
+      (metadata as Record<string, unknown>).session_id = r.session_id;
+      results.push({
+        id: String(r.id),
+        type: `session_message:${r.type}`,
+        text: r.text,
+        metadata,
+        project_id: null,
+        created_at: r.created_at,
+        workspace_id: r.workspace_id,
+        rank: r.rank,
+        source: "sessions",
       });
       tokensReturned += Math.ceil(r.text.length / 4);
     }

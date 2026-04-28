@@ -385,6 +385,7 @@ function v2List(args: Record<string, unknown>, auth: AuthContext) {
     type,
     project_id: args.project_id as string | undefined,
     status: args.status as string | undefined,
+    include_archived: Boolean(args.include_archived),
     limit,
   });
 }

@@ -298,6 +298,57 @@ export async function install(opts: InstallOpts = {}) {
     );
   }
 
+  // 6b. archive-stale weekly cron (qsearch-lifecycle PR).
+  // Best-effort: failure here does NOT abort install — the main MCP
+  // service is what matters. Operator can re-run install or manually
+  // load the plist later.
+  try {
+    const archivePlistTemplatePath = path.join(
+      PROJECT_ROOT,
+      "templates/com.qoopia.archive-stale.plist",
+    );
+    if (fs.existsSync(archivePlistTemplatePath)) {
+      const archivePlistTemplate = fs.readFileSync(
+        archivePlistTemplatePath,
+        "utf8",
+      );
+      const archivePlist = archivePlistTemplate
+        .replace(/{{BUN_PATH}}/g, bunPath)
+        .replace(/{{WORKING_DIR}}/g, PROJECT_ROOT)
+        .replace(/{{QOOPIA_DATA_DIR}}/g, env.DATA_DIR)
+        .replace(/{{LOG_DIR}}/g, env.LOG_DIR);
+      const archivePlistPath = path.join(
+        plistDir,
+        "com.qoopia.archive-stale.plist",
+      );
+      fs.writeFileSync(archivePlistPath, archivePlist, "utf8");
+      // No embedded secrets in this plist, but match owner-only perms
+      // for consistency with com.qoopia.mcp.plist.
+      try {
+        fs.chmodSync(archivePlistPath, 0o600);
+      } catch (err) {
+        console.warn(
+          `⚠ chmod 0600 on ${archivePlistPath} failed: ${(err as Error).message}`,
+        );
+      }
+      try {
+        execSync(`launchctl unload "${archivePlistPath}"`, { stdio: "ignore" });
+      } catch {}
+      try {
+        execSync(`launchctl load "${archivePlistPath}"`, { stdio: "ignore" });
+        step("archive-stale cron loaded (Sunday 03:00 weekly)");
+      } catch (err) {
+        console.warn(
+          `⚠ archive-stale launchctl load failed: ${err}. Run manually with \`bun run scripts/archive-stale.ts\`.`,
+        );
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `⚠ archive-stale cron setup skipped: ${(err as Error).message}`,
+    );
+  }
+
   // 7. Health probe
   const probeStart = Date.now();
   let up = false;
