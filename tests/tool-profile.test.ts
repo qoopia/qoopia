@@ -115,6 +115,9 @@ describe("QSA-F: riskOf returns the documented class for known tools", () => {
   });
   test("canonical write-destructive", () => {
     expect(riskOf("note_delete")).toBe("write-destructive");
+    // QSA-F / Codex review #2 (2026-04-28): note_update text/metadata
+    // replace is non-recoverable — no-destructive must NOT see this tool.
+    expect(riskOf("note_update")).toBe("write-destructive");
   });
   test("admin tools", () => {
     expect(riskOf("agent_onboard")).toBe("admin");
@@ -124,7 +127,9 @@ describe("QSA-F: riskOf returns the documented class for known tools", () => {
   });
   test("V2 compat aliases", () => {
     expect(riskOf("create")).toBe("write-low");
-    expect(riskOf("update")).toBe("write-low");
+    // QSA-F / Codex review #2: V2 'update' wraps note_update. Mirror its
+    // write-destructive class so the alias does not bypass the boundary.
+    expect(riskOf("update")).toBe("write-destructive");
     expect(riskOf("delete")).toBe("write-destructive");
     expect(riskOf("list")).toBe("read");
     expect(riskOf("get")).toBe("read");
@@ -228,16 +233,19 @@ describe("QSA-F: registerTools per-agent profile filter", () => {
     );
     // write-low stays
     expect(fake.registered).toContain("note_create");
-    expect(fake.registered).toContain("note_update");
     expect(fake.registered).toContain("session_save");
     expect(fake.registered).toContain("create"); // V2 alias write-low
-    expect(fake.registered).toContain("update"); // V2 alias write-low
     expect(fake.registered).toContain("note"); // V2 alias write-low
     // destructive/admin gone
     expect(fake.registered).not.toContain("note_delete");
     expect(fake.registered).not.toContain("delete"); // V2 alias destructive
     expect(fake.registered).not.toContain("agent_onboard");
     expect(fake.registered).not.toContain("agent_deactivate");
+    // QSA-F / Codex review #2: note_update is write-destructive (text/
+    // metadata replace is non-recoverable). The V2 'update' alias mirrors
+    // it. A no-destructive agent must NOT see either.
+    expect(fake.registered).not.toContain("note_update");
+    expect(fake.registered).not.toContain("update");
   });
 });
 

@@ -45,6 +45,10 @@ function mkAuth(agent_id: string, type: AuthContext["type"]): AuthContext {
     workspace_id: WORKSPACE_ID,
     type,
     source: "api-key",
+    // QSA-F (2026-04-28): activity forging now requires profile='full' in
+    // addition to admin type. Production stewards default to 'full' via
+    // the agents table column (migration 010), so this matches reality.
+    tool_profile: "full",
   };
 }
 
@@ -110,6 +114,42 @@ describe("QSA-C: V2 compat 'create activity' admin gate", () => {
       mkAuth(cp.id, "claude-privileged"),
     ) as { created: boolean; id: string };
     expect(result.created).toBe(true);
+  });
+
+  test("QSA-F: admin-capable agent on no-destructive profile cannot forge activity", () => {
+    const auth: AuthContext = {
+      agent_id: STEWARD_ID,
+      agent_name: "compat-steward",
+      workspace_id: WORKSPACE_ID,
+      type: "steward",
+      source: "api-key",
+      tool_profile: "no-destructive",
+    };
+    expect(() =>
+      v2Create(
+        {
+          entity: "activity",
+          action: "stealth",
+          entity_type: "note",
+          summary: "should not land",
+        },
+        auth,
+      ),
+    ).toThrow(/only 'full' profile may write to the audit log/);
+  });
+
+  test("QSA-F: read-only profile cannot forge activity even if admin type", () => {
+    const auth: AuthContext = {
+      agent_id: STEWARD_ID,
+      agent_name: "compat-steward",
+      workspace_id: WORKSPACE_ID,
+      type: "steward",
+      source: "api-key",
+      tool_profile: "read-only",
+    };
+    expect(() =>
+      v2Create({ entity: "activity", action: "x", summary: "y" }, auth),
+    ).toThrow(QoopiaError);
   });
 
   test("error code is FORBIDDEN with explanatory message", () => {

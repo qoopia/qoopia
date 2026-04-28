@@ -225,6 +225,44 @@ enforcement adds zero security boundary.
   - default 'full' profile: no behavior change vs. main.
   - agent_set_profile: steward-only, validates enum, logs activity.
 
+## Codex review responses (2026-04-28)
+
+Codex gpt-5.5 reviewed the implementation branch and raised four points.
+Responses recorded here for the audit trail:
+
+1. **note_update is not write-low** — accepted. Bumped to
+   `write-destructive` because text replacement and `metadata_replace`
+   are non-recoverable from audit (activity log records field names,
+   not prior values). The V2 `update` alias mirrors this. Effect:
+   `no-destructive` agents lose `note_update` / `update` along with
+   delete-class tools. Tests cover both the canonical and alias paths.
+
+2. **V2 `create entity:activity` bypass for admin agents on
+   no-destructive** — accepted. Even though `create` is correctly
+   classified as write-low for tasks/deals/contacts/finances/projects,
+   the `entity:activity` branch is admin-class (audit-log integrity).
+   `v2Create` now requires `tool_profile === 'full'` in addition to
+   the existing `isAdmin(auth)` check, so a steward demoted to
+   `no-destructive` cannot forge audit rows. Two new tests assert this
+   for `no-destructive` and `read-only` admin callers.
+
+3. **`riskOf("create")` always logs write-low, masking
+   activity-forging risk** — accepted as-is. The access log is by tool
+   name only (params are not inspected at log time). The hardened
+   handler in (2) makes the access-log understatement non-load-bearing
+   — the runtime gate refuses the call regardless of what the access
+   log says. A future enhancement could log resolved entity post-
+   handler, but that is not required for correctness.
+
+4. **`agents.last_seen` UPDATE on every authenticated request, even
+   for read-only profile** — accepted as a documented non-issue.
+   `read-only` is defined as "no mutating MCP tools," not "no DB
+   writes ever." `last_seen` is a metering write owned by the auth
+   layer (not exposed as an MCP tool), and disabling it would mean
+   read-only agents stop appearing in the dashboard's "active agents"
+   list — a regression. Documented here so future readers don't read
+   the absence of a fix as an oversight.
+
 ## Verification plan
 
 - `bun run typecheck` clean.

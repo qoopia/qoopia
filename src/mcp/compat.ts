@@ -37,6 +37,7 @@ import {
 import { logActivity, listActivity } from "../services/activity.ts";
 import {
   isToolAllowedForProfile,
+  normalizeAgentProfile,
   type AgentToolProfile,
   type RiskClass,
 } from "./tools.ts";
@@ -243,6 +244,22 @@ export function v2Create(args: Record<string, unknown>, auth: AuthContext) {
         throw new QoopiaError(
           "FORBIDDEN",
           "compat 'create activity' is admin-only — standard agents emit activity implicitly via note_create/update/delete",
+        );
+      }
+      // QSA-F / Codex review #2 (2026-04-28): the 'create' alias is gated
+      // as write-low at registerCompatTools, so a no-destructive admin
+      // (steward/claude-privileged on profile='no-destructive') still has
+      // the alias registered. activity-forging is admin-class risk; only
+      // 'full' profile may exercise it. Defence-in-depth alongside the
+      // isAdmin check above.
+      const activityProfile = normalizeAgentProfile(
+        auth.tool_profile,
+        auth.agent_name,
+      );
+      if (activityProfile !== "full") {
+        throw new QoopiaError(
+          "FORBIDDEN",
+          `tool_profile=${activityProfile} cannot forge activity entries — only 'full' profile may write to the audit log`,
         );
       }
       const id = logActivity({
@@ -548,7 +565,11 @@ export function registerCompatTools(
     wrap(v2Create, authProvider),
   );
 
-  if (allow("write-low")) server.tool(
+  // QSA-F / Codex review #2: V2 'update' wraps note_update which can
+  // overwrite text and (with metadata_replace) wipe metadata. Audit log
+  // records field names but not prior values, so the change is not
+  // recoverable from audit alone — promote to write-destructive.
+  if (allow("write-destructive")) server.tool(
     "update",
     "[V2 compat] Update entity by id. Provide entity + id + fields to change.",
     {

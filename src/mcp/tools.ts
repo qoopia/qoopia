@@ -320,7 +320,12 @@ const tools: ToolDef[] = [
   },
   {
     name: "note_update",
-    risk: "write-low",
+    // QSA-F / Codex review #2 (2026-04-28): note_update can fully replace
+    // text and (with metadata_replace=true) wipe metadata; the activity
+    // log records field NAMES, not prior values, so the change is not
+    // recoverable from audit alone. Treat as write-destructive so a
+    // 'no-destructive' profile cannot silently overwrite content.
+    risk: "write-destructive",
     description:
       "Update a note. Metadata merges shallowly by default; use metadata_replace to fully replace.",
     rawSchema: {
@@ -596,7 +601,9 @@ const TOOL_RISK_INDEX: ReadonlyMap<string, RiskClass> = (() => {
   // V2 compat aliases — pinned here to keep src/http.ts logging
   // self-contained without importing compat.ts.
   m.set("create", "write-low");
-  m.set("update", "write-low");
+  // QSA-F / Codex review #2: V2 'update' wraps note_update (write-destructive
+  // because text/metadata replace is not recoverable from audit). Mirror it.
+  m.set("update", "write-destructive");
   m.set("delete", "write-destructive");
   m.set("list", "read");
   m.set("get", "read");
