@@ -917,8 +917,23 @@ function handleAuthorizeFinalize(
     });
   }
 
-  // Atomic redeem; fails if a parallel request already redeemed.
+  // Atomic redeem; fails if a parallel request already redeemed OR if the
+  // approver/workspace state drifted between the pre-check SELECT above
+  // and this UPDATE. The redeemConsentTicket UPDATE folds the approver
+  // active+workspace predicates into the same statement (Codex HIGH #1
+  // round 2, 2026-04-28), so this is fully atomic in SQLite. If the
+  // pre-check passed but redeem failed, log the race-loss for forensics —
+  // the only ways for that to happen are (a) parallel finalize won the
+  // race, or (b) approver state flipped in the gap.
   if (!redeemConsentTicket(ticket.id)) {
+    audit({
+      event: "oauth_consent",
+      result: "deny",
+      ip: clientIp,
+      workspace_id: ticket.workspace_id,
+      agent_id: ticket.approved_by_agent_id,
+      detail: `finalize: redeem race lost or approver drift after pre-check ticket=${ticket.id}`,
+    });
     return json(res, 400, {
       error: "invalid_request",
       error_description: "ticket already redeemed",
@@ -1484,9 +1499,37 @@ function handleDashboardRegisterClient(
       error_description: "Dashboard session required.",
     });
   }
+  // Codex CRITICAL #1 (2026-04-28 round 2): explicitly reject OAuth bearers
+  // here. checkDashboardAuth() accepts both cookie sessions and Bearer
+  // tokens; Bearer can be either api_key or an OAuth access token. The
+  // dashboard shim is intended for cookie-driven browser flows, with
+  // api_key Bearer accepted for parity with /oauth/register. OAuth bearers
+  // must NOT be able to register new clients via this shim, otherwise the
+  // source-rejection in assertCanRegisterOAuth() at /oauth/register is
+  // trivially bypassable. The forge to source="api-key" below is preserved
+  // so the legitimate cookie path (source="cookie") still passes
+  // assertCanRegisterOAuth's api-key-only check.
+  if (dauth.source === "oauth") {
+    audit({
+      event: "oauth_register",
+      result: "deny",
+      ip: clientIp,
+      workspace_id: dauth.workspace_id,
+      agent_id: dauth.agent_id,
+      detail: "dashboard register: OAuth bearer source not accepted",
+    });
+    return json(res, 403, {
+      error: "forbidden",
+      error_description:
+        "OAuth access tokens cannot register new clients via the dashboard. Use a static API key or browser cookie session.",
+    });
+  }
   // Build a minimal AuthContext to feed registerClient. We only need
   // {agent_id, workspace_id, type} for the registerClient + assertCanRegister
-  // path — the dashboard cookie auth carries exactly those fields.
+  // path — the dashboard cookie auth carries exactly those fields. Source
+  // is forged to "api-key" here so cookie sessions pass the api-key-only
+  // check in assertCanRegisterOAuth(); OAuth bearers were already rejected
+  // above.
   const auth: AuthContext = {
     agent_id: dauth.agent_id,
     agent_name: "",

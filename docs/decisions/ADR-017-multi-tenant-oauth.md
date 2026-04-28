@@ -576,3 +576,60 @@ fixed in the same PR before merge; tests pinned in
    **Fix:** `pruneConsentTickets` now anchors on `expires_at`. Retention is
    deterministic: TTL + grace from creation, regardless of when the ticket
    transitioned to a terminal state. No schema churn.
+
+## QSA-H round 2 — codex re-review findings (2026-04-28)
+
+After fixing the six findings above (commit fc7023e), codex gpt-5.4 re-read
+the diff and surfaced two more issues that the round-1 fix did not cover.
+
+7. **CRITICAL — `/api/dashboard/oauth/clients` (the dashboard registration
+   shim) still accepted OAuth bearers indirectly.** The shim called
+   `checkDashboardAuth(req)` (which now propagates `source`) but then forged
+   a fresh `AuthContext` with `source: "api-key"` before calling
+   `assertCanRegisterOAuth`. That short-circuited the source-rejection that
+   was added at `/oauth/register` in round 1: an OAuth access token
+   presented as Bearer to the shim could still mint new clients. The leak
+   was outside `/oauth/register`, so the round-1 patch did not see it.
+   **Fix:** the shim now explicitly rejects `dauth.source === "oauth"`
+   before forging the AuthContext, with an `oauth_register` deny audit
+   row. Cookie sessions and api-key Bearer continue to work (the forge to
+   `source: "api-key"` is preserved so the legitimate cookie path passes
+   `assertCanRegisterOAuth`'s api-key-only check; OAuth bearers are
+   already 403'd above).
+
+8. **HIGH — finalize TOCTOU between the approver pre-check SELECT and
+   `redeemConsentTicket`.** Round 1 added a SELECT on `agents` to verify
+   the approver was still active and workspace-matched, but
+   `redeemConsentTicket` ran the UPDATE on `consent_tickets` without
+   re-checking those predicates. An approver deactivated or moved between
+   the two statements would still have its ticket redeemed and a code
+   minted. Logically closed, but not atomic.
+   **Fix:** the approver predicates were folded into the same UPDATE
+   statement as an `EXISTS` subquery on `agents`. SQLite serializes
+   statement execution, so this is fully atomic — the only way the redeem
+   succeeds is if the approver is still active and workspace-matched at
+   the moment of UPDATE. The pre-check SELECT in finalize is preserved for
+   audit attribution (so we can name *which* drift fired); on UPDATE
+   returning 0 rows after a clean pre-check, an `oauth_consent` deny audit
+   row is written with detail "redeem race lost or approver drift after
+   pre-check" — that's the only path where a parallel finalize won the
+   race or the approver flipped in the gap.
+
+Test additions (round 2): two new test blocks, four new cases. Total:
+228/228 passing.
+
+- `POST /api/dashboard/oauth/clients` with OAuth bearer → 403, no
+  `oauth_clients` row written.
+- `POST /api/dashboard/oauth/clients` with api-key Bearer → 201 (control).
+- `redeemConsentTicket` returns false when the approver is flipped to
+  `active=0` between approve and redeem; ticket stays unredeemed; flipping
+  back to `active=1` lets the redeem succeed (proves the approver
+  predicate, not some other state, was the gate).
+- `redeemConsentTicket` returns false when the approver's `workspace_id`
+  is moved to a different workspace between approve and redeem; ticket
+  stays unredeemed.
+
+Codex MED test gaps from round 2 are explicitly addressed: dashboard
+`/clients` OAuth-bearer bypass is now covered, and the redeem race window
+is pinned at the predicate level (any state flip across pre-check and
+redeem is rejected by the EXISTS clause, regardless of timing).

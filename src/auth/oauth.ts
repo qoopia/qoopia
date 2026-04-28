@@ -673,7 +673,17 @@ export function denyConsentTicket(ticketId: string): boolean {
 /**
  * Single-use redeem on the finalize path. Atomic: only succeeds if the
  * ticket has been approved, has not been redeemed yet, has not been denied,
- * and has not expired. Replay attempts return false.
+ * has not expired, AND the approving agent is still active in the same
+ * workspace as the ticket. Replay attempts return false.
+ *
+ * Codex HIGH #1 round 2 (2026-04-28): the EXISTS subquery on agents was
+ * added to close a TOCTOU window between finalize's pre-check SELECT and
+ * this UPDATE. Previously, an approver could be deactivated or moved
+ * between the two statements and the redeem would still succeed. Folding
+ * both predicates into the same SQL statement makes the check atomic
+ * (SQLite serializes statement execution), so the only way this UPDATE
+ * succeeds is if the approver is still active and workspace-matched at the
+ * moment of redeem.
  */
 export function redeemConsentTicket(ticketId: string): boolean {
   const info = db
@@ -684,7 +694,13 @@ export function redeemConsentTicket(ticketId: string): boolean {
           AND approved_by_agent_id IS NOT NULL
           AND denied = 0
           AND redeemed = 0
-          AND expires_at > ?`,
+          AND expires_at > ?
+          AND EXISTS (
+            SELECT 1 FROM agents a
+             WHERE a.id = consent_tickets.approved_by_agent_id
+               AND a.active = 1
+               AND a.workspace_id = consent_tickets.workspace_id
+          )`,
     )
     .run(ticketId, nowIso());
   return info.changes === 1;

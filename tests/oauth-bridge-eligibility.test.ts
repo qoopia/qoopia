@@ -31,6 +31,10 @@ import { startHttpServer } from "../src/http.ts";
 import { db } from "../src/db/connection.ts";
 import { sha256Hex } from "../src/auth/api-keys.ts";
 import { authLimiter, dashboardLimiter } from "../src/utils/rate-limit.ts";
+import {
+  createConsentTicket,
+  redeemConsentTicket,
+} from "../src/auth/oauth.ts";
 
 let server: Server;
 let baseUrl = "";
@@ -513,5 +517,149 @@ describe("QSA-H / MED #5: cross-workspace deny is audited", () => {
       );
     expect(matched.length).toBeGreaterThan(0);
     expect(matched[0]!.result).toBe("deny");
+  });
+});
+
+describe("QSA-H round 2 / CRITICAL #1: dashboard /clients rejects OAuth bearers", () => {
+  test("POST /api/dashboard/oauth/clients with OAuth bearer → 403, no client written", async () => {
+    // The dashboard shim accepts cookie sessions and api-key Bearer (parity
+    // with /oauth/register). An OAuth access token presented as Bearer must
+    // be rejected — otherwise the source-rejection in
+    // assertCanRegisterOAuth() at /oauth/register is trivially bypassed via
+    // this shim.
+    const oauthBearer = mintRawAccessToken({
+      agent_id: STEWARD_A_ID,
+      workspace_id: WS_A_ID,
+      client_id: CLIENT_A_ID,
+    });
+
+    const r = await fetch(`${baseUrl}/api/dashboard/oauth/clients`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${oauthBearer}`,
+      },
+      body: JSON.stringify({
+        client_name: "qsah-r2-attempted-via-oauth",
+        redirect_uris: ["https://example.com/cb-evil-r2"],
+        token_endpoint_auth_method: "none",
+      }),
+    });
+    expect(r.status).toBe(403);
+    const body = (await r.json()) as { error: string; error_description: string };
+    expect(body.error).toBe("forbidden");
+    expect(body.error_description.toLowerCase()).toContain("oauth");
+
+    // No row written.
+    const row = db
+      .prepare(`SELECT 1 FROM oauth_clients WHERE name = ?`)
+      .get("qsah-r2-attempted-via-oauth");
+    expect(row).toBeFalsy();
+  });
+
+  test("POST /api/dashboard/oauth/clients with api-key Bearer still works (control)", async () => {
+    const r = await fetch(`${baseUrl}/api/dashboard/oauth/clients`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${STEWARD_A_KEY}`,
+      },
+      body: JSON.stringify({
+        client_name: "qsah-r2-control-via-apikey",
+        redirect_uris: ["https://example.com/cb-r2-control"],
+        token_endpoint_auth_method: "none",
+      }),
+    });
+    expect(r.status).toBe(201);
+  });
+});
+
+describe("QSA-H round 2 / HIGH #1: redeemConsentTicket is atomically gated on approver state", () => {
+  test("approver flipped to active=0 after approve → redeemConsentTicket returns false, ticket stays unredeemed", async () => {
+    // Spin up a dedicated approver so we can deactivate without disturbing
+    // siblings (idx_one_steward forbids two active stewards per workspace).
+    const tempApprover = createAgent({
+      name: "qsah-r2-atomic-approver",
+      workspaceSlug: "qsa-h-ws-a",
+      type: "claude-privileged",
+    });
+
+    // Mint an approved ticket directly. We bypass the HTTP approve path so
+    // the test isolates the redeem predicate, not the consent surface.
+    const ticket = createConsentTicket({
+      clientId: CLIENT_A_ID,
+      workspaceId: WS_A_ID,
+      redirectUri: REDIRECT_URI,
+      codeChallenge: VALID_CHALLENGE,
+      codeChallengeMethod: "S256",
+      scope: "",
+      state: "atomic-test",
+    });
+    db.prepare(
+      `UPDATE consent_tickets SET approved_by_agent_id = ? WHERE id = ?`,
+    ).run(tempApprover.id, ticket.id);
+
+    // Sanity: pre-condition — without drift, redeem would succeed. We do
+    // not actually redeem here; we simulate the TOCTOU by flipping the
+    // approver to inactive *before* calling redeem.
+    db.prepare(`UPDATE agents SET active = 0 WHERE id = ?`).run(
+      tempApprover.id,
+    );
+
+    const ok = redeemConsentTicket(ticket.id);
+    expect(ok).toBe(false);
+
+    const row = db
+      .prepare(`SELECT redeemed FROM consent_tickets WHERE id = ?`)
+      .get(ticket.id) as { redeemed: number } | undefined;
+    expect(row).toBeDefined();
+    expect(row!.redeemed).toBe(0);
+
+    // Restore approver active=1 — confirm the only thing blocking redeem
+    // was the approver predicate, not some other ticket state.
+    db.prepare(`UPDATE agents SET active = 1 WHERE id = ?`).run(
+      tempApprover.id,
+    );
+    const ok2 = redeemConsentTicket(ticket.id);
+    expect(ok2).toBe(true);
+  });
+
+  test("approver moved to a different workspace → redeemConsentTicket returns false", async () => {
+    // Use a fresh claude-privileged approver in WS A (we cannot move a
+    // steward out of WS A without breaking idx_one_steward in WS B).
+    const tempApprover = createAgent({
+      name: "qsah-r2-atomic-approver-ws",
+      workspaceSlug: "qsa-h-ws-a",
+      type: "claude-privileged",
+    });
+
+    const ticket = createConsentTicket({
+      clientId: CLIENT_A_ID,
+      workspaceId: WS_A_ID,
+      redirectUri: REDIRECT_URI,
+      codeChallenge: VALID_CHALLENGE,
+      codeChallengeMethod: "S256",
+      scope: "",
+      state: "atomic-ws-test",
+    });
+    db.prepare(
+      `UPDATE consent_tickets SET approved_by_agent_id = ? WHERE id = ?`,
+    ).run(tempApprover.id, ticket.id);
+
+    // Direct UPDATE to relocate the approver. claude-privileged is not
+    // covered by idx_one_steward, so this is safe schema-wise.
+    db.prepare(`UPDATE agents SET workspace_id = ? WHERE id = ?`).run(
+      WS_B_ID,
+      tempApprover.id,
+    );
+
+    const ok = redeemConsentTicket(ticket.id);
+    expect(ok).toBe(false);
+
+    const row = db
+      .prepare(`SELECT redeemed FROM consent_tickets WHERE id = ?`)
+      .get(ticket.id) as { redeemed: number } | undefined;
+    expect(row).toBeDefined();
+    expect(row!.redeemed).toBe(0);
   });
 });
