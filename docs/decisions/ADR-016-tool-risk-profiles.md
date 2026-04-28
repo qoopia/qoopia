@@ -39,8 +39,8 @@ Each tool definition gains a `risk` field with one of four values:
 | risk | meaning | examples |
 |---|---|---|
 | `read` | no DB writes, no external side effects | recall, brief, note_get, note_list, session_recent, session_search, session_expand, activity_list, agent_list |
-| `write-low` | additive writes, recoverable via activity log | note_create, note_update, session_save, session_summarize |
-| `write-destructive` | hard or impossible to recover | note_delete |
+| `write-low` | additive writes, recoverable via activity log | note_create, session_save, session_summarize |
+| `write-destructive` | hard or impossible to recover | note_delete, note_update (text replace + metadata_replace are non-recoverable from audit — see Codex review responses) |
 | `admin` | identity / permission changes | agent_onboard, agent_deactivate |
 
 Two consequences:
