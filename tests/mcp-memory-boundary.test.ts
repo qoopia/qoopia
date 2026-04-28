@@ -180,6 +180,57 @@ describe("ADR-014 invariant 4: standard agent reads its own private note", () =>
   });
 });
 
+describe("QSA-B / Codex QSA-001: brief() agent_activity sibling-leak", () => {
+  test("non-admin sees only their own row in agent_activity", () => {
+    const r = brief({
+      workspace_id: WORKSPACE_ID,
+      caller_agent_id: AGENT_A,
+      is_admin: false,
+    });
+    const names = Object.keys(r.agent_activity as Record<string, unknown>);
+    expect(names).toContain("agent-a");
+    expect(names).not.toContain("agent-b");
+    expect(names).not.toContain("boundary-steward");
+  });
+
+  test("non-admin filtering by another agent's name does NOT bypass the restriction", () => {
+    // p.agent is silently ignored for non-admins; the result must still be
+    // self-only, not the requested sibling.
+    const r = brief({
+      workspace_id: WORKSPACE_ID,
+      caller_agent_id: AGENT_A,
+      is_admin: false,
+      agent: "agent-b",
+    });
+    const names = Object.keys(r.agent_activity as Record<string, unknown>);
+    expect(names).not.toContain("agent-b");
+    expect(names).toEqual(["agent-a"]);
+  });
+
+  test("admin still sees workspace-wide activity for all agents", () => {
+    const r = brief({
+      workspace_id: WORKSPACE_ID,
+      caller_agent_id: ADMIN_AGENT,
+      is_admin: true,
+    });
+    const names = Object.keys(r.agent_activity as Record<string, unknown>);
+    expect(names).toContain("agent-a");
+    expect(names).toContain("agent-b");
+    expect(names).toContain("boundary-steward");
+  });
+
+  test("admin can still narrow agent_activity via p.agent filter", () => {
+    const r = brief({
+      workspace_id: WORKSPACE_ID,
+      caller_agent_id: ADMIN_AGENT,
+      is_admin: true,
+      agent: "agent-b",
+    });
+    const names = Object.keys(r.agent_activity as Record<string, unknown>);
+    expect(names).toEqual(["agent-b"]);
+  });
+});
+
 describe("ADR-014 default behavior: omitted visibility = 'workspace'", () => {
   test("createNote without visibility defaults to 'workspace'", () => {
     const r = createNote({

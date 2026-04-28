@@ -161,9 +161,20 @@ export function brief(p: BriefParams) {
 
   // Agent activity — M3 fix: apply agent filter consistently when specified
   // When project filter is active, notes_today is scoped to that project for consistency.
+  //
+  // QSA-B / Codex QSA-001 (2026-04-28): non-admin callers must only see their
+  // own activity row. The prior version surfaced every active agent's name,
+  // last_seen, and notes_today, and notes_today did not apply the private-note
+  // visibility filter — leaking sibling identities and a count-based signal of
+  // their private activity. p.agent is silently ignored for non-admins because
+  // a non-admin filtering by another agent's name would just return an empty
+  // set anyway.
   const agentActivityWhere: string[] = [`a.workspace_id = ?`, `a.active = 1`];
   const agentActivityParams: any[] = [p.workspace_id];
-  if (p.agent) {
+  if (!p.is_admin) {
+    agentActivityWhere.push(`a.id = ?`);
+    agentActivityParams.push(p.caller_agent_id);
+  } else if (p.agent) {
     agentActivityWhere.push(`a.name = ?`);
     agentActivityParams.push(p.agent);
   }
