@@ -265,7 +265,9 @@ function verifySession(value: string): { agent_id: string; sv: number } | null {
  * — otherwise an attacker on a non-loopback interface could spoof the header
  * and trick us into setting cookies without the Secure flag.
  */
-function isHttps(req: IncomingMessage): boolean {
+// Exported so http.ts can decide whether to emit HSTS on dashboard /
+// /oauth/authorize HTML responses (QSA-G).
+export function isHttps(req: IncomingMessage): boolean {
   const sock = (req as unknown as { socket?: { encrypted?: boolean } }).socket;
   if (sock && sock.encrypted) return true;
   if (!env.TRUST_PROXY) return false;
