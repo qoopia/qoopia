@@ -23,10 +23,14 @@ import { createAgent } from "../admin/agents.ts";
 import { logActivity } from "../services/activity.ts";
 import { getRolePreset, ROLE_PRESET_NAMES } from "../admin/templates.ts";
 import { ulid } from "ulid";
+import type { RiskClass } from "./tools.ts";
 
 export interface AdminToolDef {
   name: string;
   description: string;
+  // QSA-F / ADR-016: every admin tool is at least 'admin' risk; the field
+  // is required so the per-agent profile filter has a value to read.
+  risk: RiskClass;
   rawSchema: z.ZodRawShape;
   handler: (args: Record<string, unknown>, auth: AuthContext) => unknown;
 }
@@ -41,6 +45,7 @@ export const adminTools: AdminToolDef[] = [
   // --- agent_onboard ---
   {
     name: "agent_onboard",
+    risk: "admin",
     description:
       "Create a new agent with optional bootstrap notes from a role preset. " +
       "Returns the API key ONCE — it is never stored or logged in plaintext. " +
@@ -143,6 +148,7 @@ export const adminTools: AdminToolDef[] = [
   // --- agent_list ---
   {
     name: "agent_list",
+    risk: "read",
     description:
       "List all agents in the workspace (or all workspaces for privileged steward). " +
       "Returns name, type, active status, and last_seen.",
@@ -183,6 +189,7 @@ export const adminTools: AdminToolDef[] = [
   // --- agent_deactivate ---
   {
     name: "agent_deactivate",
+    risk: "admin",
     description:
       "Deactivate (soft-delete) an agent. All API keys and OAuth tokens " +
       "become immediately invalid. Self-guard: steward cannot deactivate itself.",
@@ -248,6 +255,130 @@ export const adminTools: AdminToolDef[] = [
       });
 
       return { deactivated: true, agent_name: targetName, tokens_revoked: result.tokens_revoked };
+    },
+  },
+
+  // --- agent_set_profile (QSA-F / ADR-016) ---
+  {
+    name: "agent_set_profile",
+    risk: "admin",
+    description:
+      "Change an agent's MCP tool risk profile. Profiles: " +
+      "'read-only' (only risk='read' tools), 'no-destructive' " +
+      "(read + write-low), 'full' (every tool the agent's type qualifies for). " +
+      "Steward-only. Refuses to demote the caller (self-lockout) or the last " +
+      "active full-profile steward in the workspace (workspace lockout). " +
+      "Activates on the next MCP request — current in-flight requests are " +
+      "not interrupted.",
+    rawSchema: {
+      name: z
+        .string()
+        .min(1)
+        .describe("Name of the agent whose profile is being changed"),
+      tool_profile: z
+        .enum(["read-only", "no-destructive", "full"])
+        .describe("New profile to apply"),
+    },
+    handler(args, auth) {
+      assertSteward(auth);
+
+      const targetName = args.name as string;
+      const newProfile = args.tool_profile as
+        | "read-only"
+        | "no-destructive"
+        | "full";
+
+      // Self-demote guard: a steward who locked itself into 'read-only'
+      // could no longer call agent_set_profile to undo it. Block here
+      // before doing any DB work.
+      if (
+        targetName === auth.agent_name &&
+        (newProfile === "read-only" || newProfile === "no-destructive")
+      ) {
+        throw new QoopiaError(
+          "FORBIDDEN",
+          "Cannot demote self — use a different steward or DB-level escalation",
+        );
+      }
+
+      // Resolve target row inside the transaction so the last-steward
+      // check sees the same snapshot as the UPDATE.
+      const txn = db.transaction(() => {
+        const target = db
+          .prepare(
+            `SELECT id, type, tool_profile FROM agents
+             WHERE name = ? AND workspace_id = ? AND active = 1`,
+          )
+          .get(targetName, auth.workspace_id) as
+          | { id: string; type: string; tool_profile: string }
+          | undefined;
+
+        if (!target) {
+          throw new QoopiaError(
+            "NOT_FOUND",
+            `Active agent '${targetName}' not found in workspace`,
+          );
+        }
+
+        // Last-active-steward guard: if the target is currently a
+        // 'full'-profile steward and we're about to demote it, count
+        // how many other full-profile stewards remain. Zero = refuse.
+        if (
+          target.type === "steward" &&
+          target.tool_profile === "full" &&
+          newProfile !== "full"
+        ) {
+          const others = db
+            .prepare(
+              `SELECT COUNT(*) AS n FROM agents
+               WHERE workspace_id = ?
+                 AND type = 'steward'
+                 AND active = 1
+                 AND tool_profile = 'full'
+                 AND id != ?`,
+            )
+            .get(auth.workspace_id, target.id) as { n: number };
+          if (others.n === 0) {
+            throw new QoopiaError(
+              "FORBIDDEN",
+              `Cannot demote the last full-profile steward in workspace ${auth.workspace_id}`,
+            );
+          }
+        }
+
+        const previous = target.tool_profile;
+        db.prepare(
+          `UPDATE agents SET tool_profile = ? WHERE id = ?`,
+        ).run(newProfile, target.id);
+
+        return {
+          agent_id: target.id,
+          previous_profile: previous,
+        };
+      });
+      const result = txn();
+
+      logActivity({
+        workspace_id: auth.workspace_id,
+        agent_id: auth.agent_id,
+        action: "agent_profile_changed",
+        entity_type: "agent",
+        entity_id: result.agent_id,
+        project_id: null,
+        summary: `Steward changed profile of '${targetName}' from ${result.previous_profile} → ${newProfile}`,
+        details: {
+          agent_name: targetName,
+          previous_profile: result.previous_profile,
+          new_profile: newProfile,
+        },
+      });
+
+      return {
+        changed: true,
+        agent_name: targetName,
+        previous_profile: result.previous_profile,
+        new_profile: newProfile,
+      };
     },
   },
 ];

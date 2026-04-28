@@ -34,9 +34,76 @@ const MEMORY_TOOLS = new Set([
   "session_search",
 ]);
 
+// QSA-F / ADR-016: tool-level risk classification.
+//   read              — no DB writes, no external side effects
+//   write-low         — additive writes recoverable via activity log
+//   write-destructive — hard or impossible to recover (note_delete)
+//   admin             — identity / permission changes (agent_*)
+export type RiskClass =
+  | "read"
+  | "write-low"
+  | "write-destructive"
+  | "admin";
+
+// QSA-F / ADR-016: per-agent MCP profile. The DB CHECK constraint in
+// migration 010 is the source of truth; runtime treats anything else
+// as 'read-only' (fail-closed).
+export type AgentToolProfile = "read-only" | "no-destructive" | "full";
+
+const KNOWN_AGENT_PROFILES: ReadonlySet<AgentToolProfile> = new Set([
+  "read-only",
+  "no-destructive",
+  "full",
+]);
+
+/**
+ * Coerce an arbitrary string from the DB (or undefined / null) into a
+ * known AgentToolProfile. Unknown / missing values fail-closed to
+ * 'read-only' with a single WARN line per request, matching the
+ * documented behavior in ADR-016 "Fail-closed on null / unknown
+ * profile". Exported so tests can exercise the fallback.
+ */
+export function normalizeAgentProfile(
+  raw: unknown,
+  agentName: string,
+): AgentToolProfile {
+  if (
+    typeof raw === "string" &&
+    KNOWN_AGENT_PROFILES.has(raw as AgentToolProfile)
+  ) {
+    return raw as AgentToolProfile;
+  }
+  logger.warn(
+    `agent=${agentName} tool_profile=${JSON.stringify(raw)} unknown — degraded to read-only (fail-closed)`,
+  );
+  return "read-only";
+}
+
+/**
+ * Decide whether a tool of the given risk class is exposed under the
+ * agent's profile. Stricter wins: a `read-only` agent only sees `read`
+ * tools regardless of the server-level `ToolProfile` argument.
+ */
+export function isToolAllowedForProfile(
+  risk: RiskClass,
+  profile: AgentToolProfile,
+): boolean {
+  switch (profile) {
+    case "read-only":
+      return risk === "read";
+    case "no-destructive":
+      return risk === "read" || risk === "write-low";
+    case "full":
+      return true;
+  }
+}
+
 interface ToolDef {
   name: string;
   description: string;
+  // QSA-F / ADR-016: required so the per-agent filter can decide
+  // visibility. New tools without an explicit risk class won't compile.
+  risk: RiskClass;
   rawSchema: z.ZodRawShape;
   handler: (args: Record<string, unknown>, auth: AuthContext) => unknown;
 }
@@ -88,6 +155,7 @@ function isAdmin(auth: AuthContext): boolean {
 const tools: ToolDef[] = [
   {
     name: "recall",
+    risk: "read",
     description:
       "Full-text search across notes, activity log, and session messages. Returns results with complete text (no truncation). Keyword-based, not semantic. Use scope='all' to query every layer.",
     rawSchema: {
@@ -136,6 +204,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "brief",
+    risk: "read",
     description:
       "Workspace snapshot: open tasks, recent notes, active deals, agent activity. Call at session start to restore context.",
     rawSchema: {
@@ -158,6 +227,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "note_create",
+    risk: "write-low",
     description:
       "Create a note in the universal notes table. Use type to distinguish task/deal/contact/finance/project/memory/decision/etc.",
     rawSchema: {
@@ -194,6 +264,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "note_get",
+    risk: "read",
     description: "Fetch a single note by ULID.",
     rawSchema: {
       id: z.string().min(1),
@@ -203,6 +274,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "note_list",
+    risk: "read",
     description:
       "List notes with filters: type, project_id, agent, status (from metadata), tags, date range, session.",
     rawSchema: {
@@ -248,6 +320,12 @@ const tools: ToolDef[] = [
   },
   {
     name: "note_update",
+    // QSA-F / Codex review #2 (2026-04-28): note_update can fully replace
+    // text and (with metadata_replace=true) wipe metadata; the activity
+    // log records field NAMES, not prior values, so the change is not
+    // recoverable from audit alone. Treat as write-destructive so a
+    // 'no-destructive' profile cannot silently overwrite content.
+    risk: "write-destructive",
     description:
       "Update a note. Metadata merges shallowly by default; use metadata_replace to fully replace.",
     rawSchema: {
@@ -277,6 +355,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "note_delete",
+    risk: "write-destructive",
     description: "Soft-delete a note (sets deleted_at).",
     rawSchema: {
       id: z.string().min(1),
@@ -291,6 +370,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "session_save",
+    risk: "write-low",
     description:
       "Append one message to a session. Call after every user message AND every assistant response.",
     rawSchema: {
@@ -313,6 +393,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "session_recent",
+    risk: "read",
     description:
       "Load recent messages from a session. Pass session_id='latest' to get the most recent session of this agent.",
     rawSchema: {
@@ -331,6 +412,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "session_search",
+    risk: "read",
     description: "FTS5 search across saved session messages.",
     rawSchema: {
       query: z.string().min(1).max(1000),
@@ -357,6 +439,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "session_summarize",
+    risk: "write-low",
     description:
       "Save your own summary of a message range. Qoopia does not generate summaries — you write the text.",
     rawSchema: {
@@ -381,6 +464,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "session_expand",
+    risk: "read",
     description: "Fetch raw messages by ID range (expand a prior summary).",
     rawSchema: {
       start_id: z.number().int().positive(),
@@ -398,6 +482,7 @@ const tools: ToolDef[] = [
   },
   {
     name: "activity_list",
+    risk: "read",
     description: "Read the activity audit log with filters.",
     rawSchema: {
       entity_type: z.string().optional(),
@@ -430,10 +515,17 @@ export function registerTools(
   server: McpServer,
   authProvider: () => AuthContext | null,
   profile: ToolProfile = "full",
-  opts?: { isSteward?: boolean },
+  opts?: { isSteward?: boolean; agentToolProfile?: AgentToolProfile },
 ) {
+  // QSA-F / ADR-016: per-agent profile filter. Defaults to 'full' to
+  // preserve current behavior for callers that don't pass it (tests,
+  // bootstrap CLI, future code paths). Production handleMcp always
+  // computes this from auth.tool_profile via normalizeAgentProfile.
+  const agentProfile: AgentToolProfile = opts?.agentToolProfile ?? "full";
+
   for (const tool of tools) {
     if (profile === "memory" && !MEMORY_TOOLS.has(tool.name)) continue;
+    if (!isToolAllowedForProfile(tool.risk, agentProfile)) continue;
     server.tool(
       tool.name,
       tool.description,
@@ -459,6 +551,10 @@ export function registerTools(
   // Admin tools: only registered for steward agents
   if (opts?.isSteward) {
     for (const tool of adminTools) {
+      // Per-agent profile filter applies even to steward — a steward
+      // demoted to 'read-only' should still see only `risk='read'`
+      // admin tools (i.e. agent_list).
+      if (!isToolAllowedForProfile(tool.risk, agentProfile)) continue;
       server.tool(
         tool.name,
         tool.description,
@@ -484,9 +580,39 @@ export function registerTools(
 
   // V2 backward-compatibility aliases: skip for memory-only profile to avoid
   // re-exposing CRUD operations that memory profile is supposed to restrict.
+  // Per-agent filter is also passed through so a 'read-only' agent does NOT
+  // see the V2 mutator aliases (`create`, `update`, `delete`, `note`) —
+  // otherwise the aliases would be a trivial bypass of the profile boundary.
   if (profile !== "memory") {
-    registerCompatTools(server, authProvider);
+    registerCompatTools(server, authProvider, agentProfile);
   }
+}
+
+/**
+ * QSA-F / ADR-016: lookup a tool's risk class by name. Used by the
+ * access log in src/http.ts to surface which risk class each MCP call
+ * exercised. Returns null for unknown tool names (V2 compat aliases
+ * fall through to canonical-name handlers, so their risk is implicit).
+ */
+const TOOL_RISK_INDEX: ReadonlyMap<string, RiskClass> = (() => {
+  const m = new Map<string, RiskClass>();
+  for (const t of tools) m.set(t.name, t.risk);
+  for (const t of adminTools) m.set(t.name, t.risk);
+  // V2 compat aliases — pinned here to keep src/http.ts logging
+  // self-contained without importing compat.ts.
+  m.set("create", "write-low");
+  // QSA-F / Codex review #2: V2 'update' wraps note_update (write-destructive
+  // because text/metadata replace is not recoverable from audit). Mirror it.
+  m.set("update", "write-destructive");
+  m.set("delete", "write-destructive");
+  m.set("list", "read");
+  m.set("get", "read");
+  m.set("note", "write-low");
+  return m;
+})();
+
+export function riskOf(toolName: string): RiskClass | null {
+  return TOOL_RISK_INDEX.get(toolName) ?? null;
 }
 
 export function toolNames(profile: ToolProfile = "full"): string[] {

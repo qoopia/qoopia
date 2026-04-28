@@ -35,6 +35,12 @@ import {
   deleteNote,
 } from "../services/notes.ts";
 import { logActivity, listActivity } from "../services/activity.ts";
+import {
+  isToolAllowedForProfile,
+  normalizeAgentProfile,
+  type AgentToolProfile,
+  type RiskClass,
+} from "./tools.ts";
 
 // QRERUN-003 / ADR-014: same admin set as src/mcp/tools.ts. Kept local to
 // avoid a circular import; both modules trust the same enum.
@@ -238,6 +244,22 @@ export function v2Create(args: Record<string, unknown>, auth: AuthContext) {
         throw new QoopiaError(
           "FORBIDDEN",
           "compat 'create activity' is admin-only — standard agents emit activity implicitly via note_create/update/delete",
+        );
+      }
+      // QSA-F / Codex review #2 (2026-04-28): the 'create' alias is gated
+      // as write-low at registerCompatTools, so a no-destructive admin
+      // (steward/claude-privileged on profile='no-destructive') still has
+      // the alias registered. activity-forging is admin-class risk; only
+      // 'full' profile may exercise it. Defence-in-depth alongside the
+      // isAdmin check above.
+      const activityProfile = normalizeAgentProfile(
+        auth.tool_profile,
+        auth.agent_name,
+      );
+      if (activityProfile !== "full") {
+        throw new QoopiaError(
+          "FORBIDDEN",
+          `tool_profile=${activityProfile} cannot forge activity entries — only 'full' profile may write to the audit log`,
         );
       }
       const id = logActivity({
@@ -491,9 +513,17 @@ function v2Note(args: Record<string, unknown>, auth: AuthContext) {
 export function registerCompatTools(
   server: McpServer,
   authProvider: () => AuthContext | null,
+  agentProfile: AgentToolProfile = "full",
 ) {
+  // QSA-F / ADR-016: V2 alias risk classification. Each alias gates on
+  // the same risk class as its V3 canonical handler — otherwise a
+  // 'read-only' agent could bypass the profile by calling `create` /
+  // `update` / `delete` instead of `note_*`.
+  const allow = (risk: RiskClass) =>
+    isToolAllowedForProfile(risk, agentProfile);
+
   // Generic CRUD with `entity` discriminator
-  server.tool(
+  if (allow("write-low")) server.tool(
     "create",
     "[V2 compat] Create entity by type. entity ∈ tasks|deals|contacts|finances|activity. Use note_create for V3-native API.",
     {
@@ -535,7 +565,11 @@ export function registerCompatTools(
     wrap(v2Create, authProvider),
   );
 
-  server.tool(
+  // QSA-F / Codex review #2: V2 'update' wraps note_update which can
+  // overwrite text and (with metadata_replace) wipe metadata. Audit log
+  // records field names but not prior values, so the change is not
+  // recoverable from audit alone — promote to write-destructive.
+  if (allow("write-destructive")) server.tool(
     "update",
     "[V2 compat] Update entity by id. Provide entity + id + fields to change.",
     {
@@ -573,7 +607,7 @@ export function registerCompatTools(
     wrap(v2Update, authProvider),
   );
 
-  server.tool(
+  if (allow("write-destructive")) server.tool(
     "delete",
     "[V2 compat] Soft-delete an entity. entity ∈ tasks|deals|contacts|finances|projects.",
     {
@@ -583,7 +617,7 @@ export function registerCompatTools(
     wrap(v2Delete, authProvider),
   );
 
-  server.tool(
+  if (allow("read")) server.tool(
     "list",
     "[V2 compat] List entities by type. Supported filters: project_id, status, entity_type (for activity), limit.",
     {
@@ -603,7 +637,7 @@ export function registerCompatTools(
     wrap(v2List, authProvider),
   );
 
-  server.tool(
+  if (allow("read")) server.tool(
     "get",
     "[V2 compat] Get a single entity by id.",
     {
@@ -613,7 +647,7 @@ export function registerCompatTools(
     wrap(v2Get, authProvider),
   );
 
-  server.tool(
+  if (allow("write-low")) server.tool(
     "note",
     "[V2 compat] Record a memory note. Maps to note_create with type=memory by default.",
     {

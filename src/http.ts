@@ -6,6 +6,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import crypto from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp/server.ts";
+import { normalizeAgentProfile, riskOf } from "./mcp/tools.ts";
 import { handleDashboardApi, isHttps } from "./dashboard-api.ts";
 import { authenticate, type AuthContext } from "./auth/middleware.ts";
 import { getAllowlist } from "./admin/claude-agents.ts";
@@ -545,6 +546,14 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
     return;
   }
 
+  // QSA-F / ADR-016: normalize the agent's per-agent tool profile once
+  // per request. Unknown / null values are coerced to 'read-only' with
+  // a single WARN line, matching the documented fail-closed posture.
+  const agentProfile = normalizeAgentProfile(
+    auth.tool_profile,
+    auth.agent_name,
+  );
+
   // Access log: parse JSON-RPC method/tool name from body for debugging.
   if (body && body.length > 0) {
     try {
@@ -552,7 +561,11 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
       const rpcMethod = parsed.method;
       let detail = "";
       if (rpcMethod === "tools/call" && parsed.params?.name) {
-        detail = ` tool=${parsed.params.name}`;
+        const toolName = parsed.params.name as string;
+        const risk = riskOf(toolName);
+        // Risk class makes destructive/admin calls greppable in stderr
+        // even when the tool name itself isn't obviously dangerous.
+        detail = ` tool=${toolName} risk=${risk ?? "unknown"} profile=${agentProfile}`;
       }
       logger.info(
         `MCP ${rpcMethod || "?"}${detail} agent=${auth.agent_name} (${auth.source})`,
@@ -566,6 +579,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
   await authStorage.run(auth, async () => {
     const server = createMcpServer(() => getCurrentAuth(), "full", {
       isSteward: auth.type === "steward",
+      agentToolProfile: agentProfile,
     });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

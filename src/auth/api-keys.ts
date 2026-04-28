@@ -23,6 +23,12 @@ export interface AgentRecord {
   last_seen: string | null;
   metadata: string;
   created_at: string;
+  // QSA-F / ADR-016: per-agent MCP tool risk profile. NOT NULL DEFAULT 'full'
+  // in the schema; older rows that pre-date migration 010 receive 'full' on
+  // upgrade. Unknown / null values are coerced to 'read-only' fail-closed in
+  // src/mcp/tools.ts, so this field's runtime type is "trust the DB CHECK
+  // constraint or fail safer".
+  tool_profile?: string | null;
 }
 
 export function verifyApiKey(token: string): AgentRecord | null {
