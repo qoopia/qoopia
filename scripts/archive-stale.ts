@@ -28,7 +28,10 @@ interface SweepRule {
   // the deleted_at / already-archived guards — those are added by the
   // wrapper below.
   candidateSql: string;
-  candidateParams: unknown[];
+  // P1 (codex review): bun:sqlite's .all() expects SQLQueryBindings, not
+  // unknown. All current rules pass ISO date strings; widen only as far
+  // as needed for future numeric/null cutoffs without breaking the type.
+  candidateParams: (string | number | null)[];
 }
 
 const NOW = new Date();

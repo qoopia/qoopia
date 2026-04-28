@@ -86,7 +86,7 @@ export function brief(p: BriefParams) {
        WHERE workspace_id = ?
          AND type = 'task'
          AND deleted_at IS NULL
-         AND (json_extract(metadata, '$.status') IS NULL OR json_extract(metadata, '$.status') NOT IN ('done', 'cancelled'))
+         AND (json_extract(metadata, '$.status') IS NULL OR json_extract(metadata, '$.status') NOT IN ('done', 'cancelled', 'archived'))
          ${extraSql}
        ORDER BY created_at DESC
        LIMIT ?`,
@@ -97,7 +97,7 @@ export function brief(p: BriefParams) {
     .prepare(
       `SELECT COUNT(*) as c FROM notes
        WHERE workspace_id = ? AND type = 'task' AND deleted_at IS NULL
-         AND (json_extract(metadata, '$.status') IS NULL OR json_extract(metadata, '$.status') NOT IN ('done', 'cancelled'))
+         AND (json_extract(metadata, '$.status') IS NULL OR json_extract(metadata, '$.status') NOT IN ('done', 'cancelled', 'archived'))
          ${extraSql}`,
     )
     .get(p.workspace_id, ...extraParams) as { c: number };
@@ -109,7 +109,7 @@ export function brief(p: BriefParams) {
        WHERE workspace_id = ? AND type = 'task' AND deleted_at IS NULL
          AND json_extract(metadata, '$.due_date') IS NOT NULL
          AND json_extract(metadata, '$.due_date') < ?
-         AND (json_extract(metadata, '$.status') IS NULL OR json_extract(metadata, '$.status') NOT IN ('done', 'cancelled'))
+         AND (json_extract(metadata, '$.status') IS NULL OR json_extract(metadata, '$.status') NOT IN ('done', 'cancelled', 'archived'))
          ${extraSql}`,
     )
     .get(p.workspace_id, now, ...extraParams) as { c: number };

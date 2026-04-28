@@ -18,6 +18,7 @@ import { createNote, listNotes, updateNote } from "../src/services/notes.ts";
 import { logActivity } from "../src/services/activity.ts";
 import { saveMessage } from "../src/services/sessions.ts";
 import { recall } from "../src/services/recall.ts";
+import { brief } from "../src/services/brief.ts";
 
 let WORKSPACE_ID = "";
 let AGENT_A_ID = "";
@@ -282,6 +283,36 @@ describe("archive lifecycle", () => {
       (x) => (x.metadata as Record<string, unknown>).status,
     );
     expect(statuses).toContain("archived");
+  });
+
+  test("brief() open tasks excludes archived (P2 codex regression guard)", () => {
+    // Codex P2: a task transitioned by archive-stale.ts from status='done'
+    // to status='archived' must NOT reappear in brief() open-task lists.
+    createNote({
+      workspace_id: WORKSPACE_ID,
+      agent_id: AGENT_A_ID,
+      text: "open task — penguin should appear",
+      type: "task",
+      metadata: { status: "todo" },
+    });
+    createNote({
+      workspace_id: WORKSPACE_ID,
+      agent_id: AGENT_A_ID,
+      text: "archived done task — penguin should NOT appear",
+      type: "task",
+      metadata: { status: "archived" },
+    });
+    const b = brief({
+      workspace_id: WORKSPACE_ID,
+      caller_agent_id: AGENT_A_ID,
+      is_admin: false,
+      limit_per_section: 50,
+    });
+    const texts = b.open_tasks.items.map((t) => t.text);
+    expect(texts.some((t) => t.includes("open task — penguin"))).toBe(true);
+    expect(texts.some((t) => t.includes("archived done task — penguin"))).toBe(
+      false,
+    );
   });
 
   test("updateNote can flip status to archived (round-trip)", () => {
