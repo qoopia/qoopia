@@ -10,6 +10,7 @@
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",
     "install-service": "bun run src/admin/install.ts",
+    "migrate": "QOOPIA_AUTO_MIGRATE=true bun run scripts/migrate.ts",
     "migrate-from-v2": "bun run scripts/migrate-from-v2.ts",
     "verify-migration": "bun run scripts/verify-migration.ts",
     "typecheck": "tsc --noEmit",
